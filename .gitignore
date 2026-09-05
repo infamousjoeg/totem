@@ -1,0 +1,28 @@
+# Binaries
+/totem
+/totem-issuer
+/dist/
+*.exe
+*.test
+*.out
+
+# Go
+/vendor/
+go.work
+go.work.sum
+
+# Local state (never commit secrets or device/issuer material)
+.totem/
+*.pem
+*.key
+*.crt
+*.sqlite
+*.sqlite-*
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# local build orchestration (hooks, permissions) - not part of the repo
+.claude/
