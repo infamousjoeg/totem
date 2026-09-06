@@ -153,7 +153,7 @@ func (l *Listener) Accept() (net.Conn, error) {
 	ident, aerr := l.attestor.AttestPeer(ctx, uc)
 	c.identity, c.err = ident, aerr
 	if aerr != nil && l.log != nil {
-		l.log.Record(Event{Kind: KindRefusal, Reason: reasonFor(aerr), Message: humanRefusal(aerr, nil), Fix: fixFor(aerr, nil)})
+		l.log.Record(EventFor(KindRefusal, ident, aerr))
 	}
 	return c, nil
 }

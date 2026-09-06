@@ -158,6 +158,20 @@ func (s *Server) serveListener(ctx context.Context, lis *Listener) error {
 // Stop stops the server immediately, closing the socket.
 func (s *Server) Stop() { s.grpc.Stop() }
 
+// ForceRotate renews every identity the agent is currently holding, now,
+// instead of waiting for its half-life, and pushes the result down every open
+// FetchX509SVID stream.
+//
+// This is an operational verb, not a debug hook: "renew everything now" is what
+// an operator wants after a suspected compromise, after a revocation, or when
+// the network came back and they would rather not wait out a half-life. It
+// takes the ordinary path in full, asking the issuer for a fresh SVID and
+// re-attesting each connection before pushing, so nothing here can produce a
+// credential the issuer did not mint.
+//
+// `totem serve` wires it to SIGUSR1 and `totem rotate` sends that signal.
+func (s *Server) ForceRotate() { s.cache.invalidateAll() }
+
 // unaryHeaderInterceptor enforces the Workload API security header on unary
 // calls before any handler runs.
 func (s *Server) unaryHeaderInterceptor(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
@@ -201,12 +215,12 @@ func (s *Server) callerIdentity(ctx context.Context) (*Conn, *attest.Identity, D
 	}
 	ident, err := conn.Identity()
 	if err != nil {
-		s.record(Event{Kind: KindRefusal, Reason: reasonFor(err), Message: humanRefusal(err, nil), Fix: fixFor(err, nil)})
+		s.record(EventFor(KindRefusal, nil, err))
 		return nil, nil, Derived{}, StatusFromError(err, nil)
 	}
 	derived, err := Derive(s.cfg.Identity, ident)
 	if err != nil {
-		s.record(Event{Kind: KindRefusal, Tool: ident.Tool, PID: ident.Peer.PID, Reason: reasonFor(err), Message: humanRefusal(err, ident), Fix: fixFor(err, ident)})
+		s.record(EventFor(KindRefusal, ident, err))
 		return nil, nil, Derived{}, StatusFromError(err, ident)
 	}
 	return conn, ident, derived, nil
@@ -229,10 +243,15 @@ func (s *Server) FetchX509SVID(_ *workload.X509SVIDRequest, stream workload.Spif
 	}
 
 	for {
+		// Captured before the fetch so a rotation forced between the fetch and
+		// the wait below wakes this stream instead of being missed.
+		rotated := s.cache.rotateSignal()
+
 		svid, ferr := s.cache.get(ctx, derived)
 		if ferr != nil {
-			s.record(Event{Kind: KindFailure, Tool: ident.Tool, SpiffeID: derived.String(), PID: ident.Peer.PID,
-				Reason: reasonFor(ferr), Message: humanRefusal(ferr, ident), Fix: fixFor(ferr, ident)})
+			ev := EventFor(KindFailure, ident, ferr)
+			ev.SpiffeID = derived.String()
+			s.record(ev)
 			return StatusFromError(ferr, ident)
 		}
 
@@ -248,16 +267,19 @@ func (s *Server) FetchX509SVID(_ *workload.X509SVIDRequest, stream workload.Spif
 		if err := stream.Send(resp); err != nil {
 			return err
 		}
-		s.record(Event{Kind: KindIssuance, Tool: ident.Tool, SpiffeID: derived.String(), PID: ident.Peer.PID})
+		ev := EventFor(KindIssuance, ident, nil)
+		ev.SpiffeID = derived.String()
+		s.record(ev)
 		s.publishStatus("")
 
-		if err := s.cache.waitForRenewal(ctx, svid); err != nil {
+		if err := s.cache.waitForRenewal(ctx, svid, rotated); err != nil {
 			return nil
 		}
 		// Attestation is per connection, but renewal re-checks the peer.
 		if _, err := conn.Reattest(ctx); err != nil {
-			s.record(Event{Kind: KindRefusal, Tool: ident.Tool, SpiffeID: derived.String(), PID: ident.Peer.PID,
-				Reason: reasonFor(err), Message: humanRefusal(err, ident), Fix: fixFor(err, ident)})
+			ev := EventFor(KindRefusal, ident, err)
+			ev.SpiffeID = derived.String()
+			s.record(ev)
 			return StatusFromError(err, ident)
 		}
 	}
@@ -309,11 +331,14 @@ func (s *Server) FetchJWTSVID(ctx context.Context, req *workload.JWTSVIDRequest)
 
 	svid, ferr := s.cfg.Source.FetchJWTSVID(ctx, derived, req.GetAudience())
 	if ferr != nil {
-		s.record(Event{Kind: KindFailure, Tool: ident.Tool, SpiffeID: derived.String(), PID: ident.Peer.PID,
-			Reason: reasonFor(ferr), Message: humanRefusal(ferr, ident), Fix: fixFor(ferr, ident)})
+		ev := EventFor(KindFailure, ident, ferr)
+		ev.SpiffeID = derived.String()
+		s.record(ev)
 		return nil, StatusFromError(ferr, ident)
 	}
-	s.record(Event{Kind: KindIssuance, Tool: ident.Tool, SpiffeID: derived.String(), PID: ident.Peer.PID})
+	issued := EventFor(KindIssuance, ident, nil)
+	issued.SpiffeID = derived.String()
+	s.record(issued)
 	return &workload.JWTSVIDResponse{
 		Svids: []*workload.JWTSVID{{SpiffeId: svid.ID, Svid: svid.Token, Hint: svid.Hint}},
 	}, nil

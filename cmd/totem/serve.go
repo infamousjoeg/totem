@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/infamousjoeg/totem/internal/attest"
 	"github.com/infamousjoeg/totem/internal/spiffe"
@@ -56,6 +58,24 @@ func cmdServe(ctx context.Context, args []string) error {
 		Log:             workloadapi.NewLogger(""),
 		ProtectionLevel: state.ProtectionLevel,
 	})
+
+	// SIGUSR1 means "renew everything now". It takes the ordinary path in
+	// full, asking the issuer for fresh credentials and re-checking each
+	// connection, so it can only ever produce what the issuer would have
+	// produced at the next half-life anyway. `totem rotate` sends it.
+	rotate := make(chan os.Signal, 1)
+	signal.Notify(rotate, syscall.SIGUSR1)
+	defer signal.Stop(rotate)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-rotate:
+				srv.ForceRotate()
+			}
+		}
+	}()
 
 	fmt.Printf("totem is serving on %s\n", srv.Endpoint())
 	fmt.Printf("Point tools at it with SPIFFE_ENDPOINT_SOCKET=%s\n", srv.Endpoint())

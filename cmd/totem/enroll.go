@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/infamousjoeg/totem/internal/platform"
+	"github.com/infamousjoeg/totem/internal/presence"
 	"github.com/infamousjoeg/totem/internal/workloadapi"
 )
 
@@ -111,42 +112,104 @@ func cmdEnroll(ctx context.Context, args []string) error {
 	}
 	manifest.RecordKey(platform.DeviceKeyLabel, "this device's key")
 
-	fmt.Println("Confirm it's you to finish setting this device up.")
-	sig, err := key.Sign(ctx, challenge.Challenge, platform.Prompt{
-		Required: true,
-		Tool:     "totem",
-		Target:   addr.URL,
-		DeviceID: hostname,
-	})
+	// Both public halves, always. On Apple silicon these are two Secure
+	// Enclave keys and the issuer verifies different things against each: the
+	// device half for silent renewals, the presence half for assertions.
+	// PresencePublic() is nil ONLY when this protection level cannot check for
+	// a human at all, and that case is recorded as presence "none" on the
+	// enrollment rather than glossed over, because an enrollment that quietly
+	// dropped the presence half would verify every future assertion against
+	// the wrong key and look fine doing it.
+	devicePub, err := publicKeyDER(key.Public())
 	if err != nil {
+		return failf("Run 'totem doctor' for what this machine can do.",
+			"totem could not read this device's own key back: %v", err)
+	}
+	fingerprintHex := hex.EncodeToString(hashPublicKey(devicePub))
+
+	var presencePub []byte
+	presenceState := presence.StateNone
+	if pp := key.PresencePublic(); pp != nil {
+		presenceState = presence.StatePresent
+		if presencePub, err = publicKeyDER(pp); err != nil {
+			return failf("Run 'totem doctor' for what this machine can do.",
+				"totem could not read the key that confirms it's you: %v", err)
+		}
+	}
+
+	// The signed bytes go through presence's canonical encoder rather than
+	// being the raw challenge. Every signature in totem is domain-separated:
+	// a fixed context string plus a version byte plus length-prefixed fields,
+	// so a signature made to enroll a device cannot be replayed as a signature
+	// made for anything else, and no field boundary can be shifted.
+	signing := presence.SigningInput{
+		DeviceID:  fingerprintHex,
+		Tool:      "totem",
+		Target:    addr.URL,
+		Challenge: challenge.Challenge,
+	}
+	if len(challenge.Challenge) != presence.ChallengeSize {
+		return failf("Ask your issuer operator whether the issuer is running a version totem understands.",
+			"your issuer sent something totem cannot sign safely.")
+	}
+
+	var sig []byte
+	if presenceState == presence.StatePresent {
+		fmt.Println("Confirm it's you to finish setting this device up.")
+		assertion, aerr := presence.Sign(ctx, key, signing)
 		switch {
-		case errors.Is(err, platform.ErrPresenceDenied):
+		case aerr == nil:
+			sig = assertion.Signature
+		case errors.Is(aerr, platform.ErrPresenceDenied):
 			return failf("Run 'totem enroll' again and approve the prompt within 60 seconds.",
 				"the confirmation was declined or timed out, so nothing was set up.")
-		case errors.Is(err, platform.ErrPresenceUnavailable):
-			// A device with no way to confirm a person is present still
-			// enrolls; the fact is recorded and carried, never faked.
-			fmt.Println("  this device cannot confirm a person is present, so that is recorded as part of its setup.")
+		case errors.Is(aerr, platform.ErrPresenceUnavailable):
+			// The key reported a presence half and then could not use it. That
+			// is a contradiction, not a device without a sensor, so it is a
+			// refusal rather than a quiet downgrade to presence "none".
+			return failf("Run 'totem doctor'. It will say whether this machine's secure hardware is reachable.",
+				"this device offered to confirm it's you and then could not.")
 		default:
+			return failf("Run 'totem doctor' for what this machine can do.",
+				"totem could not use this device's key: %v", aerr)
+		}
+	} else {
+		// No presence capability anywhere on this device. It still enrolls and
+		// exchanges still work; the level is recorded honestly and travels on
+		// every identity, so a target that needs a person present will refuse
+		// this device rather than being fooled by it.
+		fmt.Println("This device has no way to confirm a person is present, so that is recorded as part of its setup.")
+		fmt.Println("Targets that require a person will refuse it. Everything else works.")
+		bytes, berr := signing.Bytes()
+		if berr != nil {
+			return failf("Ask your issuer operator whether the issuer is running a version totem understands.",
+				"totem could not prepare this device's enrollment: %v", berr)
+		}
+		if sig, err = key.Sign(ctx, bytes, platform.Prompt{
+			Required: false,
+			Tool:     "totem",
+			Target:   addr.URL,
+			DeviceID: fingerprintHex,
+		}); err != nil {
 			return failf("Run 'totem doctor' for what this machine can do.",
 				"totem could not use this device's key: %v", err)
 		}
 	}
 
-	pubDER, err := publicKeyDER(key.Public())
-	if err != nil {
-		return failf("Run 'totem doctor' for what this machine can do.",
-			"totem could not read this device's own key back: %v", err)
-	}
-
 	resp, err := client.Enroll(ctx, EnrollRequest{
-		PublicKeyDER:    pubDER,
-		ProtectionLevel: key.ProtectionLevel(),
-		Hostname:        hostname,
-		OS:              runtime.GOOS,
-		Challenge:       challenge.Challenge,
-		Signature:       sig,
-		BootstrapCode:   *code,
+		DevicePublicDER:   devicePub,
+		PresencePublicDER: presencePub,
+		Presence:          presenceState,
+		ProtectionLevel:   key.ProtectionLevel(),
+		Hostname:          hostname,
+		OS:                runtime.GOOS,
+		DeviceFingerprint: fingerprintHex,
+		SignedTool:        signing.Tool,
+		SignedTarget:      signing.Target,
+		EncodingVersion:   presence.EncodingVersion,
+		Challenge:         challenge.Challenge,
+		Signature:         sig,
+		BootstrapCode:     *code,
 	})
 	if err != nil {
 		return err
@@ -166,6 +229,9 @@ func cmdEnroll(ctx context.Context, args []string) error {
 		IssuerFingerprint: fingerprint,
 		IssuerCertPEM:     certPEM,
 		ProtectionLevel:   key.ProtectionLevel(),
+		Presence:          presenceState,
+		DevicePublicDER:   devicePub,
+		PresencePublicDER: presencePub,
 		KeyLabel:          platform.DeviceKeyLabel,
 		SocketPath:        sockPath,
 		EnrolledAt:        time.Now().UTC(),
@@ -184,8 +250,9 @@ func cmdEnroll(ctx context.Context, args []string) error {
 	manifest.RecordFile(ManifestPath(), nil, "the record of what totem changed")
 
 	fmt.Println()
-	fmt.Printf("This device is %s.\n", shortFingerprint(hex.EncodeToString(hashPublicKey(pubDER))))
+	fmt.Printf("This device is %s.\n", shortFingerprint(fingerprintHex))
 	fmt.Printf("Its key is kept in: %s\n", key.ProtectionLevel())
+	fmt.Printf("Confirming it's you:  %s\n", presenceDescription(presenceState))
 	if resp.Approved {
 		fmt.Println("Your issuer approved it.")
 	} else {
@@ -219,6 +286,15 @@ func publicKeyDER(pub crypto.PublicKey) ([]byte, error) {
 func hashPublicKey(der []byte) []byte {
 	sum := sha256.Sum256(der)
 	return sum[:]
+}
+
+// presenceDescription says, in words a person uses, what this device can do
+// about confirming a human is present. No SPIFFE or spec vocabulary.
+func presenceDescription(state presence.State) string {
+	if state == presence.StatePresent {
+		return "yes, this device can ask you to confirm"
+	}
+	return "no, this device cannot ask anyone to confirm (recorded on its setup)"
 }
 
 // hostOf returns the hostname part of an https URL, which is the default trust

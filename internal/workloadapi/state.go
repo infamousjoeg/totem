@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/infamousjoeg/totem/internal/presence"
 	tspiffe "github.com/infamousjoeg/totem/internal/spiffe"
 )
 
@@ -49,6 +50,24 @@ type State struct {
 	// ProtectionLevel is the true assurance of the device key, recorded at
 	// enroll and never inflated.
 	ProtectionLevel tspiffe.ProtectionLevel `json:"protection_level"`
+	// Presence is the presence state this device enrolled at. A device with no
+	// way to check for a human enrolls at "none", recorded and carried; it is
+	// never inflated to make an exchange succeed.
+	Presence presence.State `json:"presence,omitempty"`
+	// DevicePublicDER is the device key's public half as the issuer enrolled
+	// it, PKIX DER. It is kept so `totem doctor` can compare the key actually
+	// loaded from the key store against the key the issuer knows about.
+	//
+	// That comparison is not paranoia. A Secure Enclave key is persisted as a
+	// wrapped blob and re-imported, and a re-import that goes subtly wrong does
+	// not fail: it can hand back a fresh, working key that signs happily and
+	// verifies against nothing anyone ever enrolled. "A different key loaded
+	// and everything looks fine" is the dangerous case, and this field is what
+	// makes it detectable locally instead of at the issuer, or never.
+	DevicePublicDER []byte `json:"device_public_der,omitempty"`
+	// PresencePublicDER is the presence key's public half as enrolled. Nil
+	// only when Presence is "none".
+	PresencePublicDER []byte `json:"presence_public_der,omitempty"`
 	// KeyLabel is the platform key store label holding the device key.
 	KeyLabel string `json:"key_label"`
 	// SocketPath is where the agent serves the Workload API.

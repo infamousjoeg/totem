@@ -24,6 +24,7 @@ import (
 //	attest.ErrPIDReused          -> Aborted            (racy, retry is correct)
 //	attest.ErrTooManyShellHops   -> OutOfRange         (one hop is the range)
 //	attest.ErrInterpreterWrapped -> Unimplemented      (permanent by design)
+//	attest.ErrUnsignedAtWritablePath -> Unauthenticated (no credential of its own)
 //	ErrIssuerUnreachable         -> Unavailable        (retryable, not terminal)
 //	platform.ErrPresenceDenied   -> PermissionDenied   (human said no)
 func statusCodeFor(err error) codes.Code {
@@ -38,6 +39,11 @@ func statusCodeFor(err error) codes.Code {
 		return codes.OutOfRange
 	case errors.Is(err, attest.ErrInterpreterWrapped):
 		return codes.Unimplemented
+	case errors.Is(err, attest.ErrUnsignedAtWritablePath):
+		// Unauthenticated rather than PermissionDenied: the caller is not
+		// being refused a permission it might otherwise have, it has failed to
+		// present anything totem can authenticate it by at all.
+		return codes.Unauthenticated
 	case errors.Is(err, platform.ErrPresenceDenied):
 		return codes.PermissionDenied
 	case errors.Is(err, platform.ErrPresenceUnavailable):
@@ -71,6 +77,8 @@ func reasonFor(err error) string {
 		return "too_many_shell_hops"
 	case errors.Is(err, attest.ErrInterpreterWrapped):
 		return "interpreter_wrapped"
+	case errors.Is(err, attest.ErrUnsignedAtWritablePath):
+		return "unsigned_at_writable_path"
 	case errors.Is(err, platform.ErrPresenceDenied):
 		return "presence_denied"
 	case errors.Is(err, platform.ErrPresenceUnavailable):
@@ -125,6 +133,8 @@ func humanRefusal(err error, ident *attest.Identity) string {
 		return who + " reached totem through more than one shell, so totem cannot tell what actually asked."
 	case errors.Is(err, attest.ErrInterpreterWrapped):
 		return who + " runs as a script under an interpreter, which any program running as you can rewrite, so totem will not identify it."
+	case errors.Is(err, attest.ErrUnsignedAtWritablePath):
+		return who + " carries no signature totem can trace back to its maker, and it sits somewhere any program running as you could replace it, so totem has no way to know it is still the program you installed."
 	case errors.Is(err, platform.ErrPresenceDenied):
 		return "the confirmation prompt for " + who + " was declined or timed out."
 	case errors.Is(err, platform.ErrPresenceUnavailable):
@@ -167,6 +177,8 @@ func fixFor(err error, ident *attest.Identity) string {
 		return "Call the helper directly instead of through a wrapper script. 'totem doctor' prints the chain totem walked."
 	case errors.Is(err, attest.ErrInterpreterWrapped):
 		return "Install the native build of " + tool + " and run 'totem init' again. There is no flag that turns this off."
+	case errors.Is(err, attest.ErrUnsignedAtWritablePath):
+		return "Install the build " + tool + "'s maker signs, or put it somewhere only an administrator can write to, then run 'totem init' again. A locally built or ad-hoc signed copy cannot be identified and there is no flag that turns this off."
 	case errors.Is(err, platform.ErrPresenceDenied):
 		return "Run the command again and approve the prompt within 60 seconds."
 	case errors.Is(err, platform.ErrPresenceUnavailable):

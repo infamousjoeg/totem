@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/infamousjoeg/totem/internal/attest"
 )
 
 // Event kinds. docs/totem-design.md "Experience": `totem log` records refusals,
@@ -46,6 +48,46 @@ type Event struct {
 	Fix string `json:"fix,omitempty"`
 	// PID is the calling process, when one was attested.
 	PID int32 `json:"pid,omitempty"`
+	// PathProtected records whether the caller's binary and every parent
+	// directory were non-user-writable at the moment it was attested.
+	//
+	// It is recorded, never acted on. It is false for a normal Claude Code
+	// install because the Homebrew prefix is user-owned by design, so path
+	// protection is not the control for catalog binaries; the chain-verified
+	// signature and the kernel cdhash cross-check are. It is kept because it is
+	// a real difference in assurance that belongs in the audit line, and
+	// because issuer policy may one day want presence for a tool that ran from
+	// a writable path. `totem log` does not show it in normal operation: a
+	// false here is the ordinary case and surfacing it would train people to
+	// ignore a real warning later.
+	PathProtected bool `json:"path_protected,omitempty"`
+	// ShellHops is how many OS-signed shell processes the parent walk crossed
+	// to reach the attested tool. Recorded for the same reason.
+	ShellHops int `json:"shell_hops,omitempty"`
+	// ParentChain is the walk from the connecting process up to the catalog
+	// binary, so an audit line shows exactly how the identity was reached.
+	// Only written under a verbose logger.
+	ParentChain []string `json:"parent_chain,omitempty"`
+}
+
+// EventFor builds a log event carrying every fact attestation established
+// about a caller. It is the single place the audit line is assembled, so a
+// field cannot be recorded on a refusal and forgotten on an issuance.
+func EventFor(kind string, ident *attest.Identity, err error) Event {
+	ev := Event{Kind: kind}
+	if ident != nil {
+		ev.Tool = ident.Tool
+		ev.PID = ident.Peer.PID
+		ev.PathProtected = ident.PathProtected
+		ev.ShellHops = ident.ShellHops
+		ev.ParentChain = ident.ParentChain
+	}
+	if err != nil {
+		ev.Reason = reasonFor(err)
+		ev.Message = humanRefusal(err, ident)
+		ev.Fix = fixFor(err, ident)
+	}
+	return ev
 }
 
 // Logger appends events to the agent's local log as JSON lines. It is

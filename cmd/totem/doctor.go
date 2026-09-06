@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -29,6 +33,9 @@ type check struct {
 	ok     bool
 	detail string
 	fix    string
+	// notes are extra lines printed under the check, for detail that would
+	// make the one-line summary unreadable.
+	notes []string
 	// skipped marks a check that could not run, which is neither pass nor fail.
 	skipped bool
 }
@@ -54,10 +61,12 @@ func cmdDoctor(ctx context.Context, args []string) error {
 		checkEnrollment(state),
 		checkIssuerReachable(ctx, state),
 		checkClockSkew(ctx, state),
-		checkKeyStore(ctx),
+		checkKeyBackends(ctx),
+		checkDeviceKey(ctx, state),
 		checkSocket(state),
 		checkCatalog(),
 	}
+	checks = append(checks, checkToolAnchors()...)
 
 	failed := 0
 	for _, c := range checks {
@@ -72,6 +81,9 @@ func cmdDoctor(ctx context.Context, args []string) error {
 			if c.fix != "" {
 				fmt.Printf("       %s\n", c.fix)
 			}
+		}
+		for _, n := range c.notes {
+			fmt.Printf("       %s\n", n)
 		}
 	}
 	fmt.Println()
@@ -155,28 +167,230 @@ func checkClockSkew(ctx context.Context, state *workloadapi.State) check {
 	return check{name: "clock", ok: true, detail: fmt.Sprintf("within %s of your issuer", skew.Round(time.Second))}
 }
 
-// checkKeyStore reports what enrollment would get without creating anything.
-// KeyStore.ProtectionLevel is queryable before a key exists precisely so this
-// check does not have to make one.
-func checkKeyStore(ctx context.Context) check {
-	if platform.Open == nil {
-		return check{name: "device key", detail: "this build cannot keep a device key",
+// checkKeyBackends reports what enrollment would get on this machine, and what
+// stands between it and a better level, without creating anything.
+// platform.Probe is the same walk Open takes, so this is the honest preview
+// rather than a guess.
+func checkKeyBackends(ctx context.Context) check {
+	if platform.Probe == nil {
+		return check{name: "key storage", detail: "this build cannot keep a device key",
 			fix: "Use a build of totem for this operating system."}
 	}
-	store, err := platform.Open(ctx)
-	if err != nil {
-		return check{name: "device key", detail: fmt.Sprintf("no place to keep this device's key: %v", err),
-			fix: "Check that your login keychain is unlocked, then run 'totem doctor' again."}
+	candidates := platform.Probe(ctx)
+	if len(candidates) == 0 {
+		return check{name: "key storage", detail: "nowhere on this machine can keep a device key",
+			fix: "Run 'totem doctor' again after unlocking your login keychain."}
 	}
-	level := store.ProtectionLevel()
-	detail := fmt.Sprintf("kept in: %s", level)
-	switch level {
-	case spiffe.ProtectionHardware:
-		detail += " (this device's key cannot be copied off it)"
-	case spiffe.ProtectionKeyring, spiffe.ProtectionSoftware:
-		detail += " (no secure hardware here, which is fine and is recorded as part of this device's setup)"
+	var chosen *platform.Candidate
+	lines := make([]string, 0, len(candidates))
+	for i := range candidates {
+		c := candidates[i]
+		mark := "unavailable"
+		if c.Available {
+			mark = "usable"
+			if chosen == nil {
+				chosen = &candidates[i]
+			}
+		}
+		line := fmt.Sprintf("%s (%s, %s)", c.Name, c.Level, mark)
+		if c.Reason != "" {
+			line += ": " + c.Reason
+		}
+		lines = append(lines, line)
+	}
+	if chosen == nil {
+		return check{name: "key storage", detail: "nothing here can hold a device key right now", notes: lines,
+			fix: "Unlock your login keychain, or check that your secure hardware is reachable."}
+	}
+	detail := fmt.Sprintf("would use %s (%s)", chosen.Name, chosen.Level)
+	if !chosen.Presence {
+		detail += ", which cannot ask you to confirm"
+	}
+	return check{name: "key storage", ok: true, detail: detail, notes: lines}
+}
+
+// checkDeviceKey is the check that catches a device that has quietly stopped
+// being itself.
+//
+// It does two separate things, and both are needed. platform.Check really
+// re-imports the stored key into the hardware and really takes a signature
+// from it, so a machine whose stored blob no longer loads fails here rather
+// than at the next exchange; a doctor that only reported the protection level
+// would say "hardware, all good" on a machine that can no longer sign at all.
+// Then it compares both loaded public halves against the two the issuer
+// enrolled, because a re-import that goes subtly wrong does not error. It can
+// return a fresh, working key that signs happily and verifies against nothing
+// anyone ever enrolled. Only the comparison catches that, and only the issuer
+// would catch it otherwise, or nobody would.
+func checkDeviceKey(ctx context.Context, state *workloadapi.State) check {
+	key, err := platform.Check(ctx, keyLabel(state))
+	switch {
+	case errors.Is(err, platform.ErrKeyNotFound):
+		return check{
+			name:   "device key",
+			detail: "this device has no key, so it is not set up",
+			fix:    "Run the 'totem enroll' command your issuer operator gave you.",
+		}
+	case errors.Is(err, platform.ErrKeyUnloadable):
+		return check{
+			name:   "device key",
+			detail: "this device's key exists but can no longer be used (" + firstLine(err.Error()) + ")",
+			fix:    "This device has to be set up again. Run 'totem uninstall', then the 'totem enroll' command your issuer operator gave you. Do not skip this: nothing this device signs will be accepted until you do.",
+		}
+	case errors.Is(err, platform.ErrHardwareKeyStranded):
+		return check{
+			name:   "device key",
+			detail: "this device's key lives in secure hardware that is not reachable right now",
+			fix:    "Get the secure hardware working again, then run 'totem doctor'. Do NOT re-enroll to get around this: a new setup would land this device at a weaker level than the one it already has.",
+		}
+	case err != nil:
+		return check{
+			name:   "device key",
+			detail: "this device's key did not check out: " + firstLine(err.Error()),
+			fix:    "Run 'totem doctor' again. If it keeps failing, this device has to be set up again with 'totem enroll'.",
+		}
+	}
+
+	// The key on this machine works. The question left is whether it is the
+	// same key the issuer knows about.
+	if !state.Enrolled() || len(state.DevicePublicDER) == 0 {
+		return check{name: "device key", ok: true,
+			detail: fmt.Sprintf("loads and signs, kept in: %s (no setup on record to compare it against)", key.ProtectionLevel())}
+	}
+	loadedDevice, err := publicKeyDER(key.Public())
+	if err != nil {
+		return check{name: "device key", detail: "totem could not read this device's key back: " + err.Error(),
+			fix: "Run 'totem doctor' again. If it keeps failing, set this device up again with 'totem enroll'."}
+	}
+	if !bytes.Equal(loadedDevice, state.DevicePublicDER) {
+		return check{
+			name:   "device key",
+			detail: "this machine's key is NOT the one that was set up with your issuer",
+			fix:    "This device has to be set up again. Run 'totem uninstall', then the 'totem enroll' command your issuer operator gave you. Everything this device signs is being checked against a key your issuer does not have, so nothing it asks for will be accepted.",
+		}
+	}
+
+	// The presence half matters just as much and fails more quietly: a
+	// mismatch here leaves silent renewals working and every confirmation
+	// failing, which reads as a flaky sensor rather than a wrong key.
+	loadedPresence := key.PresencePublic()
+	switch {
+	case loadedPresence == nil && len(state.PresencePublicDER) > 0:
+		return check{
+			name:   "device key",
+			detail: "this device was set up as able to confirm it's you, and now it cannot",
+			fix:    "Run 'totem status'. If the secure hardware is reachable, set this device up again with 'totem enroll'; nothing that needs you to confirm will work until then.",
+		}
+	case loadedPresence != nil && len(state.PresencePublicDER) > 0:
+		lp, perr := publicKeyDER(loadedPresence)
+		if perr != nil {
+			return check{name: "device key", detail: "totem could not read the key that confirms it's you: " + perr.Error(),
+				fix: "Set this device up again with 'totem enroll'."}
+		}
+		if !bytes.Equal(lp, state.PresencePublicDER) {
+			return check{
+				name:   "device key",
+				detail: "the key this device uses to confirm it's you is NOT the one that was set up with your issuer",
+				fix:    "This device has to be set up again. Run 'totem uninstall', then the 'totem enroll' command your issuer operator gave you. Silent renewals would keep working and every confirmation would keep failing, which is the confusing failure this check exists to catch.",
+			}
+		}
+	}
+
+	detail := fmt.Sprintf("loads, signs, and matches your issuer's record; kept in: %s", key.ProtectionLevel())
+	if loadedPresence == nil {
+		detail += "; this device cannot ask you to confirm, which is recorded on its setup"
 	}
 	return check{name: "device key", ok: true, detail: detail}
+}
+
+// keyLabel is the key store label this device's key lives under.
+func keyLabel(state *workloadapi.State) string {
+	if state != nil && state.KeyLabel != "" {
+		return state.KeyLabel
+	}
+	return platform.DeviceKeyLabel
+}
+
+// checkToolAnchors reports each tool's anchor, which docs/totem-design.md
+// "Agent (laptop)" asks doctor for by name: whether the program is pinned to a
+// hash, or resting on its maker's signature, and whether the program sitting at
+// its path right now still matches that pin.
+//
+// A pinned tool whose hash moved is a refusal, not a warning, so it is reported
+// as a failed check with the exact command that resolves it. Decision 2:
+// `totem trust <tool>` shows the old and new hash and re-pins.
+func checkToolAnchors() []check {
+	pins, err := LoadPins()
+	if err != nil {
+		return []check{{name: "program anchors", detail: err.Error(),
+			fix: "Move " + PinsPath() + " out of the way and run 'totem init' again."}}
+	}
+	out := make([]check, 0, len(spiffe.Catalog))
+	for _, entry := range spiffe.Catalog {
+		out = append(out, checkOneToolAnchor(entry, pins[entry.Name]))
+	}
+	return out
+}
+
+func checkOneToolAnchor(entry spiffe.CatalogEntry, pin string) check {
+	name := "anchor: " + entry.Name
+	path := resolveToolPath(entry.ExpectedPaths)
+	if path == "" {
+		if pin == "" {
+			return check{name: name, skipped: true, detail: "not installed here"}
+		}
+		return check{name: name, skipped: true,
+			detail: "pinned to " + shortFingerprint(pin) + ", but not installed here right now"}
+	}
+	if pin == "" {
+		return check{name: name, ok: true,
+			detail: "relying on its maker's signature (" + entry.SigningID + "); not pinned to a specific copy",
+		}
+	}
+	sum, err := hashFile(path)
+	if err != nil {
+		return check{name: name, detail: "cannot read " + path + ": " + err.Error(),
+			fix: "Check the permissions on " + path + "."}
+	}
+	if sum != pin {
+		return check{
+			name:   name,
+			detail: "the copy at " + path + " is not the one totem pinned (pinned " + shortFingerprint(pin) + ", found " + shortFingerprint(sum) + ")",
+			fix:    "If you just updated " + entry.Name + ", run 'totem trust " + entry.Name + "' to see both and confirm the new one. If you did not update it, do not confirm it: run 'totem log' and find out what changed it.",
+		}
+	}
+	return check{name: name, ok: true, detail: "pinned to " + shortFingerprint(pin) + " and still matching"}
+}
+
+// resolveToolPath returns the first existing path among a catalog entry's
+// expected locations, which may contain ~ and glob wildcards.
+func resolveToolPath(paths []string) string {
+	for _, p := range paths {
+		matches, err := filepath.Glob(expandHome(p))
+		if err != nil {
+			continue
+		}
+		for _, m := range matches {
+			if fi, err := os.Stat(m); err == nil && fi.Mode().IsRegular() {
+				return m
+			}
+		}
+	}
+	return ""
+}
+
+// hashFile is the SHA-256 of a file in hex, which is the form a pin takes.
+func hashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // checkSocket verifies the Workload API socket is present, is a socket, is mode
@@ -219,29 +433,10 @@ func checkCatalog() check {
 		return check{name: "programs", detail: "no programs are set up, so totem would refuse every request",
 			fix: "Use a release build of totem; this one shipped without its program list."}
 	}
-	var names, missing []string
+	names := make([]string, 0, len(spiffe.Catalog))
 	for _, e := range spiffe.Catalog {
 		names = append(names, e.Name)
-		if !anyPathExists(e.ExpectedPaths) {
-			missing = append(missing, e.Name)
-		}
 	}
-	detail := fmt.Sprintf("%d set up (%s)", len(spiffe.Catalog), strings.Join(names, ", "))
-	if len(missing) > 0 {
-		return check{name: "programs", ok: true,
-			detail: detail + "; not installed here: " + strings.Join(missing, ", ")}
-	}
-	return check{name: "programs", ok: true, detail: detail}
-}
-
-// anyPathExists reports whether any of a catalog entry's expected locations
-// resolves on this machine. The paths may use ~ and glob wildcards.
-func anyPathExists(paths []string) bool {
-	for _, p := range paths {
-		matches, err := filepath.Glob(expandHome(p))
-		if err == nil && len(matches) > 0 {
-			return true
-		}
-	}
-	return false
+	return check{name: "programs", ok: true,
+		detail: fmt.Sprintf("%d totem can identify (%s); each one's anchor is below", len(spiffe.Catalog), strings.Join(names, ", "))}
 }

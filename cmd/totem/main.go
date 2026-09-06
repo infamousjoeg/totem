@@ -28,6 +28,7 @@ const usage = `totem %s
   totem trust           show the issuer this device is set up to trust
   totem log             what totem refused, asked, or could not do
   totem serve           run the agent (normally started for you at login)
+  totem rotate          renew this device's identity now instead of waiting
   totem uninstall       undo exactly what totem changed on this machine
   totem version         print the version
 
@@ -62,6 +63,8 @@ func run(args []string) int {
 		err = cmdLog(ctx, args[1:])
 	case "serve":
 		err = cmdServe(ctx, args[1:])
+	case "rotate":
+		err = cmdRotate(ctx, args[1:])
 	case "uninstall":
 		err = cmdUninstall(ctx, args[1:])
 	case "version", "--version", "-v":

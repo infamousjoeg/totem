@@ -18,6 +18,7 @@ import (
 	"time"
 
 	toterrors "github.com/infamousjoeg/totem/internal/errors"
+	"github.com/infamousjoeg/totem/internal/presence"
 	"github.com/infamousjoeg/totem/internal/spiffe"
 	"github.com/infamousjoeg/totem/internal/workloadapi"
 )
@@ -100,16 +101,57 @@ type ChallengeResponse struct {
 	ExpiresIn int    `json:"expires_in"`
 }
 
-// EnrollRequest is what the agent submits: the device public key, what kind of
-// hardware is holding it, and a presence assertion over the issuer's challenge.
+// EnrollRequest is what the agent submits: BOTH public halves of the device's
+// key material, the true protection level, the presence state the device is
+// enrolling at, and a presence-gated signature over the issuer's challenge.
+//
+// Both halves are required, and that is the whole point of the field pair. On
+// Apple silicon these are two Secure Enclave keys: a device key with no
+// presence access control that signs the silent half-life renewals, and a
+// companion key with a user-presence access control that signs presence
+// assertions. An enrollment that sent only the device half would look
+// completely successful and then fail to verify every presence assertion
+// forever, against the wrong key. So PresencePublicDER is either populated or
+// the enrollment explicitly says presence "none"; there is no third state.
 type EnrollRequest struct {
-	PublicKeyDER    []byte                 `json:"public_key_der"`
+	// DevicePublicDER is the device key's public half, PKIX DER. The issuer
+	// verifies silent renewals against this one.
+	DevicePublicDER []byte `json:"device_public_der"`
+	// PresencePublicDER is the presence key's public half, PKIX DER. The
+	// issuer verifies presence assertions against this one, including the
+	// enrollment signature below. It is nil only when Presence is "none".
+	PresencePublicDER []byte `json:"presence_public_der,omitempty"`
+	// Presence is the presence state this device is enrolling at. A device
+	// with no way to check for a human enrolls at "none", recorded and carried
+	// on the identity, and exchanges still work; it is never inflated to make
+	// an enrollment look better than it is.
+	Presence presence.State `json:"presence"`
+	// ProtectionLevel is the true assurance of the device key.
 	ProtectionLevel spiffe.ProtectionLevel `json:"protection_level"`
-	Hostname        string                 `json:"hostname"`
-	OS              string                 `json:"os"`
-	Challenge       []byte                 `json:"challenge"`
-	Signature       []byte                 `json:"signature"`
-	BootstrapCode   string                 `json:"bootstrap_code,omitempty"`
+	// Hostname and OS are shown to the human approving this device.
+	Hostname string `json:"hostname"`
+	OS       string `json:"os"`
+	// DeviceFingerprint is the SHA-256 of DevicePublicDER in hex. It is what
+	// the signature below is bound to, and the issuer can recompute it, so the
+	// signature cannot be lifted onto a different device's enrollment.
+	DeviceFingerprint string `json:"device_fingerprint"`
+	// SignedTool and SignedTarget are the other two fields bound into the
+	// signature, so the issuer reconstructs the exact signed bytes rather than
+	// trusting an encoding the caller supplied.
+	SignedTool   string `json:"signed_tool"`
+	SignedTarget string `json:"signed_target"`
+	// EncodingVersion is the presence encoding version the signature was made
+	// under.
+	EncodingVersion uint8 `json:"encoding_version"`
+	// Challenge is the issuer-minted, single-use value that was signed.
+	Challenge []byte `json:"challenge"`
+	// Signature is over the canonical enrollment signing bytes, from the
+	// presence key when the device has one and from the device key when it is
+	// enrolling at presence "none".
+	Signature []byte `json:"signature"`
+	// BootstrapCode is the one-time code from `totem-issuer init`, redeemed by
+	// the founding device.
+	BootstrapCode string `json:"bootstrap_code,omitempty"`
 }
 
 // EnrollResponse is what the issuer records and returns. Approval is a separate

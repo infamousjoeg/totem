@@ -170,6 +170,13 @@ func (a *Agent) TrustDomainID() string { return "spiffe://" + a.ca.trustDomain }
 // to, so a test can verify the chain independently.
 func (a *Agent) BundleDER() []byte { return a.ca.der }
 
+// Rotate forces the agent to renew every identity it is holding right now and
+// push the result down every open stream, through the same path a half-life
+// renewal takes. A conformance test that wants a rotation on demand calls this
+// instead of shelling out; a test that wants the natural path instead sets a
+// short SVIDLifetime and waits.
+func (a *Agent) Rotate() { a.srv.ForceRotate() }
+
 // Issued is how many SVIDs the agent has minted. A rotation test asserts this
 // grew while a stream stayed open.
 func (a *Agent) Issued() int { return a.ca.issued() }

@@ -222,6 +222,7 @@ func TestRejectionsAreLegible(t *testing.T) {
 		{"pid reused", attest.ErrPIDReused, codes.Aborted, "Run the command again"},
 		{"too many shell hops", attest.ErrTooManyShellHops, codes.OutOfRange, "totem doctor"},
 		{"interpreter wrapped", attest.ErrInterpreterWrapped, codes.Unimplemented, "native build"},
+		{"unsigned at writable path", attest.ErrUnsignedAtWritablePath, codes.Unauthenticated, "only an administrator can write"},
 	}
 	seen := map[codes.Code]string{}
 	for _, tc := range cases {
@@ -360,6 +361,43 @@ func TestServerImplementsGeneratedService(t *testing.T) {
 	_ = errors.New
 }
 
+// TestAuditLineCarriesAttestationFacts: PathProtected, ShellHops and the parent
+// chain are recorded on every line, never acted on, and never shown in normal
+// `totem log` output. A false PathProtected is the ordinary case for a real
+// Claude Code install, so surfacing it would train people to ignore a warning
+// that might one day matter.
+func TestAuditLineCarriesAttestationFacts(t *testing.T) {
+	ident := toolIdentity(t)
+	ident.PathProtected = false
+	ident.ShellHops = 1
+	ident.ParentChain = []string{"/opt/claude/bin/claude", "/bin/sh"}
+
+	ev := EventFor(KindIssuance, ident, nil)
+	if ev.Tool != testTool || ev.PID != ident.Peer.PID {
+		t.Errorf("event did not carry the attested caller: %+v", ev)
+	}
+	if ev.ShellHops != 1 {
+		t.Errorf("shell hops = %d, want 1", ev.ShellHops)
+	}
+	if len(ev.ParentChain) != 2 {
+		t.Errorf("parent chain = %v, want the walk that reached the tool", ev.ParentChain)
+	}
+	if ev.Message != "" || ev.Fix != "" {
+		t.Error("a successful issuance must not carry a refusal message")
+	}
+
+	ident.PathProtected = true
+	if !EventFor(KindIssuance, ident, nil).PathProtected {
+		t.Error("a true PathProtected must be recorded as true")
+	}
+
+	// The refusal path carries the same facts plus the reason.
+	ref := EventFor(KindRefusal, ident, attest.ErrUnsignedAtWritablePath)
+	if ref.Reason != "unsigned_at_writable_path" || ref.Fix == "" {
+		t.Errorf("refusal event = %+v, want a reason token and a fix", ref)
+	}
+}
+
 func contains(haystack, needle string) bool {
 	return len(needle) == 0 || (len(haystack) >= len(needle) && indexOf(haystack, needle) >= 0)
 }
@@ -371,4 +409,82 @@ func indexOf(h, n string) int {
 		}
 	}
 	return -1
+}
+
+// TestForceRotatePushesThroughTheRealPath proves the rotation trigger is not a
+// synthetic update injected into the stream: the SVID lifetime here is an hour,
+// so no half-life renewal is due, and the only way a second message arrives is
+// if ForceRotate drove a genuine re-mint at the source and pushed the result
+// down the open stream. The client never re-fetches.
+func TestForceRotatePushesThroughTheRealPath(t *testing.T) {
+	ca := newTestCA(t)
+	src := newFakeSource(ca)
+	src.lifetime = time.Hour // half-life is 30 minutes away; nothing is due
+	att := &fakeAttestor{identity: toolIdentity(t)}
+	client, srv, _ := testServer(t, att, src)
+
+	ctx, cancel := clientCtx(t)
+	defer cancel()
+
+	stream, err := client.FetchX509SVID(ctx, &workload.X509SVIDRequest{})
+	if err != nil {
+		t.Fatalf("FetchX509SVID: %v", err)
+	}
+	first, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	if got := src.fetchCount(); got != 1 {
+		t.Fatalf("issuer fetches = %d before rotating, want 1", got)
+	}
+
+	srv.ForceRotate()
+
+	second, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("ForceRotate did not push a renewed SVID: %v", err)
+	}
+	if string(first.Svids[0].X509Svid) == string(second.Svids[0].X509Svid) {
+		t.Error("the pushed SVID is byte-identical to the first; nothing was actually re-minted")
+	}
+	if got := src.fetchCount(); got != 2 {
+		t.Errorf("issuer fetches = %d after rotating, want 2; the update did not come from the issuer", got)
+	}
+	if att.callCount() < 2 {
+		t.Errorf("attestor called %d times; a forced rotation must re-check the connection like any other renewal", att.callCount())
+	}
+}
+
+// TestForceRotateStillRefusesAMovedPeer: a forced rotation is an ordinary
+// renewal, so it re-attests, and a peer whose binary changed loses the stream
+// rather than being handed a fresh credential.
+func TestForceRotateStillRefusesAMovedPeer(t *testing.T) {
+	ca := newTestCA(t)
+	first := toolIdentity(t)
+	moved := toolIdentity(t)
+	moved.BinaryHash = "changed"
+	att := &fakeAttestor{onCall: func(n int) (*attest.Identity, error) {
+		if n == 1 {
+			return first, nil
+		}
+		return moved, nil
+	}}
+	client, srv, _ := testServer(t, att, newFakeSource(ca))
+
+	ctx, cancel := clientCtx(t)
+	defer cancel()
+	stream, err := client.FetchX509SVID(ctx, &workload.X509SVIDRequest{})
+	if err != nil {
+		t.Fatalf("FetchX509SVID: %v", err)
+	}
+	if _, err := stream.Recv(); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+
+	srv.ForceRotate()
+
+	_, err = stream.Recv()
+	if got := status.Code(err); got != codes.FailedPrecondition {
+		t.Fatalf("code = %v, want FailedPrecondition (err=%v)", got, err)
+	}
 }

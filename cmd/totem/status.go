@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/infamousjoeg/totem/internal/presence"
 	"github.com/infamousjoeg/totem/internal/workloadapi"
 )
 
@@ -46,6 +47,7 @@ func cmdStatus(_ context.Context, args []string) error {
 		fmt.Printf("  device:        %s\n", state.DeviceID)
 	}
 	fmt.Printf("  key kept in:   %s\n", orDash(string(state.ProtectionLevel)))
+	fmt.Printf("  can confirm:   %s\n", confirmDescription(state))
 	fmt.Printf("  name:          %s\n", orDash(state.TrustDomain))
 	fmt.Println()
 
@@ -113,6 +115,20 @@ func latestRefusal() string {
 		return strings.TrimSpace(msg)
 	}
 	return ""
+}
+
+// confirmDescription says whether this device can ask a human to confirm. A
+// device that cannot still works; the fact is recorded on its setup and travels
+// with every identity, so a target that needs a person refuses this device
+// rather than being fooled by it.
+func confirmDescription(state *workloadapi.State) string {
+	if !state.Enrolled() {
+		return "not set up yet"
+	}
+	if state.Presence == presence.StatePresent {
+		return "yes, this device can ask you to confirm"
+	}
+	return "no (recorded on this device's setup; anything needing a person will refuse it)"
 }
 
 func yesNo(b bool) string {

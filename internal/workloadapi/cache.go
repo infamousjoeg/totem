@@ -19,6 +19,10 @@ type svidCache struct {
 
 	mu      sync.Mutex
 	entries map[string]*cacheEntry
+	// rotate is closed and replaced to wake every open stream at once. A
+	// channel rather than a condition variable because the stream loop is
+	// already selecting on its renewal timer and its context.
+	rotate chan struct{}
 }
 
 type cacheEntry struct {
@@ -39,7 +43,7 @@ func newSVIDCache(src Source, clock func() time.Time) *svidCache {
 	if clock == nil {
 		clock = time.Now
 	}
-	return &svidCache{src: src, clock: clock, entries: map[string]*cacheEntry{}}
+	return &svidCache{src: src, clock: clock, entries: map[string]*cacheEntry{}, rotate: make(chan struct{})}
 }
 
 func (c *svidCache) entryFor(key string) *cacheEntry {
@@ -110,11 +114,35 @@ func (c *svidCache) current(id string) *X509SVID {
 	return e.svid
 }
 
-// waitForRenewal blocks until svid reaches its half-life, the context ends, or
-// the maximum idle interval elapses. It is what makes the X509-SVID stream a
-// push: the server sleeps here and writes the next SVID when it has one, and
-// the client never polls.
-func (c *svidCache) waitForRenewal(ctx context.Context, svid *X509SVID) error {
+// rotateSignal returns the channel that closes on the next forced rotation. A
+// stream captures it BEFORE fetching, so a rotation racing between the fetch
+// and the wait wakes the stream rather than being lost.
+func (c *svidCache) rotateSignal() <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.rotate
+}
+
+// invalidateAll drops every cached SVID and wakes every open stream, which
+// makes each one re-mint at the issuer and push the new SVID down the same
+// path a half-life renewal takes. It fabricates nothing: the next credential
+// still comes from the issuer, so a caller cannot use this to conjure an SVID.
+func (c *svidCache) invalidateAll() {
+	c.mu.Lock()
+	for _, e := range c.entries {
+		e.svid = nil
+	}
+	woken := c.rotate
+	c.rotate = make(chan struct{})
+	c.mu.Unlock()
+	close(woken)
+}
+
+// waitForRenewal blocks until svid reaches its half-life, a rotation is forced,
+// the context ends, or the maximum idle interval elapses. It is what makes the
+// X509-SVID stream a push: the server sleeps here and writes the next SVID when
+// it has one, and the client never polls.
+func (c *svidCache) waitForRenewal(ctx context.Context, svid *X509SVID, rotated <-chan struct{}) error {
 	const maxWait = 5 * time.Minute
 	wait := maxWait
 	if svid != nil {
@@ -123,13 +151,15 @@ func (c *svidCache) waitForRenewal(ctx context.Context, svid *X509SVID) error {
 		}
 	}
 	if wait <= 0 {
-		return ctx.Err()
+		return nil
 	}
 	t := time.NewTimer(wait)
 	defer t.Stop()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-rotated:
+		return nil
 	case <-t.C:
 		return nil
 	}

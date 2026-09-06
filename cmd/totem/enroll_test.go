@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
@@ -9,6 +13,7 @@ import (
 
 	toterrors "github.com/infamousjoeg/totem/internal/errors"
 	"github.com/infamousjoeg/totem/internal/platform"
+	"github.com/infamousjoeg/totem/internal/presence"
 	"github.com/infamousjoeg/totem/internal/workloadapi"
 )
 
@@ -92,6 +97,7 @@ func TestNewIssuerClientRefusesAnUnpinnedIssuer(t *testing.T) {
 type stubIssuer struct {
 	unreachable bool
 	fingerprint string
+	captured    *EnrollRequest
 }
 
 func (s stubIssuer) CertificateFingerprint(context.Context) (string, string, error) {
@@ -108,10 +114,13 @@ func (s stubIssuer) Challenge(context.Context, ChallengeRequest) (*ChallengeResp
 		return nil, &cliError{reason: toterrors.ReasonIssuerUnreachable, retryAfter: 30,
 			what: "could not reach your issuer.", cause: workloadapi.ErrIssuerUnreachable}
 	}
-	return &ChallengeResponse{Challenge: []byte("challenge"), ExpiresIn: 60}, nil
+	return &ChallengeResponse{Challenge: make([]byte, presence.ChallengeSize), ExpiresIn: 60}, nil
 }
 
-func (s stubIssuer) Enroll(context.Context, EnrollRequest) (*EnrollResponse, error) {
+func (s stubIssuer) Enroll(_ context.Context, req EnrollRequest) (*EnrollResponse, error) {
+	if s.captured != nil {
+		*s.captured = req
+	}
 	return &EnrollResponse{DeviceID: "dev1", TrustDomain: "issuer.example", Approved: true}, nil
 }
 
@@ -224,5 +233,146 @@ func TestAsCLIErrorClassifiesTypedErrors(t *testing.T) {
 	}
 	if got := asCLIError(errors.New("something went sideways")).reason; got != "" {
 		t.Errorf("an unclassified error got reason %q; it must carry none rather than an invented token", got)
+	}
+}
+
+// TestEnrollSubmitsBothPublicHalves is the invariant that platform.PresencePublic
+// exists to protect. On Apple silicon the device key and the presence key are
+// two different Secure Enclave keys, and the issuer verifies different things
+// against each. An enrollment that sent only the device half would succeed,
+// look completely healthy, and then fail to verify every presence assertion
+// forever, against the wrong key.
+func TestEnrollSubmitsBothPublicHalves(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	k := newFakeKey(t, true)
+	useKey(t, &fakeStore{key: k})
+
+	var got EnrollRequest
+	restore := newIssuerClient
+	newIssuerClient = func(IssuerAddr) (IssuerClient, error) {
+		return stubIssuer{fingerprint: testFingerprint, captured: &got}, nil
+	}
+	t.Cleanup(func() { newIssuerClient = restore })
+
+	if err := cmdEnroll(context.Background(), []string{"https://issuer.example#sha256:" + testFingerprint}); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+
+	wantDevice, _ := publicKeyDER(k.Public())
+	wantPresence, _ := publicKeyDER(k.PresencePublic())
+	if !bytes.Equal(got.DevicePublicDER, wantDevice) {
+		t.Error("the device key's public half was not submitted")
+	}
+	if len(got.PresencePublicDER) == 0 {
+		t.Fatal("the presence key's public half was not submitted; every presence assertion would verify against the wrong key")
+	}
+	if !bytes.Equal(got.PresencePublicDER, wantPresence) {
+		t.Error("the submitted presence public half is not this device's presence key")
+	}
+	if bytes.Equal(got.DevicePublicDER, got.PresencePublicDER) {
+		t.Error("both halves were submitted as the same key")
+	}
+	if got.Presence != presence.StatePresent {
+		t.Errorf("presence = %q, want %q", got.Presence, presence.StatePresent)
+	}
+
+	// The enrollment record keeps both halves so doctor can compare later.
+	st, err := workloadapi.LoadState("")
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	if !bytes.Equal(st.DevicePublicDER, wantDevice) || !bytes.Equal(st.PresencePublicDER, wantPresence) {
+		t.Error("the enrollment record did not keep both public halves")
+	}
+	if st.Presence != presence.StatePresent {
+		t.Errorf("recorded presence = %q", st.Presence)
+	}
+}
+
+// TestEnrollRecordsPresenceNoneHonestly: a device with no way to check for a
+// human still enrolls, and the fact is recorded rather than glossed over.
+func TestEnrollRecordsPresenceNoneHonestly(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	k := newFakeKey(t, false) // no presence half at all
+	useKey(t, &fakeStore{key: k})
+
+	var got EnrollRequest
+	restore := newIssuerClient
+	newIssuerClient = func(IssuerAddr) (IssuerClient, error) {
+		return stubIssuer{fingerprint: testFingerprint, captured: &got}, nil
+	}
+	t.Cleanup(func() { newIssuerClient = restore })
+
+	if err := cmdEnroll(context.Background(), []string{"https://issuer.example#sha256:" + testFingerprint}); err != nil {
+		t.Fatalf("a device with no presence capability must still enroll: %v", err)
+	}
+	if got.Presence != presence.StateNone {
+		t.Errorf("presence = %q, want %q recorded on the enrollment", got.Presence, presence.StateNone)
+	}
+	if len(got.PresencePublicDER) != 0 {
+		t.Error("a presence public half was submitted for a device that has none")
+	}
+	if len(got.Signature) == 0 {
+		t.Error("the enrollment was not signed at all")
+	}
+
+	st, err := workloadapi.LoadState("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Presence != presence.StateNone {
+		t.Errorf("recorded presence = %q, want %q", st.Presence, presence.StateNone)
+	}
+}
+
+// TestEnrollSignsDomainSeparatedBytes: the signature is over presence's
+// canonical, domain-separated encoding, never over the raw challenge. A
+// signature made to enroll a device must not be indistinguishable from a
+// signature made over the same bytes for some other purpose.
+func TestEnrollSignsDomainSeparatedBytes(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	k := newFakeKey(t, true)
+	useKey(t, &fakeStore{key: k})
+
+	var got EnrollRequest
+	restore := newIssuerClient
+	newIssuerClient = func(IssuerAddr) (IssuerClient, error) {
+		return stubIssuer{fingerprint: testFingerprint, captured: &got}, nil
+	}
+	t.Cleanup(func() { newIssuerClient = restore })
+
+	if err := cmdEnroll(context.Background(), []string{"https://issuer.example#sha256:" + testFingerprint}); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+
+	// The raw challenge must NOT verify: that is what domain separation means.
+	rawDigest := sha256.Sum256(got.Challenge)
+	if ecdsa.VerifyASN1(&k.device.PublicKey, rawDigest[:], got.Signature) {
+		t.Fatal("the enrollment signature verifies over the bare challenge; it is not domain-separated")
+	}
+
+	// The canonical encoding must verify, reconstructed from the fields the
+	// request carries, which is exactly what the issuer will do.
+	in := presence.SigningInput{
+		Version:   got.EncodingVersion,
+		DeviceID:  got.DeviceFingerprint,
+		Tool:      got.SignedTool,
+		Target:    got.SignedTarget,
+		Challenge: got.Challenge,
+	}
+	signed, err := in.Bytes()
+	if err != nil {
+		t.Fatalf("canonical bytes: %v", err)
+	}
+	digest := sha256.Sum256(signed)
+	if !ecdsa.VerifyASN1(&k.device.PublicKey, digest[:], got.Signature) {
+		t.Fatal("the issuer cannot reconstruct the signed bytes from the fields the enrollment carries")
+	}
+
+	if got.DeviceFingerprint != hex.EncodeToString(hashPublicKey(got.DevicePublicDER)) {
+		t.Error("the fingerprint bound into the signature is not derived from the submitted device key, so the signature could be lifted onto another enrollment")
+	}
+	if got.SignedTarget != "https://issuer.example" {
+		t.Errorf("signed target = %q; the signature is not bound to this issuer", got.SignedTarget)
 	}
 }
