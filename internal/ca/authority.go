@@ -45,12 +45,13 @@ const (
 type authority struct {
 	mu sync.Mutex
 
-	dir         string
-	trustDomain spiffeid.TrustDomain
-	resolver    summon.Resolver
-	passRef     summon.Reference
-	now         func() time.Time
-	rootProv    RootProvider
+	dir             string
+	trustDomain     spiffeid.TrustDomain
+	resolver        summon.Resolver
+	passRef         summon.Reference
+	now             func() time.Time
+	rootProv        RootProvider
+	nameConstraints bool
 
 	salt   []byte
 	roots  []*x509.Certificate
@@ -218,6 +219,9 @@ func newAuthority(cfg Config) (*authority, error) {
 		passRef:     cfg.PassphraseRef,
 		now:         now,
 		rootProv:    cfg.Root,
+		// Default ON: the zero value of DisableNameConstraints keeps the
+		// constraint, so removing the control is always a deliberate act.
+		nameConstraints: !cfg.DisableNameConstraints,
 	}
 	if a.rootProv == nil {
 		a.rootProv = &localRoot{a: a}
@@ -389,6 +393,21 @@ func (a *authority) createIntermediate(ctx context.Context, subject string, notB
 		MaxPathLenZero:        true,
 		SubjectKeyId:          skid,
 		SignatureAlgorithm:    caSignatureAlgorithm,
+	}
+	if a.nameConstraints {
+		// The constraint is on the INTERMEDIATE, not the root. It binds
+		// everything the intermediate signs, which is every credential totem
+		// issues, and backing it out costs one thirty-day rotation. The same
+		// constraint on the root would bind the intermediates too, but backing
+		// it out would cost a root-rotation ceremony across every relying
+		// party's trust anchor, and this control is new enough that it should
+		// be reversible at the cheaper tier.
+		//
+		// Critical, as RFC 5280 requires. A non-critical name constraint is
+		// advisory: a verifier is free to ignore it, which would leave the
+		// control looking present while doing nothing.
+		tmpl.PermittedURIDomains = []string{a.trustDomain.Name()}
+		tmpl.PermittedDNSDomainsCritical = true
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, rootCert, key.Public(), rootSigner)
 	if err != nil {

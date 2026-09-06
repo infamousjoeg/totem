@@ -169,6 +169,72 @@ type RootOperator interface {
 	RotateRoot(ctx context.Context, req RootRotationRequest) (*Bundle, error)
 }
 
+// PassphraseOperator is the CA-passphrase maintenance surface: detecting that
+// the Summon-resolved passphrase no longer opens the sealed CA material, and
+// re-sealing it under a new one.
+//
+// It exists because of a failure mode with the worst possible diagnostic shape.
+// Summon rotation is pull-based on an hourly default. If the CA passphrase
+// rotates, the RUNNING issuer is unaffected, because the intermediate private
+// keys are already unsealed in memory. Nothing breaks, nothing is logged, and
+// the issuer keeps minting correctly for as long as it stays up. Then it
+// restarts, days or weeks later, cannot unseal its own CA material, and the old
+// passphrase is long gone. The cause and the symptom are separated by an
+// arbitrary amount of time and by a restart that looks unrelated.
+//
+// So the CA passphrase reference should be EXCLUDED from pull-based rotation
+// (it protects key material at rest, and rotating it automatically under a
+// process that cannot re-seal is strictly harmful), and VerifyPassphrase exists
+// to catch it if that exclusion is ever missed, while the old value is still
+// reachable and the fix is still cheap.
+//
+// It is a separate interface from Authority for the same reason RootOperator
+// is: a request handler holding an Authority should be structurally unable to
+// re-seal the CA.
+type PassphraseOperator interface {
+	// VerifyPassphrase resolves the CA passphrase and checks that it still
+	// opens every sealed key file on disk, returning ErrPassphraseChanged
+	// naming the files it does not.
+	//
+	// It tests the real property rather than a proxy for it: it attempts the
+	// actual unseal that a restart would attempt. A cached hash of the
+	// passphrase would be cheaper and would answer a slightly different
+	// question, and the difference between those two questions is exactly where
+	// a latent brick hides.
+	//
+	// The issuer is expected to call this on a timer and, on failure, to log
+	// loudly and repeatedly that it will NOT restart successfully until
+	// `issuer reseal-ca` has been run. A single warning at the moment of
+	// rotation is not enough, because the operator who needs to see it may not
+	// be looking for weeks.
+	//
+	// A missing root key file is not a failure: a root carried off the box is
+	// the intended offline posture, and there is nothing local to re-seal.
+	VerifyPassphrase(ctx context.Context) error
+
+	// Reseal re-seals every sealed key file under the passphrase the resolver
+	// returns NOW, given the previous passphrase that currently opens them.
+	// This is the mechanism behind `issuer reseal-ca`.
+	//
+	// It is idempotent and safe to re-run: a file that already opens under the
+	// current passphrase is left alone, so a Reseal interrupted halfway can be
+	// completed by running it again with the same previous value. That matters
+	// because the files are re-sealed one at a time and no filesystem offers to
+	// rename a group of them atomically, so "interrupted halfway" is a state
+	// that has to be recoverable rather than prevented.
+	//
+	// The KDF salt is deliberately NOT changed. Rotating it would mean every
+	// file has to be rewritten together for any of them to be readable, which
+	// turns a recoverable partial write into an unrecoverable one, and the salt
+	// defends against cross-installation precomputation rather than against
+	// anything a passphrase change affects.
+	//
+	// previous may be nil when only the in-memory intermediate keys need
+	// re-sealing, but a root key file present on disk cannot be re-sealed
+	// without it and Reseal says so rather than leaving it stale.
+	Reseal(ctx context.Context, previous []byte) error
+}
+
 // Constructors land with the implementation. They are named here so the shape
 // of the dependency is part of the contract rather than a surprise at wiring
 // time:
@@ -207,6 +273,34 @@ type Config struct {
 	// must sit under. An identity from another trust domain is
 	// ErrTrustDomainMismatch, not a cross-signed courtesy.
 	TrustDomain string
+
+	// DisableNameConstraints removes the URI name constraint from intermediates
+	// created from here on. The zero value keeps the constraint, so the control
+	// is on by default and turning it off is a deliberate act with a name that
+	// says what it does.
+	//
+	// With the constraint, an intermediate carries a critical nameConstraints
+	// extension permitting only URIs under this CA's trust domain, so an
+	// intermediate whose key has been stolen STRUCTURALLY cannot mint a usable
+	// identity in someone else's trust domain: a correct verifier rejects the
+	// chain no matter what the holder of the key signs. That is a stronger
+	// statement than IssueSVID refusing a foreign trust domain, because the
+	// refusal only binds callers who come through this package and the
+	// constraint binds anyone holding the key.
+	//
+	// PRE-FLIGHT FOR STEP 4: docs/totem-design.md requires totem's certificate
+	// profile to be verified against AWS Roles Anywhere before the AWS bridge
+	// is built. The nameConstraints extension is marked critical, as RFC 5280
+	// requires, so a relying party that cannot parse it rejects the chain
+	// outright. If Roles Anywhere turns out not to accept a URI-name-constrained
+	// chain, this flag is how the constraint comes back out, with the reason
+	// recorded, rather than being quietly deleted from the template.
+	//
+	// It takes effect on the NEXT intermediate created, not retroactively:
+	// constraints are baked into a certificate at signing, so changing this
+	// flag changes nothing until a rotation. Existing intermediates keep what
+	// they were signed with.
+	DisableNameConstraints bool
 
 	// RequireFIPS makes non-approved configuration fatal: if the binary is not
 	// running under the FIPS Go crypto module, Open fails with ErrFIPSRequired
@@ -721,6 +815,14 @@ var (
 	// an unverified claim lets a caller write serials into a CRL that this CA
 	// never issued.
 	ErrNotOurCertificate = errors.New("ca: certificate does not chain to this CA; refusing to revoke on an unverified claim")
+
+	// ErrPassphraseChanged means the passphrase the Summon provider returns no
+	// longer opens the sealed CA material on disk. The issuer keeps running,
+	// because its keys are already unsealed in memory, and then FAILS TO START
+	// next time. Treat it as an outage that has already happened and is merely
+	// waiting for a restart to become visible: shout, repeatedly, and run
+	// `issuer reseal-ca` while the previous value is still reachable.
+	ErrPassphraseChanged = errors.New("ca: the resolved CA passphrase no longer opens the sealed CA material; the issuer will not restart until it is re-sealed")
 
 	// ErrClosed means the Authority has been closed.
 	ErrClosed = errors.New("ca: authority is closed")

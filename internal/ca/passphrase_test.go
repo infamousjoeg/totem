@@ -1,0 +1,229 @@
+package ca
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func (c *testCA) setPassphrase(p string) {
+	c.res.mu.Lock()
+	defer c.res.mu.Unlock()
+	c.res.pass = p
+}
+
+// TestPassphraseRotationIsLatentUntilRestart demonstrates the failure this
+// whole mechanism exists for, before demonstrating the detection.
+//
+// Summon rotation is pull-based on an hourly default. When the CA passphrase
+// rotates, the running issuer is completely unaffected: its intermediate keys
+// are already unsealed in memory, so it keeps minting correct certificates and
+// nothing anywhere reports a problem. The brick only lands at the next restart,
+// which may be weeks later and will look unrelated. That gap is the point.
+func TestPassphraseRotationIsLatentUntilRestart(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ca := newTestCA(t)
+
+	ca.setPassphrase("a completely different passphrase")
+
+	// The running issuer does not notice, and this is not a bug in the issuer.
+	if _, err := ca.IssueSVID(ctx, SVIDRequest{ID: deviceID("claude"), PublicKey: newSVIDKey(t).Public()}); err != nil {
+		t.Fatalf("a rotated passphrase must not disturb a running issuer: %v", err)
+	}
+	if _, err := ca.Bundle(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// A restart is where it lands.
+	if err := ca.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Open(ctx, Config{
+		Dir: ca.dir, Resolver: ca.res, PassphraseRef: "ca_passphrase",
+		TrustDomain: testTrustDomain, Now: ca.clk.now,
+	})
+	if err == nil {
+		t.Fatal("the issuer must fail to reopen under a rotated passphrase; if this passes, the seal is not doing anything")
+	}
+	if !strings.Contains(err.Error(), "unseal") {
+		t.Fatalf("reopen failed with %v, want an unseal failure", err)
+	}
+}
+
+// TestVerifyPassphraseCatchesItWhileTheOldValueIsStillReachable is the
+// detection half: it converts a silent brick into a visible alarm at the moment
+// of rotation, when the previous value can still be fetched and the fix is
+// cheap.
+func TestVerifyPassphraseCatchesItWhileTheOldValueIsStillReachable(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ca := newTestCA(t)
+
+	op, ok := ca.Authority.(PassphraseOperator)
+	if !ok {
+		t.Fatal("the authority must implement PassphraseOperator")
+	}
+	if err := op.VerifyPassphrase(ctx); err != nil {
+		t.Fatalf("a freshly initialised CA must verify: %v", err)
+	}
+
+	ca.setPassphrase("rotated out from under us")
+	err := op.VerifyPassphrase(ctx)
+	if !errors.Is(err, ErrPassphraseChanged) {
+		t.Fatalf("got %v, want ErrPassphraseChanged", err)
+	}
+	// The message has to name the files, because a partial re-seal is a real
+	// state and "something is wrong" would not tell the operator which.
+	for _, want := range []string{rootPrefix, interPrefix} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the error must name the unopenable files, got %q", err)
+		}
+	}
+}
+
+// TestVerifyPassphraseIgnoresAnOfflineRoot: a root carried off the box is the
+// intended posture, not a fault, and there is nothing local to re-seal.
+func TestVerifyPassphraseIgnoresAnOfflineRoot(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ca := newTestCA(t)
+	op := ca.Authority.(PassphraseOperator)
+
+	roots, err := filepath.Glob(filepath.Join(ca.dir, rootPrefix+"*"+keySuffix))
+	if err != nil || len(roots) != 1 {
+		t.Fatalf("want one root key file, got %v", roots)
+	}
+	if err := os.Rename(roots[0], filepath.Join(t.TempDir(), "root.key")); err != nil {
+		t.Fatal(err)
+	}
+	if err := op.VerifyPassphrase(ctx); err != nil {
+		t.Fatalf("an offline root must not read as a passphrase failure: %v", err)
+	}
+}
+
+// TestResealRecoversTheCA is the repair half, end to end: rotate the
+// passphrase, re-seal with the previous one, and confirm the thing that
+// actually matters, which is that a restart now succeeds and the CA still
+// works.
+func TestResealRecoversTheCA(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ca := newTestCA(t)
+	op := ca.Authority.(PassphraseOperator)
+	const oldPass = "a-passphrase-only-summon-knows"
+
+	before, err := ca.IssueSVID(ctx, SVIDRequest{ID: deviceID("claude"), PublicKey: newSVIDKey(t).Public()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ca.setPassphrase("the new value the provider now returns")
+	if err := op.Reseal(ctx, []byte(oldPass)); err != nil {
+		t.Fatalf("Reseal: %v", err)
+	}
+	if err := op.VerifyPassphrase(ctx); err != nil {
+		t.Fatalf("after re-sealing the CA must verify: %v", err)
+	}
+
+	// Idempotent: running it again is not an error and does not need the old
+	// value any more.
+	if err := op.Reseal(ctx, nil); err != nil {
+		t.Fatalf("re-running Reseal must be safe: %v", err)
+	}
+
+	// The property that was actually wanted: a restart succeeds.
+	if err := ca.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(ctx, Config{
+		Dir: ca.dir, Resolver: ca.res, PassphraseRef: "ca_passphrase",
+		TrustDomain: testTrustDomain, Now: ca.clk.now,
+	})
+	if err != nil {
+		t.Fatalf("reopening after a re-seal: %v", err)
+	}
+	defer reopened.Close()
+
+	bundle, err := reopened.Bundle(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyAgainstBundle(t, before.Certificate, bundle, ca.clk.now()); err != nil {
+		t.Fatalf("a credential issued before the re-seal stopped verifying: %v", err)
+	}
+	if _, err := reopened.IssueSVID(ctx, SVIDRequest{ID: deviceID("claude"), PublicKey: newSVIDKey(t).Public()}); err != nil {
+		t.Fatalf("issuing after a re-seal: %v", err)
+	}
+	// And the root is genuinely re-sealed, not merely skipped: rotation needs
+	// the root signer, which has to unseal under the new passphrase.
+	sched, err := reopened.Schedule(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca.clk.set(sched.RotateAfter.Add(time.Hour))
+	if _, err := reopened.RotateIntermediate(ctx); err != nil {
+		t.Fatalf("rotating after a re-seal must unseal the root under the new passphrase: %v", err)
+	}
+}
+
+// TestResealWithoutThePreviousPassphraseSaysWhatItCouldNotDo: the intermediates
+// can be re-sealed from the keys already in memory, but the root only exists on
+// disk. A partial result must be named rather than reported as success.
+func TestResealWithoutThePreviousPassphraseSaysWhatItCouldNotDo(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ca := newTestCA(t)
+	op := ca.Authority.(PassphraseOperator)
+	const oldPass = "a-passphrase-only-summon-knows"
+
+	ca.setPassphrase("new value")
+	err := op.Reseal(ctx, nil)
+	if !errors.Is(err, ErrPassphraseChanged) {
+		t.Fatalf("got %v, want ErrPassphraseChanged naming the root", err)
+	}
+	if !strings.Contains(err.Error(), rootPrefix) {
+		t.Fatalf("the error must name the root key file, got %q", err)
+	}
+	// It must fail on the "I could not do this, here is how to finish it" path,
+	// not merely on the final confirmation that something is still unopenable.
+	// Both are loud, but only one tells the operator what to do next, and a
+	// generic "still does not open" at the end of a re-seal reads like the
+	// re-seal itself is broken rather than like it needs one more input.
+	if !strings.Contains(err.Error(), "re-run reseal with it") {
+		t.Fatalf("the error must tell the operator to re-run with the previous passphrase, got %q", err)
+	}
+
+	// The intermediates did get re-sealed from memory, so this is a real
+	// partial state, and finishing it is just running Reseal again with the
+	// previous value.
+	if err := op.Reseal(ctx, []byte(oldPass)); err != nil {
+		t.Fatalf("completing an interrupted re-seal: %v", err)
+	}
+	if err := op.VerifyPassphrase(ctx); err != nil {
+		t.Fatalf("after completing the re-seal: %v", err)
+	}
+}
+
+// TestResealRefusesAWrongPreviousPassphrase: it must not report success for a
+// file it could not open, because the operator would then believe a restart is
+// safe when it is not.
+func TestResealRefusesAWrongPreviousPassphrase(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ca := newTestCA(t)
+	op := ca.Authority.(PassphraseOperator)
+
+	ca.setPassphrase("new value")
+	err := op.Reseal(ctx, []byte("not the previous passphrase either"))
+	if err == nil {
+		t.Fatal("re-sealing with a wrong previous passphrase must fail loudly")
+	}
+	if !strings.Contains(err.Error(), "neither the current nor the previous") {
+		t.Fatalf("got %v, want an error naming the file that opens under neither", err)
+	}
+}
