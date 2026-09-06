@@ -212,6 +212,18 @@ The ride-along sentence is a load-bearing claim and stays on the README's first 
 
 Parking is async and resumable (`parked, id=X`, polled across heartbeats), never blocking. Parked items split by reversibility: reversible queues for one-tap morning approval, irreversible waits for presence with no pre-signing; pre-blessed lists enumerate operations, never categories. Money is a grant primitive with per-transaction and per-day ceilings and a presence floor. Grants scope by entity and action within a relying party. The README states that totem governs credentialed relying parties and outward communication is the harness's job. `~/.totem/last-error` JSON is the machine error contract; exit codes are the fast path. `agents propose` outputs three layers with the ceiling shown as prominently as the grant. Self-narrowing is instant and monotonic, inherits expiry and lineage, can never drop logging or the kill switch, and re-widening requires presence. Provenance framing: agents should want to be legible.
 
+## 38. The rollback witness is the fleet
+
+Raised during the step 2 review, which asked where the chain head witness lives and correctly refused to answer it from inside the store package.
+
+The chain is tamper-evident forward and not against rollback. Truncating the tail and rewriting the recorded tip leaves a prefix with no broken link and no gap in the ordinals, and cutting back past a revocation restores access a human took away.
+
+A witness the issuer host keeps for itself does not close this. That host holds the signing key, so it can produce any head it likes and sign it. The asymmetry available to us is that a value already delivered to a device cannot be recalled. So agents hold the highest `(seq, hash)` the issuer has shown them and require proof on each contact that the record is still in the chain being served. It ships with the versioned agent protocol: a protocol field, agent-side persistent state, and a consistency endpoint.
+
+Restore is a separate and cheaper case, closed now. A restore that moves the chain backwards, or onto a chain that is not the live one's own history, is refused; the live head is re-read under the lock so an append during decryption cannot slip past. Deliberate rollback restores into a fresh directory.
+
+Interim, not a substitute: the issuer states its head at open and after every restore, and the log stream already leaves the box. An attacker holding the host also holds the emitter, so this catches operator error and a clumsy rollback, nothing stronger, and it is commented that way.
+
 ## Carried from adversarial QA without a separate decision
 
 - Threat model out of scope: compromised kernel or root, physical attacks on the secure element, hostile issuer operator.
