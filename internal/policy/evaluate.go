@@ -52,7 +52,11 @@ func (i *Issuer) evaluateTool(ctx context.Context, a *Attested, req Request, ass
 	if a.state == presence.StateDelegated {
 		return deny("a delegated credential cannot act as an interactive tool"), nil
 	}
-	escalate := req.AmountUSD > presence.TrivialMoneyUSD
+	// Money above trivial escalates a windowed target to a per-request
+	// touch. Written as "not provably trivial" so a NaN, infinite or
+	// negative amount escalates too, the same sense as Money.Decide on the
+	// agent path, rather than sliding under the floor by failing a compare.
+	escalate := !(req.AmountUSD >= 0 && req.AmountUSD <= presence.TrivialMoneyUSD)
 	d := i.cfg.Sessions.Evaluate(a.id.DeviceID, w, escalate)
 
 	// A device with no presence capability: windowed targets work and the

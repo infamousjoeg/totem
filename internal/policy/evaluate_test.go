@@ -3,6 +3,7 @@ package policy
 import (
 	"context"
 	"crypto/x509"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -142,6 +143,14 @@ func TestToolPresenceWindows(t *testing.T) {
 	d, _ = w.iss.Evaluate(ctx, aws, Request{Tool: "aws", Target: "dev", AmountUSD: 6, Hash: h})
 	if d.Verdict != VerdictPrompt || d.Binding != presence.BindingRequired {
 		t.Fatalf("money on windowed target %+v", d)
+	}
+	// An amount that is not provably trivial (NaN, infinite, negative)
+	// escalates too; it must not slide under the floor by failing a compare.
+	for _, amt := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), -1} {
+		d, _ = w.iss.Evaluate(ctx, aws, Request{Tool: "aws", Target: "dev", AmountUSD: amt, Hash: h})
+		if d.Verdict != VerdictPrompt || d.Binding != presence.BindingRequired {
+			t.Fatalf("amount %v on windowed target %+v", amt, d)
+		}
 	}
 
 	// step-up parks with an id, and a present human on ANOTHER device
