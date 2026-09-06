@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/pem"
 	"net/http"
 	"time"
@@ -283,6 +284,56 @@ func (s *Server) signed(w http.ResponseWriter, r *http.Request, a *policy.Attest
 	sig := policy.Signature{DeviceID: a.ID().DeviceID, Assertion: req.Assertion.presence()}
 	sig.Assertion.DeviceID = a.ID().DeviceID
 	return req, sig, true
+}
+
+// CRLView is one signed certificate revocation list, scoped to the
+// intermediate that issued the certificates it lists.
+type CRLView struct {
+	// IssuerSubjectKeyID identifies the intermediate that signed this CRL,
+	// which is also the intermediate that issued every serial it lists.
+	IssuerSubjectKeyID string `json:"issuer_subject_key_id"`
+	// DER is the signed CRL, ready to hand to rolesanywhere ImportCrl/UpdateCrl.
+	DER []byte `json:"der"`
+	// ThisUpdate and NextUpdate are the CRL's own validity. A relying party
+	// still holding a CRL past NextUpdate is failing open.
+	ThisUpdate time.Time `json:"this_update"`
+	NextUpdate time.Time `json:"next_update"`
+}
+
+// handleCRLs publishes one CRL PER INTERMEDIATE, never a merged one.
+//
+// This shape is not a convenience and must not be collapsed. A CRL is signed by
+// the CA that issued the certificates it revokes, and during a rotation overlap
+// there are up to three live intermediates. A single list signed by the current
+// intermediate is silently IGNORED by a correct verifier for every serial the
+// outgoing intermediate issued, so the revocations that matter most during a
+// rotation are exactly the ones that stop working, and revocation failing open
+// is indistinguishable from nothing having been revoked. The endpoint is
+// therefore an array whose length is a property of the schedule, not a
+// convenience wrapper around one entry.
+func (s *Server) handleCRLs(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.CA == nil {
+		writeError(w, r, &apiError{
+			status: http.StatusServiceUnavailable, retryAfter: 60,
+			what: "this issuer has not finished being set up.",
+			fix:  "Ask your issuer operator to run 'totem-issuer init'."})
+		return
+	}
+	crls, err := s.cfg.CA.CRLs(r.Context())
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	out := make([]CRLView, 0, len(crls))
+	for _, c := range crls {
+		out = append(out, CRLView{
+			IssuerSubjectKeyID: hex.EncodeToString(c.IssuerSubjectKeyID),
+			DER:                c.DER,
+			ThisUpdate:         c.ThisUpdate,
+			NextUpdate:         c.NextUpdate,
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // handleBundle publishes what relying parties must trust: the root, or both

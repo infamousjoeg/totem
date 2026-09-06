@@ -31,6 +31,7 @@ type runtime struct {
 	db       *store.DB
 	issuer   *policy.Issuer
 	audit    *server.AuditLog
+	identity *server.IssuerIdentity
 }
 
 func (rt *runtime) Close() {
@@ -94,6 +95,19 @@ func openRuntime(ctx context.Context, dir string) (*runtime, error) {
 		return nil, err
 	}
 	if rt.issuer, err = newPolicy(ctx, cfg, rt.db); err != nil {
+		rt.Close()
+		return nil, err
+	}
+	// The issuer's own identity key. Created on first open and kept as an
+	// envelope-encrypted row, so backup carries it and rotate-data-key
+	// re-encrypts it along with everything else. Creating it here rather than
+	// at first use means it exists before the first backup rather than after
+	// whichever restart happens to need it.
+	if rt.identity, err = server.NewIssuerIdentity(rt.db, rt.ca); err != nil {
+		rt.Close()
+		return nil, err
+	}
+	if _, err = rt.identity.Key(ctx); err != nil {
 		rt.Close()
 		return nil, err
 	}

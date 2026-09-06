@@ -16,7 +16,20 @@ import (
 // because every row is envelope-encrypted end to end. Nothing inside a row is
 // indexable or queryable no matter how it is stored, so four tables would buy
 // four names and nothing else, while one table lets rotation walk every
-// encrypted row in a single statement. The names below are the contract.
+// encrypted row in a single statement.
+//
+// Splitting this into a table per collection WILL look tidier at some point.
+// It is not. Read the paragraph above before proposing it: the normalisation
+// that separate tables usually buys needs columns to index and join on, and
+// there are none here, because the only thing SQLite can see is a ciphertext
+// and a key wrapped under a data key it does not hold. What the split would
+// actually cost is RotateDataKey, which re-wraps every row in one statement
+// inside one transaction, and which is atomic precisely because it is that
+// cheap. Four tables make it four statements over four loops, and the first
+// person to get that wrong reintroduces the half-rotated database that this
+// package is built to make unrepresentable.
+//
+// The names below are the contract.
 const (
 	// CollectionEnrollments holds one record per enrolled device: public key,
 	// device id, protection level, admin flag, pinned cert.

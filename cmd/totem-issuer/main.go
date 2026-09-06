@@ -25,6 +25,9 @@ const usage = `totem-issuer %s
   totem-issuer status     what this issuer is, and what it is waiting on
   totem-issuer recover    print a new one-time setup code for a founding device
   totem-issuer bridges    enable, disable, and list the exchanges this issuer serves
+
+  totem-issuer rotate-intermediate  prepare the successor to the signing certificate
+  totem-issuer reseal-ca            re-seal the CA keys after the passphrase changed
   totem-issuer version    print the version
 
 Every question 'init' asks has a flag; run 'totem-issuer init -h' for the list.
@@ -54,6 +57,10 @@ func run(args []string) int {
 		err = cmdRecover(ctx, args[1:])
 	case "bridges":
 		err = cmdBridges(ctx, args[1:])
+	case "rotate-intermediate":
+		err = cmdRotateIntermediate(ctx, args[1:])
+	case "reseal-ca":
+		err = cmdResealCA(ctx, args[1:])
 	case "version", "--version", "-v":
 		fmt.Printf("totem-issuer %s\n", version.Version)
 		return 0

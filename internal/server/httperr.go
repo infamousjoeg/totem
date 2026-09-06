@@ -207,6 +207,16 @@ func classify(err error) *apiError {
 			reason: toterrors.ReasonIssuerUnreachable, cause: err,
 			what: "this issuer cannot sign anything right now.",
 			fix:  "Ask your issuer operator to rotate the issuer's intermediate certificate."}
+	case errors.Is(err, ca.ErrTTLTooLong):
+		// internal/ca refuses rather than clamps, on the reasoning that a caller
+		// who asked for eight hours and quietly got one discovers it during an
+		// outage. Passing the refusal through with the ACTUAL limit is the other
+		// half of that: a refusal whose message does not say the limit leaves the
+		// caller to guess, and a caller guessing at a lifetime will guess wrong in
+		// the direction that fails later.
+		return &apiError{status: http.StatusBadRequest, cause: err,
+			what: fmt.Sprintf("that credential was asked to last longer than this issuer will allow (the limit is %s).", ca.MaxSVIDTTL),
+			fix:  fmt.Sprintf("Ask for %s or less. totem does not shorten a credential silently, because a caller that got less than it asked for finds out during an outage.", ca.MaxSVIDTTL)}
 	case errors.Is(err, ca.ErrNotInitialized):
 		return &apiError{status: http.StatusServiceUnavailable, retryAfter: 60,
 			reason: toterrors.ReasonIssuerUnreachable, cause: err,

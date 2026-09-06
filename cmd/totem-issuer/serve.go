@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/infamousjoeg/totem/internal/ca"
 	"github.com/infamousjoeg/totem/internal/server"
 )
 
@@ -46,6 +47,22 @@ func cmdServe(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	// Two things change with no method call behind them: the signing
+	// intermediate is promoted on the clock, and the CA passphrase can stop
+	// opening the CA after a pull-based rotation. Neither is recorded unless
+	// something looks, so something looks. See internal/server/watch.go.
+	passphrase, _ := rt.ca.(ca.PassphraseOperator)
+	watcher, err := server.NewWatcher(server.WatcherConfig{
+		CA:         rt.ca,
+		Passphrase: passphrase,
+		Audit:      rt.audit,
+		Warn:       os.Stderr,
+	})
+	if err != nil {
+		return err
+	}
+	go watcher.Run(ctx)
+
 	fmt.Fprintf(os.Stderr, "totem-issuer: %s listening on %s (certificate sha256:%s)\n",
 		rt.cfg.TrustDomain, rt.cfg.Listen, identity.FingerprintHex())
 	if n := len(rt.issuer.Pending()); n > 0 {

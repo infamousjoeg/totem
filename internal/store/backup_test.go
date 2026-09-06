@@ -437,7 +437,11 @@ func TestBackupOfALargeDatabaseSpansChunks(t *testing.T) {
 // key derivation, decryption, extraction, the manifest hash check, schema
 // migration, the data key check and a full chain verification.
 //
-// Set TOTEM_RESTORE_GATE_RECORDS to run it at a larger size.
+// The default size keeps the everyday suite fast. RELEASE runs set
+// TOTEM_RESTORE_GATE_RECORDS to the size the gate is actually claimed at; the
+// test logs the variable and the measurement on every run, so the number in CI
+// output is always the number that was measured rather than one someone
+// remembered.
 func TestRestoreOnAFreshBoxMeetsTheTenMinuteGate(t *testing.T) {
 	const gate = 10 * time.Minute
 
@@ -505,8 +509,10 @@ func TestRestoreOnAFreshBoxMeetsTheTenMinuteGate(t *testing.T) {
 		t.Fatalf("restored head = %d, want %d", seq, records)
 	}
 
-	t.Logf("restore gate: %d chain records, %d devices, %d-byte database, %d-byte archive; backup %v, restore %v (gate %v)",
-		records, devices, dbSize, archiveSize, backupTook.Round(time.Millisecond), took.Round(time.Millisecond), gate)
+	t.Logf("restore gate: restored %d chain records and %d devices (%d-byte database, %d-byte archive) in %v, against a %v gate; backup took %v. "+
+		"Re-run at release scale with TOTEM_RESTORE_GATE_RECORDS=<n> (this run: %d).",
+		records, devices, dbSize, archiveSize, took.Round(time.Millisecond), gate,
+		backupTook.Round(time.Millisecond), records)
 	if took > gate {
 		t.Fatalf("restore took %v, over the %v release gate", took, gate)
 	}

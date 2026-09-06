@@ -187,6 +187,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.mux.HandleFunc("HEAD /healthz", s.handleHealth)
 	s.mux.HandleFunc("GET /v1/bundle", s.handleBundle)
+	s.mux.HandleFunc("GET /v1/crls", s.handleCRLs)
 	s.mux.HandleFunc("POST /v1/enroll/challenge", s.handleEnrollChallenge)
 	s.mux.HandleFunc("POST /v1/enroll", s.handleEnroll)
 
