@@ -60,6 +60,12 @@ type Config struct {
 	// RuntimeStatusPath is where the agent publishes its snapshot for
 	// `totem status`. Empty means DefaultRuntimeStatusPath.
 	RuntimeStatusPath string
+	// BinaryPath and BinaryHash identify the totem binary this agent is
+	// running from. `totem serve` fills them so `totem doctor` can detect an
+	// in-place upgrade, which silently breaks helper connections until the
+	// agent restarts.
+	BinaryPath string
+	BinaryHash string
 	// Clock is overridable for tests. Nil means time.Now.
 	Clock func() time.Time
 }
@@ -421,6 +427,8 @@ func (s *Server) publishStatus(lastError string) {
 		DeviceID:        s.cfg.Identity.DeviceID,
 		ProtectionLevel: s.cfg.ProtectionLevel,
 		LastError:       lastError,
+		BinaryPath:      s.cfg.BinaryPath,
+		BinaryHash:      s.cfg.BinaryHash,
 	}
 	s.cache.mu.Lock()
 	for id, e := range s.cache.entries {

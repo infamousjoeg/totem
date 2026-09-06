@@ -14,6 +14,7 @@ import (
 	toterrors "github.com/infamousjoeg/totem/internal/errors"
 	"github.com/infamousjoeg/totem/internal/platform"
 	"github.com/infamousjoeg/totem/internal/presence"
+	"github.com/infamousjoeg/totem/internal/spiffe"
 	"github.com/infamousjoeg/totem/internal/workloadapi"
 )
 
@@ -52,13 +53,12 @@ func TestParseIssuerURLAcceptsColonSeparatedHex(t *testing.T) {
 	}
 }
 
-// TestParseIssuerURLRefusesFirstContactWithoutAFingerprint is the rule stated
-// as a test: first-contact trust is the fragment and nothing else. There is no
-// trust-on-first-use prompt and no skip flag, so a bare URL is a refusal.
-func TestParseIssuerURLRefusesFirstContactWithoutAFingerprint(t *testing.T) {
+// TestParseIssuerURLRefusesAMalformedLink: a bare URL is allowed and falls
+// back (see below), but a link that carries a fingerprint totem cannot read is
+// refused rather than quietly dropped to the weaker path. Silently downgrading
+// a link the operator believed was pinned is the worst of both.
+func TestParseIssuerURLRefusesAMalformedLink(t *testing.T) {
 	for _, raw := range []string{
-		"https://issuer.example",
-		"https://issuer.example#",
 		"https://issuer.example#sha1:abc",
 		"https://issuer.example#sha256:tooshort",
 		"https://issuer.example#sha256:" + strings.Repeat("z", 64),
@@ -71,17 +71,30 @@ func TestParseIssuerURLRefusesFirstContactWithoutAFingerprint(t *testing.T) {
 	}
 }
 
-func TestParseIssuerURLRefusalExplainsItself(t *testing.T) {
-	_, err := ParseIssuerURL("https://issuer.example")
-	ce := asCLIError(err)
-	if ce == nil {
-		t.Fatal("no error")
+// TestParseIssuerURLMarksABareLinkAsTheWeakerPath: docs/totem-design.md
+// "Enrollment" step 1 keeps the fallback, so a bare URL parses. What must not
+// happen is the two paths becoming indistinguishable, so the weaker one is
+// labelled at the moment it is taken.
+func TestParseIssuerURLMarksABareLinkAsTheWeakerPath(t *testing.T) {
+	for _, raw := range []string{"https://issuer.example", "https://issuer.example#"} {
+		addr, err := ParseIssuerURL(raw)
+		if err != nil {
+			t.Fatalf("%q: %v", raw, err)
+		}
+		if addr.FingerprintHex != "" {
+			t.Errorf("%q pinned something out of thin air", raw)
+		}
+		if addr.FirstContact != workloadapi.FirstContactPrompt {
+			t.Errorf("%q recorded first contact as %q, want %q", raw, addr.FirstContact, workloadapi.FirstContactPrompt)
+		}
 	}
-	if !strings.Contains(ce.fix, "totem-issuer init") {
-		t.Errorf("the fix %q does not tell the human where to get the right link", ce.fix)
+
+	addr, err := ParseIssuerURL("https://issuer.example#sha256:" + testFingerprint)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if strings.Contains(strings.ToLower(ce.fix+ce.what), "spiffe") {
-		t.Error("user-facing text must not use SPIFFE vocabulary")
+	if addr.FirstContact != workloadapi.FirstContactFragment {
+		t.Errorf("a pinned link recorded first contact as %q", addr.FirstContact)
 	}
 }
 
@@ -353,12 +366,19 @@ func TestEnrollSignsDomainSeparatedBytes(t *testing.T) {
 
 	// The canonical encoding must verify, reconstructed from the fields the
 	// request carries, which is exactly what the issuer will do.
+	// The issuer recomputes the request hash from the fields it received; if
+	// any of them were rewritten in transit, this reconstruction diverges and
+	// the signature stops verifying. That is the point of binding them.
+	if !bytes.Equal(got.RequestHash, enrollmentRequestHash(got)) {
+		t.Fatal("the request hash is not recomputable from the fields the enrollment carries")
+	}
 	in := presence.SigningInput{
-		Version:   got.EncodingVersion,
-		DeviceID:  got.DeviceFingerprint,
-		Tool:      got.SignedTool,
-		Target:    got.SignedTarget,
-		Challenge: got.Challenge,
+		Version:     got.EncodingVersion,
+		DeviceID:    got.DeviceFingerprint,
+		Tool:        got.SignedTool,
+		Target:      got.SignedTarget,
+		Challenge:   got.Challenge,
+		RequestHash: got.RequestHash,
 	}
 	signed, err := in.Bytes()
 	if err != nil {
@@ -374,5 +394,83 @@ func TestEnrollSignsDomainSeparatedBytes(t *testing.T) {
 	}
 	if got.SignedTarget != "https://issuer.example" {
 		t.Errorf("signed target = %q; the signature is not bound to this issuer", got.SignedTarget)
+	}
+}
+
+// TestEnrollmentBindingCoversEveryClaim: a signature over the challenge alone
+// proves somebody was present, not what they agreed to. Every field an active
+// attacker could rewrite in transit has to change the hash, or the signature
+// keeps verifying over a request that no longer says what the device said.
+func TestEnrollmentBindingCoversEveryClaim(t *testing.T) {
+	base := EnrollRequest{
+		DevicePublicDER:   []byte("device"),
+		PresencePublicDER: []byte("presence"),
+		Presence:          presence.StatePresent,
+		ProtectionLevel:   spiffe.ProtectionHardware,
+		Hostname:          "laptop",
+		OS:                "darwin",
+		IssuerURL:         "https://issuer.example",
+		IssuerFingerprint: testFingerprint,
+		FirstContact:      workloadapi.FirstContactFragment,
+		BootstrapCode:     "ABC-123",
+	}
+	original := enrollmentRequestHash(base)
+
+	tamper := map[string]func(*EnrollRequest){
+		"device public half":   func(r *EnrollRequest) { r.DevicePublicDER = []byte("other") },
+		"presence public half": func(r *EnrollRequest) { r.PresencePublicDER = []byte("other") },
+		"presence state":       func(r *EnrollRequest) { r.Presence = presence.StateNone },
+		"protection level":     func(r *EnrollRequest) { r.ProtectionLevel = spiffe.ProtectionSoftware },
+		"hostname":             func(r *EnrollRequest) { r.Hostname = "someone-elses-laptop" },
+		"os":                   func(r *EnrollRequest) { r.OS = "linux" },
+		"issuer url":           func(r *EnrollRequest) { r.IssuerURL = "https://attacker.example" },
+		"issuer fingerprint":   func(r *EnrollRequest) { r.IssuerFingerprint = strings.Repeat("ff", 32) },
+		"first contact":        func(r *EnrollRequest) { r.FirstContact = workloadapi.FirstContactPrompt },
+		"bootstrap code":       func(r *EnrollRequest) { r.BootstrapCode = "STOLEN-CODE" },
+	}
+	for name, mutate := range tamper {
+		t.Run(name, func(t *testing.T) {
+			altered := base
+			mutate(&altered)
+			if bytes.Equal(enrollmentRequestHash(altered), original) {
+				t.Errorf("rewriting the %s does not change the signature's binding, so an attacker can change it in transit", name)
+			}
+		})
+	}
+
+	// An empty field must be distinct from an absent one, or "no bootstrap
+	// code" and "some bootstrap code" become interchangeable.
+	noCode := base
+	noCode.BootstrapCode = ""
+	if bytes.Equal(enrollmentRequestHash(noCode), original) {
+		t.Error("dropping the bootstrap code does not change the binding")
+	}
+}
+
+// TestEnrollPrintsTheRequestCodeBeforeAsking: the code has to be on screen
+// before the prompt, derived from the issuer-minted challenge, so the human has
+// something to compare the OS dialog against. A code derived from the request
+// alone can be precomputed offline by anything running as this user.
+func TestEnrollPrintsTheRequestCodeFromChallengeAndRequest(t *testing.T) {
+	req := EnrollRequest{
+		DevicePublicDER: []byte("device"),
+		Presence:        presence.StatePresent,
+		IssuerURL:       "https://issuer.example",
+	}
+	req.RequestHash = enrollmentRequestHash(req)
+	challenge := make([]byte, presence.ChallengeSize)
+	challenge[0] = 1
+
+	code := presence.RequestCode(challenge, req.RequestHash)
+	if code == "" {
+		t.Fatal("no request code was produced")
+	}
+
+	// A different challenge must produce a different code, which is what stops
+	// the code being precomputable from the request alone.
+	other := make([]byte, presence.ChallengeSize)
+	other[0] = 2
+	if presence.RequestCode(other, req.RequestHash) == code {
+		t.Error("the code does not depend on the issuer's challenge, so it can be precomputed offline")
 	}
 }

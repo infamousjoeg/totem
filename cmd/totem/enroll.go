@@ -37,6 +37,7 @@ func cmdEnroll(ctx context.Context, args []string) error {
 	code := fs.String("code", "", "the one-time bootstrap code from 'totem-issuer init', for the founding device")
 	trustDomain := fs.String("trust-domain", "", "trust domain to use when the issuer is reachable only by IP")
 	socket := fs.String("socket", "", "where to serve the workload socket (default ~/.totem/agent.sock)")
+	fingerprint := fs.String("fingerprint", "", "the sha256:... your issuer's console printed, when the enroll link does not carry it")
 	if err := fs.Parse(args); err != nil {
 		return failf("Run 'totem enroll <link>' with the command your issuer operator gave you.", "could not read those options.")
 	}
@@ -49,9 +50,21 @@ func cmdEnroll(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	client, err := newIssuerClient(addr)
-	if err != nil {
-		return err
+	if *fingerprint != "" {
+		// Supplying the fingerprint directly is the same trust as the one in
+		// the link: an operator-chosen out-of-band channel, pinned before
+		// first contact, with no human comparing hex. It is the headless
+		// equivalent, so it is recorded the same way.
+		fp, ferr := ParseFingerprint(*fingerprint)
+		if ferr != nil {
+			return ferr
+		}
+		if addr.FingerprintHex != "" && addr.FingerprintHex != fp {
+			return failf("Use one or the other, and check with your issuer operator which is right.",
+				"the link and --fingerprint name two different issuers.")
+		}
+		addr.FingerprintHex = fp
+		addr.FirstContact = workloadapi.FirstContactFragment
 	}
 
 	if existing, lerr := workloadapi.LoadState(""); lerr == nil && existing.Enrolled() {
@@ -59,14 +72,14 @@ func cmdEnroll(ctx context.Context, args []string) error {
 			"this device is already set up with %s.", existing.IssuerURL)
 	}
 
-	// Verify the issuer before anything is created. An issuer that cannot be
-	// reached or does not match its link must never leave a device key behind.
+	// Establish the issuer before anything is created. An issuer that cannot
+	// be reached, or that turns out not to be the one the operator meant, must
+	// never leave a device key behind on this machine.
 	fmt.Println("Checking your issuer...")
-	fingerprint, certPEM, err := client.CertificateFingerprint(ctx)
+	client, addr, certPEM, err := establishIssuer(ctx, addr, os.Stdin, os.Stdout)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("  verified %s\n", addr.URL)
 
 	td := *trustDomain
 	if td == "" {
@@ -137,25 +150,60 @@ func cmdEnroll(ctx context.Context, args []string) error {
 		}
 	}
 
-	// The signed bytes go through presence's canonical encoder rather than
-	// being the raw challenge. Every signature in totem is domain-separated:
-	// a fixed context string plus a version byte plus length-prefixed fields,
-	// so a signature made to enroll a device cannot be replayed as a signature
-	// made for anything else, and no field boundary can be shifted.
-	signing := presence.SigningInput{
-		DeviceID:  fingerprintHex,
-		Tool:      "totem",
-		Target:    addr.URL,
-		Challenge: challenge.Challenge,
+	// Everything the issuer will be asked to stand behind gets bound into the
+	// signature, not just the challenge. enrollmentRequestHash is the one
+	// canonical order both sides use; see its doc comment for why each field
+	// is in there.
+	req := EnrollRequest{
+		DevicePublicDER:   devicePub,
+		PresencePublicDER: presencePub,
+		Presence:          presenceState,
+		ProtectionLevel:   key.ProtectionLevel(),
+		Hostname:          hostname,
+		OS:                runtime.GOOS,
+		DeviceFingerprint: fingerprintHex,
+		IssuerURL:         addr.URL,
+		IssuerFingerprint: addr.FingerprintHex,
+		FirstContact:      addr.FirstContact,
+		BootstrapCode:     *code,
+		SignedTool:        "totem",
+		SignedTarget:      addr.URL,
+		EncodingVersion:   presence.EncodingVersion,
+		Challenge:         challenge.Challenge,
 	}
 	if len(challenge.Challenge) != presence.ChallengeSize {
 		return failf("Ask your issuer operator whether the issuer is running a version totem understands.",
 			"your issuer sent something totem cannot sign safely.")
 	}
+	req.RequestHash = enrollmentRequestHash(req)
+
+	// The signed bytes go through presence's canonical encoder rather than
+	// being the raw challenge. Every signature in totem is domain-separated: a
+	// fixed context string plus a version byte plus length-prefixed fields, so
+	// a signature made to enroll a device cannot be replayed as a signature
+	// made for anything else, and no field boundary can be shifted.
+	signing := presence.SigningInput{
+		DeviceID:    fingerprintHex,
+		Tool:        req.SignedTool,
+		Target:      req.SignedTarget,
+		Challenge:   challenge.Challenge,
+		RequestHash: req.RequestHash,
+	}
 
 	var sig []byte
 	if presenceState == presence.StatePresent {
-		fmt.Println("Confirm it's you to finish setting this device up.")
+		// The code goes on screen BEFORE the prompt, so the human has
+		// something to compare the OS dialog against. It has to come from
+		// presence.RequestCode over the issuer-minted challenge and this
+		// request's hash, which is the same call presence.Sign makes to fill
+		// the prompt: a code derived any other way, or from the request alone,
+		// can be precomputed offline by anything running as this user, and a
+		// code that can be precomputed is not a check.
+		fmt.Println()
+		fmt.Printf("  This request's code is %s\n", presence.RequestCode(challenge.Challenge, req.RequestHash))
+		fmt.Println("  Confirm it's you to finish setting this device up.")
+		fmt.Println("  The prompt should show that same code. If it shows a different one, say no.")
+
 		assertion, aerr := presence.Sign(ctx, key, signing)
 		switch {
 		case aerr == nil:
@@ -180,37 +228,24 @@ func cmdEnroll(ctx context.Context, args []string) error {
 		// this device rather than being fooled by it.
 		fmt.Println("This device has no way to confirm a person is present, so that is recorded as part of its setup.")
 		fmt.Println("Targets that require a person will refuse it. Everything else works.")
-		bytes, berr := signing.Bytes()
+		signed, berr := signing.Bytes()
 		if berr != nil {
 			return failf("Ask your issuer operator whether the issuer is running a version totem understands.",
 				"totem could not prepare this device's enrollment: %v", berr)
 		}
-		if sig, err = key.Sign(ctx, bytes, platform.Prompt{
+		if sig, err = key.Sign(ctx, signed, platform.Prompt{
 			Required: false,
-			Tool:     "totem",
-			Target:   addr.URL,
+			Tool:     req.SignedTool,
+			Target:   req.SignedTarget,
 			DeviceID: fingerprintHex,
 		}); err != nil {
 			return failf("Run 'totem doctor' for what this machine can do.",
 				"totem could not use this device's key: %v", err)
 		}
 	}
+	req.Signature = sig
 
-	resp, err := client.Enroll(ctx, EnrollRequest{
-		DevicePublicDER:   devicePub,
-		PresencePublicDER: presencePub,
-		Presence:          presenceState,
-		ProtectionLevel:   key.ProtectionLevel(),
-		Hostname:          hostname,
-		OS:                runtime.GOOS,
-		DeviceFingerprint: fingerprintHex,
-		SignedTool:        signing.Tool,
-		SignedTarget:      signing.Target,
-		EncodingVersion:   presence.EncodingVersion,
-		Challenge:         challenge.Challenge,
-		Signature:         sig,
-		BootstrapCode:     *code,
-	})
+	resp, err := client.Enroll(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -226,7 +261,8 @@ func cmdEnroll(ctx context.Context, args []string) error {
 		TrustDomain:       td,
 		DeviceID:          resp.DeviceID,
 		IssuerURL:         addr.URL,
-		IssuerFingerprint: fingerprint,
+		IssuerFingerprint: addr.FingerprintHex,
+		FirstContact:      addr.FirstContact,
 		IssuerCertPEM:     certPEM,
 		ProtectionLevel:   key.ProtectionLevel(),
 		Presence:          presenceState,
@@ -253,6 +289,7 @@ func cmdEnroll(ctx context.Context, args []string) error {
 	fmt.Printf("This device is %s.\n", shortFingerprint(fingerprintHex))
 	fmt.Printf("Its key is kept in: %s\n", key.ProtectionLevel())
 	fmt.Printf("Confirming it's you:  %s\n", presenceDescription(presenceState))
+	fmt.Printf("Your issuer was:      %s\n", describeFirstContact(addr.FirstContact))
 	if resp.Approved {
 		fmt.Println("Your issuer approved it.")
 	} else {

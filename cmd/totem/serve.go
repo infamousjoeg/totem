@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/infamousjoeg/totem/internal/attest"
@@ -46,6 +47,15 @@ func cmdServe(ctx context.Context, args []string) error {
 		return err
 	}
 
+	// Record which totem binary this agent is running from. attest pins the
+	// agent's own hash to recognise its helpers, so upgrading totem in place
+	// while the agent runs breaks every helper connection until it restarts.
+	// Capturing it here is what lets `totem doctor` explain that instead of
+	// leaving somebody staring at "totem does not know what you are" after a
+	// routine upgrade. Failing to read it is not fatal; the check just goes
+	// quiet.
+	selfPath, selfHash := runningBinary()
+
 	srv := workloadapi.New(workloadapi.Config{
 		SocketPath: sockPath,
 		Identity: workloadapi.IdentityConfig{
@@ -57,6 +67,8 @@ func cmdServe(ctx context.Context, args []string) error {
 		Source:          nil, // the issuer is step 2; until then every caller is told so plainly
 		Log:             workloadapi.NewLogger(""),
 		ProtectionLevel: state.ProtectionLevel,
+		BinaryPath:      selfPath,
+		BinaryHash:      selfHash,
 	})
 
 	// SIGUSR1 means "renew everything now". It takes the ordinary path in
@@ -80,6 +92,23 @@ func cmdServe(ctx context.Context, args []string) error {
 	fmt.Printf("totem is serving on %s\n", srv.Endpoint())
 	fmt.Printf("Point tools at it with SPIFFE_ENDPOINT_SOCKET=%s\n", srv.Endpoint())
 	return srv.Serve(ctx)
+}
+
+// runningBinary reports the path and SHA-256 of the binary this process is
+// running from, or empty strings when it cannot be determined.
+func runningBinary() (path, hash string) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", ""
+	}
+	if resolved, rerr := filepath.EvalSymlinks(exe); rerr == nil {
+		exe = resolved
+	}
+	sum, err := hashFile(exe)
+	if err != nil {
+		return exe, ""
+	}
+	return exe, sum
 }
 
 // openAttestor builds the attestor for this machine.

@@ -30,6 +30,32 @@ func DefaultRuntimeStatusPath() string {
 // ErrNoState means the agent has never enrolled on this machine.
 var ErrNoState = errors.New("workloadapi: no enrollment record on this device")
 
+// FirstContact records HOW the agent established that the issuer it was
+// talking to was the right one, the very first time it spoke to it. There are
+// two paths and they are not equally strong, so the enrollment says which one
+// was taken and the fact travels to the issuer.
+//
+// This mirrors what the codebase already does with assurance everywhere else:
+// hardware with no presence capability is never refused, it enrolls and is
+// recorded as presence "none", and the level rides on the identity so
+// downstream policy can act on it. Recording a weaker path is what makes it
+// honest to allow the weaker path at all. An issuer operator can ask which
+// devices enrolled without a pinned fingerprint, and policy can require the
+// stronger path later without anyone having to relitigate what happened.
+type FirstContact string
+
+const (
+	// FirstContactFragment means the issuer certificate was pinned from the
+	// fingerprint the enroll link carried, or from an equivalent fingerprint
+	// the operator supplied directly. No human compared anything, which is the
+	// whole point of decision 18.
+	FirstContactFragment FirstContact = "fragment"
+	// FirstContactPrompt means the enroll link carried no fingerprint, so a
+	// human had to establish trust out of band. Weaker than the fragment,
+	// recorded as such, and never silently upgraded.
+	FirstContactPrompt FirstContact = "prompt"
+)
+
 // State is the enrollment record the agent persists. It holds no secret: the
 // device private key lives in the Secure Enclave, the TPM, the keyring, or a
 // separate 0600 file owned by internal/platform, never here.
@@ -42,9 +68,13 @@ type State struct {
 	// IssuerURL is the issuer address, without the fingerprint fragment.
 	IssuerURL string `json:"issuer_url"`
 	// IssuerFingerprint is the SHA-256 of the issuer certificate, pinned at
-	// enroll from the URL fragment. Later connections require that leaf or a
-	// successor signed by the issuer's server CA.
+	// enroll. Later connections require that leaf or a successor signed by the
+	// issuer's server CA.
 	IssuerFingerprint string `json:"issuer_fingerprint"`
+	// FirstContact records how that fingerprint was established. It is never
+	// rewritten after enrollment: an enrollment made over the weaker path
+	// stays visibly weaker.
+	FirstContact FirstContact `json:"first_contact,omitempty"`
 	// IssuerCertPEM is the pinned issuer certificate itself.
 	IssuerCertPEM string `json:"issuer_cert_pem,omitempty"`
 	// ProtectionLevel is the true assurance of the device key, recorded at
@@ -152,6 +182,19 @@ type RuntimeStatus struct {
 	// LastError is the most recent refusal or failure, so `status` surfaces
 	// the log's headline without the human opening `totem log`.
 	LastError string `json:"last_error,omitempty"`
+	// BinaryPath and BinaryHash identify the totem binary this agent is
+	// RUNNING FROM, captured at startup.
+	//
+	// They exist for one specific, baffling failure. The agent pins its own
+	// hash so it can recognise its own helpers. Upgrade totem in place while
+	// the agent is running and the helper on disk no longer matches the hash
+	// the running agent remembers, so every helper connection fails as an
+	// unknown program until the agent restarts. That is correct behaviour and
+	// it is completely opaque from the outside: the tool was working, you
+	// upgraded, and now it says it does not know what you are. `totem doctor`
+	// compares these against what is on disk and says "restart the agent".
+	BinaryPath string `json:"binary_path,omitempty"`
+	BinaryHash string `json:"binary_hash,omitempty"`
 }
 
 // SVIDStatus is one identity's current credential, with no key material.

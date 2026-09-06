@@ -35,55 +35,109 @@ import (
 // refuses on mismatch, and humans never compare hex.
 var ErrIssuerPinMismatch = errors.New("the issuer presented a different certificate than the enroll link named")
 
-// IssuerAddr is an issuer URL plus the certificate fingerprint pinned from its
-// fragment. First-contact trust is that fragment and nothing else.
+// IssuerAddr is an issuer URL plus the certificate fingerprint the agent will
+// pin, and a record of how that fingerprint was established.
 type IssuerAddr struct {
 	// URL is the issuer address with the fragment stripped.
 	URL string
 	// FingerprintHex is the lowercase hex SHA-256 of the issuer's certificate.
+	// Empty when the enroll link carried none, in which case a human has to
+	// establish it before anything is pinned.
 	FingerprintHex string
+	// FirstContact is how FingerprintHex was established. It is carried onto
+	// the enrollment record and sent to the issuer, so an enrollment made over
+	// the weaker path stays visibly weaker forever.
+	FirstContact workloadapi.FirstContact
 }
 
 // ParseIssuerURL splits an enroll URL into its address and its pinned
-// fingerprint. Decision 18 puts the fingerprint in the URL fragment, and this
-// build accepts nothing else: there is no trust-on-first-use prompt and no flag
-// that skips the check, because a first contact that trusts whatever answers is
-// not a first contact worth having.
+// fingerprint. Decision 18 puts the fingerprint in the URL fragment so humans
+// never have to compare hex: `totem-issuer init` prints the whole command, the
+// agent verifies against the fragment, and refuses on mismatch.
+//
+// A bare URL is not refused. docs/totem-design.md "Enrollment" step 1 keeps a
+// fallback, and a hard refusal would strand anyone whose fragment was eaten by
+// a chat client or a copy-paste, and stranded people invent worse workarounds
+// than the one they were denied. The fallback is weaker, so it is handled by
+// establishIssuer below rather than here, and the path taken is recorded.
 func ParseIssuerURL(raw string) (IssuerAddr, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
-		return IssuerAddr{}, failf("Use the whole command your issuer operator gave you, including the part after the # sign.",
+		return IssuerAddr{}, failf(
+			"Use the whole command your issuer operator gave you, including the part after the # sign.",
 			"%q is not a usable issuer address.", raw)
 	}
 	if u.Scheme != "https" {
-		return IssuerAddr{}, failf("Use the whole command your issuer operator gave you. The address starts with https://.",
+		return IssuerAddr{}, failf(
+			"Use the whole command your issuer operator gave you. The address starts with https://.",
 			"the issuer address must start with https://, and %q does not.", raw)
 	}
 	if u.Host == "" {
-		return IssuerAddr{}, failf("Use the whole command your issuer operator gave you.",
+		return IssuerAddr{}, failf(
+			"Use the whole command your issuer operator gave you.",
 			"the issuer address %q has no host.", raw)
 	}
 	frag := strings.TrimSpace(u.Fragment)
+	u.Fragment = ""
+	addr := IssuerAddr{URL: strings.TrimSuffix(u.String(), "#")}
 	if frag == "" {
-		return IssuerAddr{}, failf("Ask your issuer operator for the full command that 'totem-issuer init' printed. It ends with a # and a long string, and that part is what proves you are talking to their issuer and not to someone else. There is no way to skip it.",
-			"this issuer link does not identify the issuer.")
+		addr.FirstContact = workloadapi.FirstContactPrompt
+		return addr, nil
 	}
-	if !strings.HasPrefix(frag, "sha256:") {
-		return IssuerAddr{}, failf("Ask your issuer operator for the full command that 'totem-issuer init' printed.",
-			"this issuer link identifies the issuer in a way this version of totem does not understand.")
+	fp, err := ParseFingerprint(frag)
+	if err != nil {
+		return IssuerAddr{}, err
 	}
-	fp := strings.ToLower(strings.TrimPrefix(frag, "sha256:"))
-	fp = strings.ReplaceAll(fp, ":", "")
+	addr.FingerprintHex = fp
+	addr.FirstContact = workloadapi.FirstContactFragment
+	return addr, nil
+}
+
+// ParseFingerprint normalizes a "sha256:..." fingerprint, accepting the colon
+// separated form people paste out of a terminal and a bare hex string, and
+// accepting a prefix of at least MinFingerprintPrefix characters so a human
+// transcribing from an issuer console does not have to copy all 64.
+func ParseFingerprint(raw string) (string, error) {
+	fp := strings.ToLower(strings.TrimSpace(raw))
+	fp = strings.TrimPrefix(fp, "sha256:")
+	fp = strings.NewReplacer(":", "", " ", "", "-", "").Replace(fp)
 	if len(fp) != 64 {
-		return IssuerAddr{}, failf("Ask your issuer operator for the full command that 'totem-issuer init' printed.",
-			"this issuer link's identifying string is the wrong length.")
+		return "", failf(
+			"Ask your issuer operator for the full command that 'totem-issuer init' printed, or for the whole line starting with sha256:.",
+			"that is not a complete issuer identifier (it should be 64 characters after 'sha256:', and that one is %d).", len(fp))
 	}
 	if _, err := hex.DecodeString(fp); err != nil {
-		return IssuerAddr{}, failf("Ask your issuer operator for the full command that 'totem-issuer init' printed.",
-			"this issuer link's identifying string is not readable.")
+		return "", failf(
+			"Ask your issuer operator for the full command that 'totem-issuer init' printed.",
+			"that issuer identifier has characters totem cannot read.")
 	}
-	u.Fragment = ""
-	return IssuerAddr{URL: strings.TrimSuffix(u.String(), "#"), FingerprintHex: fp}, nil
+	return fp, nil
+}
+
+// MinFingerprintPrefix is how much of a fingerprint a human must transcribe
+// from the issuer console on the fallback path. Twelve hex characters is 48
+// bits, which is the same strength the presence request code settled on, and
+// it is short enough that people actually copy it correctly.
+const MinFingerprintPrefix = 12
+
+// ParseFingerprintPrefix normalizes a partial fingerprint a human typed. It
+// accepts a full one too, because somebody will paste the whole thing.
+func ParseFingerprintPrefix(raw string) (string, error) {
+	fp := strings.ToLower(strings.TrimSpace(raw))
+	fp = strings.TrimPrefix(fp, "sha256:")
+	fp = strings.NewReplacer(":", "", " ", "", "-", "").Replace(fp)
+	if len(fp) < MinFingerprintPrefix {
+		return "", failf(
+			fmt.Sprintf("Type at least the first %d characters of the line starting with sha256: on your issuer's console.", MinFingerprintPrefix),
+			"that is too short to identify an issuer (totem needs at least %d characters, and that was %d).", MinFingerprintPrefix, len(fp))
+	}
+	if len(fp) > 64 {
+		return "", failf("Copy just the part after 'sha256:'.", "that is longer than an issuer identifier.")
+	}
+	if _, err := hex.DecodeString(fp); err != nil {
+		return "", failf("Copy just the part after 'sha256:'.", "that has characters totem cannot read.")
+	}
+	return fp, nil
 }
 
 // ChallengeRequest asks the issuer for a one-shot value to sign. Nothing
@@ -143,8 +197,28 @@ type EnrollRequest struct {
 	// EncodingVersion is the presence encoding version the signature was made
 	// under.
 	EncodingVersion uint8 `json:"encoding_version"`
+	// IssuerURL is the issuer this device believes it enrolled with.
+	IssuerURL string `json:"issuer_url"`
+	// IssuerFingerprint is the SHA-256 of the certificate this device pinned.
+	// Binding it lets the issuer refuse an enrollment made against somebody
+	// else's certificate: if what the device pinned is not the issuer's own
+	// leaf, something terminated TLS in between and the enrollment is not one
+	// the issuer should record.
+	IssuerFingerprint string `json:"issuer_fingerprint"`
+	// FirstContact is HOW this device established that fingerprint: from the
+	// enroll link (or an equivalent operator-supplied value), or from a human
+	// reading it off the issuer console. The two paths are not equally strong,
+	// so the issuer records which one happened and policy can act on it later.
+	// It is under the signature, because a field that names the weaker path is
+	// exactly the field an attacker would rewrite to hide that it was taken.
+	FirstContact workloadapi.FirstContact `json:"first_contact"`
 	// Challenge is the issuer-minted, single-use value that was signed.
 	Challenge []byte `json:"challenge"`
+	// RequestHash binds everything above into the signature and is what the
+	// human-visible request code is derived from. The issuer recomputes it
+	// from the fields of this request; see enrollmentRequestHash for the
+	// canonical order.
+	RequestHash []byte `json:"request_hash"`
 	// Signature is over the canonical enrollment signing bytes, from the
 	// presence key when the device has one and from the device key when it is
 	// enrolling at presence "none".
@@ -418,4 +492,49 @@ func parseURLHost(raw string) (string, error) {
 		return "", nil
 	}
 	return h, nil
+}
+
+// observeIssuerCertificate dials the issuer with no pin at all and reports the
+// certificate it presented, without trusting it for anything.
+//
+// It exists ONLY for the fallback path in establishIssuer, where the enroll
+// link carried no fingerprint and a human has to establish trust out of band.
+// Nothing that comes back from here is trusted until a human has matched it
+// against what the issuer console printed; the return value is evidence to be
+// checked, not a decision.
+func observeIssuerCertificate(ctx context.Context, issuerURL string) (fingerprint, certPEM string, err error) {
+	u, err := url.Parse(issuerURL)
+	if err != nil {
+		return "", "", err
+	}
+	host := u.Host
+	if u.Port() == "" {
+		host = net.JoinHostPort(u.Hostname(), "443")
+	}
+	dialer := &tls.Dialer{Config: &tls.Config{
+		InsecureSkipVerify: true, //nolint:gosec // nothing here is trusted; a human matches it below
+		MinVersion:         tls.VersionTLS12,
+	}}
+	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	conn, err := dialer.DialContext(dctx, "tcp", host)
+	if err != nil {
+		return "", "", &cliError{
+			reason:     toterrors.ReasonIssuerUnreachable,
+			retryAfter: 30,
+			what:       fmt.Sprintf("could not reach your issuer at %s.", issuerURL),
+			fix:        "Check your network and try again.",
+			cause:      errors.Join(err, workloadapi.ErrIssuerUnreachable),
+		}
+	}
+	defer conn.Close()
+
+	state := conn.(*tls.Conn).ConnectionState()
+	if len(state.PeerCertificates) == 0 {
+		return "", "", failf("Ask your issuer operator to check the issuer is serving over TLS.",
+			"your issuer at %s did not present a certificate.", issuerURL)
+	}
+	leaf := state.PeerCertificates[0]
+	sum := sha256.Sum256(leaf.Raw)
+	return hex.EncodeToString(sum[:]), string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leaf.Raw})), nil
 }
