@@ -85,11 +85,11 @@ func TestProviderRefusesAWorldReadableFileProvider(t *testing.T) {
 func TestProviderRefusesAHashThatNoLongerMatchesItsPin(t *testing.T) {
 	t.Skip("not drivable from this package, by design, not by gap, for the same reason as the other two " +
 		"in this file: the outer Config.Path ownership check refuses before a Summoner ever reaches " +
-		"verifyPinLocked. Also worth noting for whoever revisits this: verifyPinLocked is skipped " +
-		"entirely for the built-in file provider (it only applies to an external Provider.Path), so " +
-		"even a hypothetical root-owned config would still need an external provider binary, also " +
-		"root-owned, to reach this check at all. internal/summon's own test suite (pin_test.go) covers " +
-		"the hash-mismatch refusal directly, for real, from inside the package.")
+		"verifyPin. Also worth noting for whoever revisits this: verifyPin is skipped entirely for the " +
+		"built-in file provider (it only applies to an external Provider.Path), so even a hypothetical " +
+		"root-owned config would still need an external provider binary, also root-owned, to reach this " +
+		"check at all. internal/summon's own test suite (pin_test.go) covers the hash-mismatch refusal " +
+		"directly, for real, from inside the package.")
 }
 
 // probeProviderPathAlwaysRefusedFromHere is not a test; it exists so the claim
@@ -108,7 +108,7 @@ func probeProviderPathAlwaysRefusedFromHere(t *testing.T, dir string) error {
 	s, err := summon.New(summon.Config{
 		Path: cfgPath,
 		File: summon.FileProvider{Dir: dir},
-		Refs: map[string]summon.Reference{"secret": "secret"},
+		Refs: map[string]summon.Secret{"secret": summon.Rotating("secret")},
 	})
 	if err != nil {
 		t.Fatalf("summon.New: %v", err)
