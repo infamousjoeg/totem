@@ -262,7 +262,7 @@ func TestShellCopiedOutOfBinIsNotAHop(t *testing.T) {
 		t.Fatal(err)
 	}
 	if insp.sig == nil || insp.sig.Platform == 0 || !insp.kcs.isPlatformBinary() {
-		t.Fatalf("test premise broken: copy did not verify as a platform binary (sig %+v)", insp.sig)
+		t.Fatalf("test premise broken: copy did not verify as a platform binary (sig %+v, sigErr %v, kernel identity %q)", insp.sig, insp.sigErr, insp.kcs.identity)
 	}
 	if insp.kind == kindShell {
 		t.Fatal("a shell copied out of /bin was accepted as an OS shell hop")
@@ -543,5 +543,79 @@ func TestIsAppleCodeSigningChain(t *testing.T) {
 	ca := newTestCA(t)
 	if isAppleCodeSigningChain([]*x509.Certificate{ca.leaf, ca.inter, ca.root}) {
 		t.Error("test chain accepted as Apple's")
+	}
+}
+
+// TestInspectKeepsSignatureError: a nil sig must come with the reason. A
+// running platform shell inspected against a file whose CodeDirectory does
+// not match the kernel cdhash gets sigErr set, not silently no signature.
+func TestInspectKeepsSignatureError(t *testing.T) {
+	needFixtures(t)
+	a := fixtureAttestor(t, nil, nil)
+	cmd := exec.Command("/bin/zsh", "-c", "sleep 3; true")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Process.Kill()
+	defer cmd.Wait()
+	real, err := darwinSystem{}.process(int32(cmd.Process.Pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The kernel says zsh; the file at this path is the (differently
+	// signed) fixture, so slice selection by cdhash must fail loudly.
+	mismatched := *real
+	mismatched.exePath = fixtures.good
+	insp, err := a.inspect(&mismatched)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if insp.sig != nil || insp.sigErr == nil || !errors.Is(insp.sigErr, errSliceNotFound) {
+		t.Fatalf("sig %+v sigErr %v; want nil sig with errSliceNotFound", insp.sig, insp.sigErr)
+	}
+	// And a walk refusal for a NON-catalog, non-helper path names it (a
+	// catalog path reports the same failure through ErrUnsignedAtWritablePath).
+	elsewhere := filepath.Join(fixtures.dir, "elsewhere-sigerr")
+	if err := copyFile(fixtures.good, elsewhere); err != nil {
+		t.Fatal(err)
+	}
+	hook := hookSystem{system: darwinSystem{}, calls: map[int32]int{}}
+	hook.onProcess = func(pid int32, p *process, call int) *process {
+		if pid == int32(cmd.Process.Pid) {
+			q := *p
+			q.exePath = elsewhere
+			return &q
+		}
+		return p
+	}
+	a.sys = hook
+	_, err = a.attest(context.Background(), peerCred{pid: int32(cmd.Process.Pid), uid: real.uid})
+	if err == nil || !strings.Contains(err.Error(), "signature:") {
+		t.Fatalf("refusal = %v, want the signature failure named", err)
+	}
+}
+
+// TestSignatureErrorSurvivesCDHashSelection answers the question the cdhash-
+// first reorder raises: is a signature failure still reachable, or does every
+// bad file now die at slice selection? It is reachable whenever the file IS
+// the running code (cdhash matches) but its signature does not verify. Here a
+// real process runs a fixture signed by an untrusted root from a non-catalog
+// path, and the refusal must name the CMS failure, not a generic miss.
+func TestSignatureErrorSurvivesCDHashSelection(t *testing.T) {
+	needFixtures(t)
+	a := fixtureAttestor(t, nil, nil)
+	elsewhere := filepath.Join(fixtures.dir, "elsewhere-wrongroot")
+	if err := copyFile(fixtures.wrongRoot, elsewhere); err != nil {
+		t.Fatal(err)
+	}
+	_, err := attestArgv(t, a, elsewhere, "client", socketArg)
+	if !errors.Is(err, ErrNotInCatalog) {
+		t.Fatalf("err = %v, want ErrNotInCatalog", err)
+	}
+	if !strings.Contains(err.Error(), "signature:") || !strings.Contains(err.Error(), "CMS") {
+		t.Fatalf("refusal does not name the CMS chain failure: %v", err)
+	}
+	if strings.Contains(err.Error(), "cdhash") {
+		t.Fatalf("refused at slice selection, not at signature verification: %v", err)
 	}
 }

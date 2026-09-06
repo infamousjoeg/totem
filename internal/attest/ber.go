@@ -12,6 +12,20 @@ package attest
 // so the walk is bounded: nesting deeper than maxBERDepth is refused (Apple's
 // real signatures nest under ten levels), which also bounds the re-encoding
 // work to maxBERDepth copies of the input.
+//
+// Why a bug here fails closed rather than forging (recorded from the security
+// review): nothing downstream trusts the normalised bytes until a signature
+// or chain check has passed over them. The signed attributes are verified as
+// the re-tagged SET over the normalised SignedAttrs bytes, and every
+// certificate's authenticity comes from a signature check over its own
+// RawTBSCertificate. If this code ever produced bytes whose meaning differed
+// from the input, the affected object's signature would no longer match and
+// verification would FAIL. The only normalised values not themselves under a
+// signature are structural selectors (which SignerInfo, which SID, which
+// certificate), and each only chooses WHICH signed object to check, and that
+// object must still pass. Apple emits indefinite lengths only in the outer
+// ContentInfo/SignedData containers; the signed attributes and certificates
+// are already DER and are copied byte-identically.
 
 import (
 	"errors"

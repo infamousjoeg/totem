@@ -656,6 +656,17 @@ func verifyLoaded(ls *loadedSlice, roots []*x509.Certificate) (*codeSignature, e
 	// CodeDirectory we chose. The primary directory is bound by the CMS
 	// messageDigest; an alternate directory is bound only if its cdhash is in
 	// the signed cdhashes attribute.
+	//
+	// Why that binding is real and not incidental (recorded from the security
+	// review so the next reader inherits it): pages are hashed against best
+	// and identity is read from best, but messageDigest only covers primary.
+	// What stops best from being an attacker's CodeDirectory is that
+	// res.cdHashes is parsed from the SIGNED attributes, the exact byte range
+	// the signer's signature is verified over. An attacker cannot add a
+	// cdhash to a signed attribute without the vendor key, and loadSlice has
+	// already required every CodeDirectory in the blob to agree on identifier
+	// and team id. So best is a vendor-signed directory or the slice is
+	// refused.
 	res, err := verifyCMS(sb.cms, primary.raw, roots)
 	if err != nil {
 		return nil, err

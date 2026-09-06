@@ -386,6 +386,11 @@ type inspection struct {
 	// note carries a reason a catalog match was not attempted, for the
 	// ErrNotInCatalog message.
 	note string
+	// sigErr is why sig is nil when it is nil: the signature could not be
+	// read or did not verify. A nil sig with a nil sigErr never happens on a
+	// platform with kernel code signing; "no signature present" is itself a
+	// verification error (errNoSignature), so the two facts stay distinct.
+	sigErr error
 }
 
 func (a *attestor) attest(ctx context.Context, pc peerCred) (*Identity, error) {
@@ -450,8 +455,16 @@ func (a *attestor) attest(ctx context.Context, pc peerCred) (*Identity, error) {
 			if insp.refusal != nil {
 				return nil, insp.refusal
 			}
-			if insp.note != "" {
+			// The refusal names why the binary could not be anything else:
+			// a signature that failed to read or verify is a different fact
+			// from one that verified for the wrong identity.
+			switch {
+			case insp.note != "" && insp.sigErr != nil:
+				return nil, fmt.Errorf("%w: %s (%s; signature: %v)", ErrNotInCatalog, cur.exePath, insp.note, insp.sigErr)
+			case insp.note != "":
 				return nil, fmt.Errorf("%w: %s (%s)", ErrNotInCatalog, cur.exePath, insp.note)
+			case insp.sigErr != nil:
+				return nil, fmt.Errorf("%w: %s (signature: %v)", ErrNotInCatalog, cur.exePath, insp.sigErr)
 			}
 			return nil, fmt.Errorf("%w: %s", ErrNotInCatalog, cur.exePath)
 		}
@@ -541,6 +554,8 @@ func (a *attestor) inspect(p *process) (*inspection, error) {
 		sig, sigErr = verifyMachO(f, st.Size(), sel, a.roots)
 		if sigErr == nil {
 			insp.sig = sig
+		} else {
+			insp.sigErr = sigErr
 		}
 	}
 
