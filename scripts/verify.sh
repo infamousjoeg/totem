@@ -21,6 +21,24 @@
 # Uncommitted changes are the thing under test, so a clone of HEAD would verify
 # bytes nobody is asking about and report green about the wrong thing.
 #
+# WHAT IT MIRRORS. This is the per-change CI job, command for command: gofmt,
+# build, vet, GOOS=linux vet, CGO_ENABLED=0 build, and the -race suite. Keep it
+# that way; a local check that is a subset of the gate is a local check that
+# says green about a change the gate will reject, and the whole reason to run
+# one is to find that out before pushing.
+#
+# WHAT IT DELIBERATELY DOES NOT. Two CI jobs are release-scale and are not run
+# here, because putting them in the per-change loop would mean nobody runs the
+# per-change loop:
+#
+#   - the restore gate, which restores two million chain records against a
+#     ten-minute budget on a 30-minute timeout;
+#   - the release gate, which proves a release build still REFUSES while the
+#     X.509 OID arc is a placeholder PEN.
+#
+# So a green here is a statement about the per-change gate and not about CI in
+# full. Say so rather than assuming it.
+#
 # Usage:
 #   scripts/verify.sh                      # everything
 #   scripts/verify.sh ./internal/server/   # one package, same checks
@@ -92,6 +110,11 @@ fi
 go build ./...
 go vet ./...
 GOOS=linux go vet ./...
+# Both cgo configurations ship: cgo reaches the Secure Enclave on darwin, and
+# the static builds everywhere else do not have it. A change that breaks the
+# no-cgo build is invisible to every other check here, because the file it
+# breaks is the one the default build does not compile.
+CGO_ENABLED=0 go build ./...
 go test -race -count=1 "${@:-./...}"
 
 echo "=== verified ==="
