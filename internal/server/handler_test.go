@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -193,22 +194,37 @@ func TestEnrollPassesTheIssuersOwnFingerprintAndNotTheDevices(t *testing.T) {
 	}
 }
 
-// TestAssertedTrustDomainMismatchIsALegibleRefusal.
-func TestAssertedTrustDomainMismatchIsALegibleRefusal(t *testing.T) {
+// TestAnAssertedNameIsNeverItselfGroundsForRefusal replaces the pre-flight
+// comparison this handler used to make, and asserts the opposite property.
+//
+// The asserted name is DIAGNOSTIC ONLY. A device that claims the wrong issuer
+// name and presents a valid signature must enroll, because the name was never
+// an input to the decision: the issuer verifies against its own configured
+// trust domain either way. This is the guard against someone reintroducing a
+// convenience check here, which is where the check used to live and where the
+// build lead ruled it must not.
+func TestAnAssertedNameIsNeverItselfGroundsForRefusal(t *testing.T) {
 	t.Parallel()
 	v := presence.NewVerifier(0, nil)
 	d := newEnrollingDevice(t, true)
-	challenge, _ := v.Mint(d.deviceID)
-	req, _ := d.request(t, challenge, "some-other-issuer", "", issuerFingerprint(t))
-
-	s, _ := newTestServer(t, &fakeEngine{})
-	w := post(t, s, "/v1/enroll", req)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("got %d, want 400", w.Code)
+	challenge, err := v.Mint(d.deviceID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	body := w.Body.String()
-	if !strings.Contains(body, "some-other-issuer") || !strings.Contains(body, testTrustDomain) {
-		t.Errorf("the refusal must name BOTH names so the human can see the typo; got %q", body)
+	req, _ := d.request(t, challenge, "an-issuer-that-is-not-us", "", issuerFingerprint(t))
+
+	f := &fakeEngine{enrolled: &policy.EnrollResult{DeviceID: d.deviceID, Approved: true, Presence: presence.StatePresent}}
+	s, _ := newTestServer(t, f)
+
+	w := post(t, s, "/v1/enroll", req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d (%s); an asserted name is never itself grounds for refusal, only for a better message when something else fails",
+			w.Code, w.Body.String())
+	}
+	// And the value still reaches the engine, or the diagnostic it enables
+	// cannot be produced when a signature does fail.
+	if f.lastEnroll.AssertedTrustDomain != "an-issuer-that-is-not-us" {
+		t.Errorf("the asserted name did not reach the engine: %q", f.lastEnroll.AssertedTrustDomain)
 	}
 }
 
@@ -357,5 +373,86 @@ func TestNewRefusesAnIncompleteFrontDoor(t *testing.T) {
 		if _, err := New(cfg); !errors.Is(err, ErrConfig) {
 			t.Errorf("%s: got %v, want ErrConfig", name, err)
 		}
+	}
+}
+
+// TestEnrollmentNameMismatchReadsAsATypoNotAKeyProblem.
+//
+// internal/policy detects the mismatch and wraps the signature failure as
+// ErrAssertedTrustDomain carrying both names. Two things have to be true of
+// what reaches the person: it must name both issuers, and it must NOT read as
+// a signature or a prompt problem, because both send an operator somewhere
+// expensive for what is a typo in a command.
+func TestEnrollmentNameMismatchReadsAsATypoNotAKeyProblem(t *testing.T) {
+	t.Parallel()
+	v := presence.NewVerifier(0, nil)
+	d := newEnrollingDevice(t, true)
+	challenge, err := v.Mint(d.deviceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const asserted = "issuer.example.com"
+	req, _ := d.request(t, challenge, asserted, "", issuerFingerprint(t))
+
+	// The engine reports what policy reports: the sentinel wrapping the
+	// presence error, exactly as policy builds it.
+	f := &fakeEngine{enrollErr: fmt.Errorf("%w: %w: this device thinks we are called %q and we are called %q; fix the enroll command",
+		policy.ErrAssertedTrustDomain, presence.ErrBadSignature, asserted, testTrustDomain)}
+	s, _ := newTestServer(t, f)
+
+	w := post(t, s, "/v1/enroll", req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400: a name mismatch is a typo, not a signature problem", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, asserted) || !strings.Contains(body, testTrustDomain) {
+		t.Errorf("the refusal must name BOTH issuers so the operator can see the typo; got %q", body)
+	}
+	if !strings.Contains(body, "--trust-domain") {
+		t.Errorf("the refusal does not name the flag that fixes it: %q", body)
+	}
+	// The wrapped error still satisfies errors.Is for the presence failure, so
+	// the generic bad-signature mapping would happily claim it. It must not:
+	// "this device's enrollment did not verify" is true and useless here.
+	if strings.Contains(strings.ToLower(body), "did not verify") {
+		t.Errorf("the name mismatch was rendered as a signature failure: %q", body)
+	}
+	// And no package names or wrapping chain reach the person. cmd/totem
+	// prints the first line of this body verbatim.
+	for _, leak := range []string{"policy:", "presence:", "ca:", "store:"} {
+		if strings.Contains(body, leak) {
+			t.Errorf("the wrapped error chain leaked %q to the operator: %q", leak, body)
+		}
+	}
+
+	// The same presence sentinel on a path that is NOT an enrollment keeps the
+	// presence reading, so the two do not collapse into one message.
+	generic := classify(presence.ErrTargetMismatch)
+	if !strings.Contains(strings.ToLower(generic.fix), "prompt") {
+		t.Errorf("the generic mapping lost the presence reading: %q", generic.fix)
+	}
+}
+
+// TestABareSignatureFailureStaysASignatureFailure. policy only wraps when the
+// device actually claimed a different name, so a genuine bad signature must
+// still read as one rather than blaming a typo that did not happen.
+func TestABareSignatureFailureStaysASignatureFailure(t *testing.T) {
+	t.Parallel()
+	v := presence.NewVerifier(0, nil)
+	d := newEnrollingDevice(t, true)
+	challenge, err := v.Mint(d.deviceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ := d.request(t, challenge, testTrustDomain, "", issuerFingerprint(t))
+	f := &fakeEngine{enrollErr: presence.ErrBadSignature}
+	s, _ := newTestServer(t, f)
+
+	w := post(t, s, "/v1/enroll", req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("got %d, want 403 for a signature that does not verify", w.Code)
+	}
+	if body := w.Body.String(); strings.Contains(body, "--trust-domain") {
+		t.Errorf("a genuine signature failure was blamed on a name mismatch: %q", body)
 	}
 }

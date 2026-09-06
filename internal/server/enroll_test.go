@@ -211,17 +211,24 @@ func TestOneChallengeCoversBothSignatures(t *testing.T) {
 	}
 }
 
-// TestAssertedTrustDomainIsDiagnosticOnly proves both halves of the rule: the
-// issuer's own trust domain is what verification uses, and the device's
-// asserted name is what makes the failure legible.
+// TestAssertedTrustDomainIsDiagnosticOnly documents WHY internal/policy
+// reconstructs the assertion target from the issuer's own configured value
+// unconditionally, and why it produces its diagnostic some other way.
 //
-// The second half is the finding. When the assertion is reconstructed with the
-// name the DEVICE signed, a mismatch surfaces as ErrTargetMismatch, which the
-// front door can turn into "this device thinks we are called X and we are
-// called Y". When it is reconstructed with the ISSUER's name, as
-// policy.EnrollRequest's current shape forces (it carries no field for the
-// device's asserted target), the same mismatch surfaces as ErrBadSignature, and
-// an operator goes looking at key material for what is a typo in a command.
+// Both branches below are true facts about internal/presence. Substituting the
+// device's asserted name into the assertion would yield ErrTargetMismatch, a
+// precise sentinel, and it cannot widen acceptance: asserting our own name
+// changes nothing and asserting another fails earlier rather than later. policy
+// still refuses to do it, and is right to. Assertion.Target is the verifier's
+// INPUT, so that substitution puts a device-chosen string back into the struct
+// presence checks, in the one place this build spent its time establishing that
+// a device sends signature bytes and never a target. The invariant is worth
+// more than the better sentinel, so policy pays a heuristic instead
+// (policy.ErrAssertedTrustDomain) and keeps Target: cfg.TrustDomain readable at
+// the call site.
+//
+// This test is therefore documentation of a road not taken, and it is the test
+// that would notice if anyone ever took it.
 func TestAssertedTrustDomainIsDiagnosticOnly(t *testing.T) {
 	t.Parallel()
 	const wrong = "issuer.example.com"

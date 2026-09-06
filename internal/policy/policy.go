@@ -236,6 +236,29 @@ type EnrollRequest struct {
 	BootstrapCode string
 	// Name is the device name for inventory.
 	Name string
+	// AssertedTrustDomain is the issuer NAME the device believed it was
+	// joining and signed its presence assertion for (the agent's
+	// SignedTarget). It is DIAGNOSTIC ONLY and is never verified against:
+	// Enroll reconstructs the assertion's target from the issuer's own
+	// configured trust domain, so a device that signed for another name
+	// fails as ErrBadSignature whatever this field says.
+	//
+	// What it is FOR: turning that failure into a thirty-second fix. When
+	// the signature fails and this value differs from the issuer's, Enroll
+	// wraps the error in ErrAssertedTrustDomain naming both, so the
+	// operator reads "this device thinks we are called X and we are called
+	// Y" and corrects the enroll command instead of chasing key material.
+	// Remove this field and that message goes back to being a bare
+	// signature failure.
+	//
+	// This does NOT weaken the rule on Request. Request carries what a
+	// caller is asking for during an exchange, where a caller-supplied
+	// identity is a forgery vector, and it has no identity fields and must
+	// not gain any. EnrollRequest carries what a device SAID at enrollment,
+	// the thing being adjudicated, not the thing being trusted. This field
+	// is not precedent for a grant id, device id or presence state on
+	// Request.
+	AssertedTrustDomain string
 }
 
 // EnrollResult is the issuer's answer: either approved now (the founding
@@ -770,6 +793,11 @@ var (
 	// ErrIssuerFingerprint: the device pinned a certificate that is not this
 	// issuer's.
 	ErrIssuerFingerprint = errors.New("policy: enrollment pinned a certificate that is not this issuer's")
+	// ErrAssertedTrustDomain wraps an enrollment signature failure when the
+	// device's AssertedTrustDomain differs from the issuer's: the likely
+	// cause is a typo'd enroll command, not key material. Diagnostic; the
+	// underlying presence error is wrapped alongside it.
+	ErrAssertedTrustDomain = errors.New("policy: device enrolled against a different issuer name")
 	// ErrPresenceRequired: the action needs a device with presence and the
 	// signer has none.
 	ErrPresenceRequired = errors.New("policy: this action requires a device with presence")

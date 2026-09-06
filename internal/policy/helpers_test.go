@@ -356,7 +356,7 @@ func (w *world) enrollRequest(key *fakeKey, name, code, target string) EnrollReq
 	if err != nil {
 		w.t.Fatal(err)
 	}
-	req := EnrollRequest{Input: in, Signature: sig, BootstrapCode: code, Name: name}
+	req := EnrollRequest{Input: in, Signature: sig, BootstrapCode: code, Name: name, AssertedTrustDomain: target}
 	if key.presence != nil {
 		digest, _ := in.Digest()
 		a, err := presence.Sign(context.Background(), key, presence.SigningInput{

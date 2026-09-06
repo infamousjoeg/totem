@@ -100,6 +100,15 @@ func (i *Issuer) enroll(ctx context.Context, req EnrollRequest, issuerFingerprin
 	}
 	enrolled, err := i.cfg.Verifier.Enroll(in, req.Signature, a, i.cfg.TrustDomain)
 	if err != nil {
+		// Diagnostic only. The target was reconstructed from the issuer's
+		// own domain above, so a device that signed for another name
+		// fails the signature; if it TOLD us another name, say so, because
+		// that is a typo in an enroll command and not a key problem.
+		if a != nil && errors.Is(err, presence.ErrBadSignature) &&
+			req.AssertedTrustDomain != "" && req.AssertedTrustDomain != i.cfg.TrustDomain {
+			return nil, fmt.Errorf("%w: %w: this device thinks we are called %q and we are called %q; fix the enroll command",
+				ErrAssertedTrustDomain, err, req.AssertedTrustDomain, i.cfg.TrustDomain)
+		}
 		return nil, err
 	}
 	if subtle.ConstantTimeCompare(in.IssuerFingerprint, issuerFingerprint) != 1 {

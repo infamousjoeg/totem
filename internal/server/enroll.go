@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -149,10 +150,6 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		s.refuse(w, r, req.DeviceFingerprint, err)
 		return
 	}
-	if err := s.checkAssertedTrustDomain(req.SignedTarget); err != nil {
-		s.refuse(w, r, deviceID, err)
-		return
-	}
 	in, err := EnrollmentInput(req)
 	if err != nil {
 		s.refuse(w, r, deviceID, err)
@@ -167,9 +164,14 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		PresenceSignature: req.PresenceAssertion,
 		BootstrapCode:     req.BootstrapCode,
 		Name:              req.Hostname,
+		// DIAGNOSTIC ONLY, and the engine treats it as such. The issuer
+		// verifies against its OWN configured trust domain; this is the name
+		// the DEVICE believes it is joining, and it exists so a mismatch reads
+		// as a typo in an enroll command rather than as a key problem.
+		AssertedTrustDomain: req.SignedTarget,
 	}, s.cfg.Identity.Fingerprint)
 	if err != nil {
-		s.refuse(w, r, deviceID, err)
+		s.refuse(w, r, deviceID, s.enrollError(req, err))
 		return
 	}
 
@@ -262,26 +264,39 @@ func firstContactOrWeakest(f presence.FirstContact) presence.FirstContact {
 	return presence.FirstContactPrompt
 }
 
-// checkAssertedTrustDomain compares the name the device says it is joining
-// against this issuer's own, purely to produce a better message.
+// enrollError renders the human reading of an error the policy engine returned.
 //
-// It is NOT a security check and must never be read as one. Verification uses
-// the issuer's own trust domain, passed down to presence.Verifier.Enroll, and
-// a device that matched here would gain nothing by it. What this buys is the
-// difference between "signature did not verify", which sends an operator
-// looking at key material, and "this device thinks we are called X and we are
-// called Y", which is a typo in an enroll command and a thirty-second fix.
-// Without it the mismatch surfaces as presence.ErrBadSignature, because the
-// name is under the signature and the issuer reconstructs the signed bytes
-// with its own value.
-func (s *Server) checkAssertedTrustDomain(asserted string) error {
-	if asserted == "" || asserted == s.cfg.TrustDomain {
-		return nil
+// internal/policy detects the name mismatch, because that is where the
+// comparison happens, and wraps the signature failure as
+// policy.ErrAssertedTrustDomain carrying both names. This function does not
+// repeat that detection; it branches on the sentinel and writes the sentence.
+//
+// It writes its own sentence rather than passing policy's through, for a
+// measured reason rather than a stylistic one. cmd/totem's httpIssuerClient.post
+// prints firstLine(body) VERBATIM to the person, and the wrapped error renders
+// as "policy: device enrolled against a different issuer name: presence:
+// signature does not verify: this device thinks we are called ...". Handing
+// that to an operator puts two package names and a contradictory "signature does
+// not verify" in front of the one sentence they need, at the moment they are
+// already confused. policy's text is right for a caller reading a log; this is
+// the same fact rendered for the person, from values this handler already holds.
+// The DETECTION still lives in exactly one place, which is what the ruling was
+// about.
+func (s *Server) enrollError(req EnrollRequest, err error) error {
+	if !errors.Is(err, policy.ErrAssertedTrustDomain) {
+		return err
 	}
-	return badRequest(
-		fmt.Sprintf("Enroll again with --trust-domain %s, or ask your issuer operator which name is right.", s.cfg.TrustDomain),
-		"this device is trying to join an issuer called %q, and this issuer is called %q.",
-		asserted, s.cfg.TrustDomain)
+	asserted := req.SignedTarget
+	if asserted == "" {
+		asserted = "(unnamed)"
+	}
+	return &apiError{
+		status: http.StatusBadRequest,
+		cause:  err,
+		what: fmt.Sprintf("this device is trying to join an issuer called %q, and this issuer is called %q.",
+			asserted, s.cfg.TrustDomain),
+		fix: fmt.Sprintf("Enroll again with --trust-domain %s, or ask your issuer operator which name is right.", s.cfg.TrustDomain),
+	}
 }
 
 // deviceIDFor derives the pre-enrollment device id from the public key and

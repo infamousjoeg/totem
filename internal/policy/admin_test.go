@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -53,6 +54,12 @@ func TestFoundingEnrollment(t *testing.T) {
 	req = w.enrollRequest(key, "founder", bootstrap, "evil.example.test")
 	_, err = w.iss.Enroll(ctx, req, issuerFP)
 	mustErr(t, err, presence.ErrBadSignature)
+	// ... and because the device SAID which name it signed for, the error
+	// also names both sides, so the operator fixes the command, not the key.
+	mustErr(t, err, ErrAssertedTrustDomain)
+	if !strings.Contains(err.Error(), `"evil.example.test"`) || !strings.Contains(err.Error(), `"`+testDomain+`"`) {
+		t.Fatalf("diagnostic does not name both domains: %v", err)
+	}
 
 	// Correct.
 	req = w.enrollRequest(key, "founder", bootstrap, testDomain)
@@ -411,4 +418,51 @@ func TestEnrollSpendsOneChallengeForBothSignatures(t *testing.T) {
 	if e.Presence != presence.StatePresent || !e.Live() {
 		t.Fatalf("after reload %+v", e)
 	}
+}
+
+func TestAssertedTrustDomainIsDiagnosticOnly(t *testing.T) {
+	w := newWorld(t)
+	ctx := ctxb()
+	founder := w.found("founder", true)
+	_ = founder
+
+	// A device that signed for the RIGHT domain but claims a wrong one is
+	// enrolled: the claim is never verified against.
+	key := newFakeKey(t, true)
+	req := w.enrollRequest(key, "laptop", "", testDomain)
+	req.AssertedTrustDomain = "wrong.example.test"
+	res, err := w.iss.Enroll(ctx, req, issuerFP)
+	mustErr(t, err, nil)
+	if res.Code == "" {
+		t.Fatal("not pending")
+	}
+	// A device that signed for the WRONG domain but claims the right one
+	// (or none) is a bare signature failure: the claim cannot help it.
+	for _, claim := range []string{testDomain, ""} {
+		key := newFakeKey(t, true)
+		req := w.enrollRequest(key, "typo", "", "evil.example.test")
+		req.AssertedTrustDomain = claim
+		_, err := w.iss.Enroll(ctx, req, issuerFP)
+		mustErr(t, err, presence.ErrBadSignature)
+		if errors.Is(err, ErrAssertedTrustDomain) {
+			t.Fatalf("claim %q produced the domain diagnostic: %v", claim, err)
+		}
+	}
+	// A none-level device has no presence assertion, so there is nothing
+	// a domain could have been signed into; no diagnostic.
+	none := newFakeKey(t, false)
+	req = w.enrollRequest(none, "headless", "", testDomain)
+	req.AssertedTrustDomain = "wrong.example.test"
+	_, err = w.iss.Enroll(ctx, req, issuerFP)
+	mustErr(t, err, nil)
+	// A signature failure for another reason with a mismatched claim still
+	// gets the diagnostic (it names the likely cause, it does not prove it),
+	// but the underlying presence error stays reachable through errors.Is.
+	key = newFakeKey(t, true)
+	req = w.enrollRequest(key, "corrupt", "", testDomain)
+	req.AssertedTrustDomain = "wrong.example.test"
+	req.PresenceSignature[len(req.PresenceSignature)/2] ^= 0x40
+	_, err = w.iss.Enroll(ctx, req, issuerFP)
+	mustErr(t, err, presence.ErrBadSignature)
+	mustErr(t, err, ErrAssertedTrustDomain)
 }

@@ -24,6 +24,11 @@ func gateCfg(dir string, rot summon.Rotation, rotErr error) Config {
 		Resolver:      &fakeResolver{pass: testPass, rotation: rot, rotationErr: rotErr},
 		PassphraseRef: "ca_passphrase",
 		TrustDomain:   testTrustDomain,
+		// Injected rather than left to time.Now. Nothing here depends on the
+		// wall clock, but a test that reads it can only be reasoned about by
+		// arguing that it does not matter, and that argument has to be redone
+		// every time the code under it changes.
+		Now: newClock(T0).now,
 	}
 }
 

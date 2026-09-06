@@ -163,24 +163,54 @@ func TestRequestBodiesCarryNoIdentity(t *testing.T) {
 }
 
 // TestNoTrustDomainIsReadFromARequest. The trust domain an enrollment is
-// verified against is always the issuer's own configured value. A device that
+// verified against is ALWAYS this issuer's own configured value. A device that
 // could pick the name it is checked against defeats the whole binding.
+//
+// The device's asserted name does travel to the policy engine, because a
+// mismatch is only legible if the engine can see what the device claimed. The
+// rule that keeps that safe is naming: it may be assigned ONLY to a field whose
+// name says it is asserted, never to a bare TrustDomain, so a reader skimming a
+// use site knows which one is authoritative without consulting a comment. That
+// is the build lead's constraint on how the field landed, and this is what
+// enforces it.
 func TestNoTrustDomainIsReadFromARequest(t *testing.T) {
 	t.Parallel()
 	src := packageSource(t)
-	// SignedTarget is the device's asserted name. It may be COMPARED (for the
-	// diagnostic) and must never be assigned into anything the engine verifies
-	// against.
-	for _, forbidden := range []string{
-		"TrustDomain: req.SignedTarget",
-		"TrustDomain = req.SignedTarget",
-		"trustDomain: req.SignedTarget",
-	} {
-		if countOutsideComments(src, forbidden) != 0 {
-			t.Errorf("the issuer's trust domain was taken from a request (%q)", forbidden)
+
+	// A bare TrustDomain field taking the device's value, in any struct. The
+	// leading class stops this matching AssertedTrustDomain, which is the one
+	// spelling that is allowed.
+	bare := regexp.MustCompile(`(^|[^A-Za-z])TrustDomain\s*[:=]\s*req\.SignedTarget`)
+	if loc := bare.FindString(src); loc != "" {
+		t.Errorf("the issuer's trust domain was taken from a request (%q). Verification uses the configured "+
+			"value; a device's asserted name may only be carried in a field that says it is asserted.", strings.TrimSpace(loc))
+	}
+
+	// Every use of the device's asserted name must land in an Asserted* field.
+	uses := regexp.MustCompile(`([A-Za-z]*)\s*:\s*req\.SignedTarget`).FindAllStringSubmatch(src, -1)
+	for _, u := range uses {
+		if !strings.HasPrefix(u[1], "Asserted") {
+			t.Errorf("req.SignedTarget is assigned to %q; it may only be carried in a field whose name says "+
+				"it is asserted, so no use site can be misread as authoritative", u[1])
 		}
 	}
+
 	if countOutsideComments(src, "s.cfg.TrustDomain") == 0 {
 		t.Error("the configured trust domain is never used; something is reading the name from somewhere else")
+	}
+}
+
+// TestTheAssertedNameIsNeverComparedHere. The detection of a name mismatch
+// lives in internal/policy, where the comparison against the configured value
+// already happens. This package renders the result and does not repeat the
+// check: two places stating the same rule, only one of which anyone watches, is
+// the shape this build has repeatedly found to be a defect.
+func TestTheAssertedNameIsNeverComparedHere(t *testing.T) {
+	t.Parallel()
+	src := packageSource(t)
+	compare := regexp.MustCompile(`req\.SignedTarget\s*(==|!=)|(==|!=)\s*req\.SignedTarget`)
+	if loc := compare.FindString(src); loc != "" {
+		t.Errorf("the asserted name is compared in this package (%q). internal/policy detects the mismatch; "+
+			"this package only renders it.", strings.TrimSpace(loc))
 	}
 }

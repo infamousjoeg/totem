@@ -3,12 +3,55 @@ package ca
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 )
+
+// sealState renders what a failure in these tests actually needs to be
+// diagnosed: which sealed files exist and which candidate passphrase opens
+// each. It exists because a passphrase failure that only says "got nil, want
+// error" tells you the assertion that fired and nothing about the state that
+// produced it, and these tests run under a full-tree race run where a single
+// unreproducible failure is all the evidence there will ever be.
+//
+// It uses CanOpen, which is the same question an operator asks when a re-seal
+// goes wrong, so a failure here reads the same way an incident does.
+func sealState(ctx context.Context, ca *testCA, candidates map[string]string) string {
+	op, ok := ca.Authority.(PassphraseOperator)
+	if !ok {
+		return " (authority is not a PassphraseOperator)"
+	}
+	var b strings.Builder
+	files, _ := filepath.Glob(filepath.Join(ca.dir, "*"+keySuffix))
+	sort.Strings(files)
+	fmt.Fprintf(&b, "\n  sealed key files (%d):", len(files))
+	for _, f := range files {
+		fmt.Fprintf(&b, " %s", filepath.Base(f))
+	}
+	names := make([]string, 0, len(candidates))
+	for n := range candidates {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		bad, err := op.CanOpen(ctx, []byte(candidates[n]))
+		switch {
+		case err != nil:
+			fmt.Fprintf(&b, "\n  CanOpen(%s): error: %v", n, err)
+		case len(bad) == 0:
+			fmt.Fprintf(&b, "\n  CanOpen(%s): opens every file", n)
+		default:
+			fmt.Fprintf(&b, "\n  CanOpen(%s): does NOT open %v", n, bad)
+		}
+	}
+	fmt.Fprintf(&b, "\n  resolver calls so far: %d", ca.res.callCount())
+	return b.String()
+}
 
 func (c *testCA) setPassphrase(p string) {
 	c.res.mu.Lock()
@@ -248,23 +291,28 @@ func TestResealRefusesBeforeTheResolverHasAdoptedTheNewValue(t *testing.T) {
 	op := ca.Authority.(PassphraseOperator)
 	const oldPass = "a-passphrase-only-summon-knows"
 
+	const newPass = "the value the provider now returns"
+	state := func() string {
+		return sealState(ctx, ca, map[string]string{"old": oldPass, "new": newPass, "wrong": "a flatly wrong previous passphrase"})
+	}
+
 	// The resolver still serves the old value: summon's pre-adoption state.
 	if err := op.Reseal(ctx, []byte(oldPass)); !errors.Is(err, ErrPassphraseNotAdopted) {
-		t.Fatalf("re-sealing before adoption: got %v, want ErrPassphraseNotAdopted", err)
+		t.Fatalf("re-sealing before adoption: got %v, want ErrPassphraseNotAdopted%s", err, state())
 	}
 	// A flatly wrong previous value must not read as success either, which is
 	// what it did before: it was never tried.
 	if err := op.Reseal(ctx, []byte("a flatly wrong previous passphrase")); err == nil {
-		t.Fatal("a wrong previous value reported success; it was never checked against anything")
+		t.Fatalf("a wrong previous value reported success; it was never checked against anything%s", state())
 	}
 
 	// After adoption the ordinary path works.
-	ca.setPassphrase("the value the provider now returns")
+	ca.setPassphrase(newPass)
 	if err := op.Reseal(ctx, []byte(oldPass)); err != nil {
-		t.Fatalf("re-sealing after adoption: %v", err)
+		t.Fatalf("re-sealing after adoption: %v%s", err, state())
 	}
 	if err := op.VerifyPassphrase(ctx); err != nil {
-		t.Fatalf("after re-sealing: %v", err)
+		t.Fatalf("after re-sealing: %v%s", err, state())
 	}
 }
 
