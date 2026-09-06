@@ -103,7 +103,7 @@ func cmdInit(ctx context.Context, args []string) error {
 		return err
 	}
 
-	rt := &runtime{cfg: cfg, dir: dir, audit: server.NewAuditLog(os.Stdout, nil)}
+	rt := &runtime{cfg: cfg, dir: dir, audit: server.NewAuditLog(auditSink(cfg, oneShot), nil)}
 	defer rt.Close()
 
 	if rt.summoner, err = openSecrets(ctx, cfg, dir); err != nil {

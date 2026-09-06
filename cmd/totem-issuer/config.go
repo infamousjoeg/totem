@@ -51,6 +51,13 @@ type Config struct {
 	Secrets SecretsConfig `json:"secrets"`
 	// Bridges records which bridges are enabled and what each one needs.
 	Bridges map[string]Bridge `json:"bridges,omitempty"`
+	// AuditSink is where the hash-chained audit stream goes: "stdout",
+	// "stderr", or empty for the per-command default (see auditSink). It is
+	// configuration rather than a constant for the same reason the syslog and
+	// OTLP exports are: where an operator wants the record is a deployment
+	// decision, and the only thing totem insists on is that whatever reads it
+	// never has to tolerate a line it cannot parse.
+	AuditSink string `json:"audit_sink,omitempty"`
 	// DailyBackup records the operator's answer to the backup question at init,
 	// so issuer status can say whether one was ever set up.
 	DailyBackup bool `json:"daily_backup"`
@@ -129,6 +136,20 @@ func (c *Config) Save(dir string) error {
 	}
 	c.path = path
 	return nil
+}
+
+// auditSink is the configured sink, normalised. An unrecognised value is
+// treated as unset rather than refused: a typo here must not stop an issuer
+// starting, and the per-command default is always safe.
+func (c *Config) auditSink() string {
+	switch strings.ToLower(strings.TrimSpace(c.AuditSink)) {
+	case AuditSinkStdout:
+		return AuditSinkStdout
+	case AuditSinkStderr:
+		return AuditSinkStderr
+	default:
+		return ""
+	}
 }
 
 // Path is where this config lives.

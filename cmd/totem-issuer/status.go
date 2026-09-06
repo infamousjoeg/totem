@@ -23,7 +23,7 @@ func cmdStatus(ctx context.Context, args []string) error {
 	}
 	dir := issuerDir(*dirFlag)
 
-	rt, err := openRuntime(ctx, dir)
+	rt, err := openRuntime(ctx, dir, oneShot)
 	if err != nil {
 		return err
 	}

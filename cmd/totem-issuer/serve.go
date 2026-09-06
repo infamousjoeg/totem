@@ -14,12 +14,21 @@ import (
 // file, mTLS only", and "Every issuance, exchange, and policy change is one
 // structured, hash-chained log line ... Stdout".
 //
-// So the audit stream IS stdout, and nothing else may write there. Every human
-// message this command produces goes to stderr, because a line of prose in the
-// middle of a hash-chained stream is a line a log shipper cannot parse and a
-// verifier cannot place: it breaks the chain for a reader without anything
-// having been tampered with, which is the worst possible false positive for a
-// control whose entire job is to be believed.
+// SERVE'S audit sink is stdout, and nothing else may write there. Note the
+// shape of that sentence: the audit stream is a NAMED SINK and stdout is one
+// possible value of it, not its definition. This comment used to say "the audit
+// stream IS stdout", which is true here and false of every one-shot command,
+// whose stdout belongs to its caller, and that wording is what let `init` start
+// emitting JSON records into the stream a scripted setup reads the enroll
+// command from. See auditSink in runtime.go for the rule.
+//
+// Every human message this command produces goes to stderr, because a line of
+// prose in the middle of a hash-chained stream is a line a log shipper cannot
+// parse and a verifier cannot place: it breaks the chain for a reader without
+// anything having been tampered with, which is the worst possible false
+// positive for a control whose entire job is to be believed. Worse, a consumer
+// that has learned to skip unparseable lines is a consumer that will skip a
+// tampered one.
 func cmdServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -30,7 +39,7 @@ func cmdServe(ctx context.Context, args []string) error {
 	}
 	dir := issuerDir(*dirFlag)
 
-	rt, err := openRuntime(ctx, dir)
+	rt, err := openRuntime(ctx, dir, longRunning)
 	if err != nil {
 		return err
 	}

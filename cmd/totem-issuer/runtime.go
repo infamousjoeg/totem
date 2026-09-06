@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -65,13 +66,81 @@ func openSecrets(ctx context.Context, cfg *Config, dir string) (*summon.Summoner
 	return s, nil
 }
 
+// AuditSinkStdout and AuditSinkStderr are the values Config.AuditSink accepts.
+// Empty means the default for the command, which is the rule below.
+const (
+	AuditSinkStdout = "stdout"
+	AuditSinkStderr = "stderr"
+)
+
+// commandKind says what a command's STDOUT belongs to, which is the only thing
+// that decides where the audit stream can go.
+type commandKind int
+
+const (
+	// oneShot is a command that runs, prints a result, and exits. Its stdout
+	// belongs to whoever invoked it: `init` writes the enroll command there on
+	// purpose and a scripted setup captures it, `status` prints for a person.
+	oneShot commandKind = iota
+	// longRunning is `serve`. Nothing else consumes its stdout, so the audit
+	// stream can have it.
+	longRunning
+)
+
+// auditSink returns where the hash-chained audit stream is written.
+//
+// THE INVARIANT IS THE SINK, NOT STDOUT, and getting that backwards is what
+// produced the defect this function exists to fix. The rule used to be written
+// as "stdout is the audit stream", which is true of serve and false of every
+// one-shot command, because a one-shot command's stdout already belongs to its
+// caller. So `init` was emitting a JSON audit record into the same stream a
+// scripted setup reads the enroll command from, and into the middle of a
+// person's terminal output. init was not the thing that was wrong; the
+// invariant was.
+//
+// The rule, which a new command inherits by having to name its kind:
+//
+//   - longRunning: stdout, because serve has no other consumer for it.
+//   - oneShot: stderr, so stdout carries the command's result and nothing else.
+//
+// Why it matters beyond tidiness: the audit stream is itself hash-chained, so a
+// consumer that has learned to skip unparseable lines is a consumer that will
+// skip a TAMPERED one. A stream that never contains a non-JSON line is a stream
+// whose reader never needs that habit.
+//
+// ONE THING THIS DOES NOT DO, stated so nobody infers it. A one-shot command's
+// stderr carries its human messages too, so its audit records share a stream
+// with prose. That is fine and is not the case the rule is about: a log shipper
+// is pointed at the long-running issuer, whose stdout is the audit stream and
+// carries nothing else, and a one-shot's audit record is a line for the
+// operator running it and for whatever captured that session. Point a shipper
+// at a one-shot's stderr and it will see prose. The property being protected is
+// that the SHIPPED stream never contains a line its reader must learn to skip,
+// because a reader with that habit will skip a tampered one.
+//
+// Config.AuditSink overrides the default either way, in the same shape the
+// syslog and OTLP exports will take. An operator who points a one-shot command
+// at stdout gets the contamination back, deliberately and on their own head.
+func auditSink(cfg *Config, kind commandKind) io.Writer {
+	switch cfg.auditSink() {
+	case AuditSinkStdout:
+		return os.Stdout
+	case AuditSinkStderr:
+		return os.Stderr
+	}
+	if kind == longRunning {
+		return os.Stdout
+	}
+	return os.Stderr
+}
+
 // openRuntime opens an issuer that has already been initialised.
-func openRuntime(ctx context.Context, dir string) (*runtime, error) {
+func openRuntime(ctx context.Context, dir string, kind commandKind) (*runtime, error) {
 	cfg, err := Load(dir)
 	if err != nil {
 		return nil, err
 	}
-	rt := &runtime{cfg: cfg, dir: dir, audit: server.NewAuditLog(os.Stdout, nil)}
+	rt := &runtime{cfg: cfg, dir: dir, audit: server.NewAuditLog(auditSink(cfg, kind), nil)}
 
 	if rt.summoner, err = openSecrets(ctx, cfg, dir); err != nil {
 		return nil, err

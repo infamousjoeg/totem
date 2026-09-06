@@ -313,3 +313,89 @@ func TestValidateAcceptsTheShippedDefaults(t *testing.T) {
 		t.Fatalf("a blank reference validated: %v", err)
 	}
 }
+
+// TestAuditSinkNeverContaminatesACommandsResult pins the ruling that the audit
+// stream is a NAMED SINK and stdout is one possible value of it.
+//
+// The defect this replaces: the invariant was written as "stdout is the audit
+// stream", which is true of serve and false of every one-shot command, whose
+// stdout belongs to its caller. init writes the enroll command to stdout on
+// purpose and a scripted setup captures it, so init emitting a JSON audit
+// record there put an unparseable line into two streams at once, a caller's and
+// a person's.
+//
+// It matters past tidiness because the audit stream is itself hash-chained: a
+// consumer that has learned to skip unparseable lines will skip a tampered one.
+func TestAuditSinkNeverContaminatesACommandsResult(t *testing.T) {
+	t.Parallel()
+	cfg := &Config{Secrets: SecretsConfig{Refs: DefaultRefs("totem")}}
+
+	if got := auditSink(cfg, longRunning); got != os.Stdout {
+		t.Error("serve's audit sink is not stdout; nothing else consumes serve's stdout, so the stream can have it")
+	}
+	if got := auditSink(cfg, oneShot); got != os.Stderr {
+		t.Error("a one-shot command's audit sink is stdout, which is the stream its caller parses. " +
+			"init writes the enroll command there deliberately.")
+	}
+
+	// Configurable either way, in the shape the syslog and OTLP exports will
+	// take. An operator who asks for the contamination gets it, on their head.
+	cfg.AuditSink = AuditSinkStdout
+	if got := auditSink(cfg, oneShot); got != os.Stdout {
+		t.Error("an explicit stdout sink was not honoured")
+	}
+	cfg.AuditSink = AuditSinkStderr
+	if got := auditSink(cfg, longRunning); got != os.Stderr {
+		t.Error("an explicit stderr sink was not honoured")
+	}
+	// Case and whitespace are an operator typing into a config file, not a
+	// different intent.
+	cfg.AuditSink = "  STDERR "
+	if got := auditSink(cfg, longRunning); got != os.Stderr {
+		t.Error("a sink written with different case or spacing was not recognised")
+	}
+	// A typo must not stop an issuer starting; the per-command default is
+	// always safe, so an unrecognised value falls back to it rather than
+	// refusing.
+	cfg.AuditSink = "sylog"
+	if got := auditSink(cfg, oneShot); got != os.Stderr {
+		t.Error("an unrecognised sink did not fall back to the safe per-command default")
+	}
+	if got := auditSink(cfg, longRunning); got != os.Stdout {
+		t.Error("an unrecognised sink did not fall back to the safe per-command default")
+	}
+}
+
+// TestEveryCommandDeclaresWhatItsStdoutIsFor. The rule is inherited by having
+// to name a kind, so a new command cannot get the default by accident. This
+// asserts the one that would be most costly to get wrong is still declared: a
+// long-running kind on a command that prints for a caller puts JSON back in the
+// caller's stream.
+func TestEveryCommandDeclaresWhatItsStdoutIsFor(t *testing.T) {
+	t.Parallel()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	longRunningFiles := map[string]bool{"serve.go": true}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(filepath.Clean(name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := string(src)
+		if strings.Contains(body, "openRuntime(ctx, dir, longRunning)") && !longRunningFiles[name] {
+			t.Errorf("%s opens the runtime as longRunning. Only serve may: every other command prints a "+
+				"result its caller parses, and a longRunning sink puts the audit stream back into it.", name)
+		}
+		// Nothing may name os.Stdout as an audit sink directly, which is how
+		// the rule gets bypassed without anyone choosing to bypass it.
+		if strings.Contains(body, "NewAuditLog(os.Stdout") {
+			t.Errorf("%s wires the audit log straight to stdout instead of through auditSink()", name)
+		}
+	}
+}
