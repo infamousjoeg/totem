@@ -33,9 +33,23 @@ func (k *fakeKey) PresencePublic() crypto.PublicKey {
 	return &k.presence.PublicKey
 }
 
-func (k *fakeKey) Sign(_ context.Context, challenge []byte, _ platform.Prompt) ([]byte, error) {
+// Sign uses the half a real platform.Key would use: the presence key when a
+// human is required, the device key otherwise.
+//
+// That distinction is the whole reason PresencePublic exists, so a fake that
+// signed everything with one key would quietly pass tests that a real Secure
+// Enclave key fails. It did, until an end-to-end check against presence's own
+// verifier caught it.
+func (k *fakeKey) Sign(_ context.Context, challenge []byte, prompt platform.Prompt) ([]byte, error) {
+	signer := k.device
+	if prompt.Required {
+		if k.presence == nil {
+			return nil, platform.ErrPresenceUnavailable
+		}
+		signer = k.presence
+	}
 	sum := sha256.Sum256(challenge)
-	return ecdsa.SignASN1(rand.Reader, k.device, sum[:])
+	return ecdsa.SignASN1(rand.Reader, signer, sum[:])
 }
 
 func (k *fakeKey) ProtectionLevel() spiffe.ProtectionLevel {

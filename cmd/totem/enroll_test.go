@@ -111,6 +111,10 @@ type stubIssuer struct {
 	unreachable bool
 	fingerprint string
 	captured    *EnrollRequest
+	// verifier, when set, mints the challenge the way a real issuer does:
+	// bound to this device, single use. It is also what the test then verifies
+	// the finished enrollment against.
+	verifier *presence.Verifier
 }
 
 func (s stubIssuer) CertificateFingerprint(context.Context) (string, string, error) {
@@ -122,10 +126,17 @@ func (s stubIssuer) CertificateFingerprint(context.Context) (string, string, err
 	return s.fingerprint, "-----BEGIN CERTIFICATE-----\n", nil
 }
 
-func (s stubIssuer) Challenge(context.Context, ChallengeRequest) (*ChallengeResponse, error) {
+func (s stubIssuer) Challenge(_ context.Context, req ChallengeRequest) (*ChallengeResponse, error) {
 	if s.unreachable {
 		return nil, &cliError{reason: toterrors.ReasonIssuerUnreachable, retryAfter: 30,
 			what: "could not reach your issuer.", cause: workloadapi.ErrIssuerUnreachable}
+	}
+	if s.verifier != nil {
+		c, err := s.verifier.Mint(req.DeviceFingerprint)
+		if err != nil {
+			return nil, err
+		}
+		return &ChallengeResponse{Challenge: c, ExpiresIn: 60}, nil
 	}
 	return &ChallengeResponse{Challenge: make([]byte, presence.ChallengeSize), ExpiresIn: 60}, nil
 }
@@ -395,17 +406,36 @@ func TestEnrollSignsDomainSeparatedBytes(t *testing.T) {
 	assertionBytes, err := presence.SigningInput{
 		Version:     presence.EncodingVersion,
 		DeviceID:    got.DeviceFingerprint,
-		Tool:        "totem",
-		Target:      got.IssuerURL,
+		Tool:        presence.EnrollmentTool,
+		Target:      got.SignedTarget,
 		Challenge:   got.Challenge,
 		RequestHash: digest,
 	}.Bytes()
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Verified against the PRESENCE half, not the device half. They are two
+	// different keys on Apple silicon and each proves the thing it is for.
 	assertionDigest := sha256.Sum256(assertionBytes)
-	if !ecdsa.VerifyASN1(&k.device.PublicKey, assertionDigest[:], got.PresenceAssertion) {
-		t.Fatal("the presence assertion does not verify over the enrollment digest")
+	if !ecdsa.VerifyASN1(&k.presence.PublicKey, assertionDigest[:], got.PresenceAssertion) {
+		t.Fatal("the presence assertion does not verify against the presence key")
+	}
+	if ecdsa.VerifyASN1(&k.device.PublicKey, assertionDigest[:], got.PresenceAssertion) {
+		t.Fatal("the presence assertion verifies against the DEVICE key; the wrong half signed it")
+	}
+
+	// The target under the signature is the issuer's NAME, not the address
+	// this device happened to dial. A device may reach its issuer over
+	// Tailscale, a LAN address, or a bare IP, so the URL is not something the
+	// issuer can predict; the trust domain is.
+	if got.SignedTarget != "issuer.example" {
+		t.Errorf("signed target = %q, want the trust domain", got.SignedTarget)
+	}
+	if strings.HasPrefix(got.SignedTarget, "https://") {
+		t.Error("the signed target is an address; it must be the issuer's name")
+	}
+	if got.DeviceFingerprint != presence.PreEnrollmentDeviceID(got.DevicePublicDER) {
+		t.Error("the device identifier is not presence.PreEnrollmentDeviceID of the submitted key, so the issuer will derive a different one")
 	}
 
 	if got.DeviceFingerprint != hex.EncodeToString(hashPublicKey(got.DevicePublicDER)) {
@@ -520,4 +550,121 @@ func TestEnrollPrintsTheRequestCodeFromChallengeAndRequest(t *testing.T) {
 	if otherCode == code {
 		t.Error("the code does not depend on the issuer's challenge, so it can be precomputed offline")
 	}
+}
+
+// TestEnrollmentVerifiesThroughTheRealIssuerPath is the end-to-end check that
+// matters most: it runs the agent's finished enrollment through
+// presence.Verifier.Enroll, which is the exact call the issuer will make, with
+// a challenge the verifier actually minted. Everything else in this file tests
+// one piece; this tests that the pieces agree with the other side.
+func TestEnrollmentVerifiesThroughTheRealIssuerPath(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	k := newFakeKey(t, true)
+	useKey(t, &fakeStore{key: k})
+
+	verifier := presence.NewVerifier(5*time.Minute, time.Now)
+	var got EnrollRequest
+	restore := newIssuerClient
+	newIssuerClient = func(IssuerAddr) (IssuerClient, error) {
+		return stubIssuer{fingerprint: testFingerprint, captured: &got, verifier: verifier}, nil
+	}
+	t.Cleanup(func() { newIssuerClient = restore })
+
+	if err := cmdEnroll(context.Background(), []string{"https://issuer.example#sha256:" + testFingerprint}); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+
+	in := enrollmentInput(got)
+	assertion := &presence.Assertion{
+		Version:     presence.EncodingVersion,
+		DeviceID:    got.DeviceFingerprint,
+		Tool:        presence.EnrollmentTool,
+		Target:      got.SignedTarget,
+		Challenge:   got.Challenge,
+		Signature:   got.PresenceAssertion,
+		RequestHash: mustDigest(t, in),
+	}
+
+	enrolled, err := verifier.Enroll(in, got.Signature, assertion, "issuer.example")
+	if err != nil {
+		t.Fatalf("the issuer cannot complete this enrollment: %v", err)
+	}
+	if enrolled.DeviceID != got.DeviceFingerprint {
+		t.Errorf("issuer derived device id %q, agent sent %q", enrolled.DeviceID, got.DeviceFingerprint)
+	}
+	if !enrolled.DeviceKey.Equal(&k.device.PublicKey) {
+		t.Error("the issuer verified a different device key")
+	}
+	if enrolled.PresenceKey == nil || !enrolled.PresenceKey.Equal(&k.presence.PublicKey) {
+		t.Error("the issuer did not record this device's presence key")
+	}
+
+	// The challenge is consumed by the ENROLLMENT, not per signature: one
+	// spend covered both. Replaying the whole thing must now fail, which is
+	// what stops one approved enrollment being submitted twice.
+	if _, err := verifier.Enroll(in, got.Signature, assertion, "issuer.example"); err == nil {
+		t.Fatal("the same enrollment was accepted twice; the challenge was not consumed")
+	}
+}
+
+// TestEnrollmentCannotBePairedAcrossAttempts is the attack the single-challenge
+// design closes, checked from the agent's side: a device signature from one
+// enrollment attempt paired with a presence assertion from another must be
+// refused, because both are bound to the same issuer-minted challenge and the
+// two challenges differ.
+func TestEnrollmentCannotBePairedAcrossAttempts(t *testing.T) {
+	verifier := presence.NewVerifier(5*time.Minute, time.Now)
+	first := runEnrollment(t, verifier)
+	second := runEnrollment(t, verifier)
+
+	if bytes.Equal(first.Challenge, second.Challenge) {
+		t.Fatal("two attempts got the same challenge; this test proves nothing")
+	}
+
+	// The device signature from attempt one, the human's assertion from two.
+	mixed := first
+	mixed.PresenceAssertion = second.PresenceAssertion
+	in := enrollmentInput(mixed)
+	assertion := &presence.Assertion{
+		Version:     presence.EncodingVersion,
+		DeviceID:    second.DeviceFingerprint,
+		Tool:        presence.EnrollmentTool,
+		Target:      second.SignedTarget,
+		Challenge:   second.Challenge,
+		Signature:   second.PresenceAssertion,
+		RequestHash: mustDigest(t, enrollmentInput(second)),
+	}
+	if _, err := verifier.Enroll(in, mixed.Signature, assertion, "issuer.example"); err == nil {
+		t.Fatal("a device signature from one attempt was paired with a human's approval from another")
+	}
+}
+
+// runEnrollment drives one full enrollment against verifier and returns what
+// the agent sent.
+func runEnrollment(t *testing.T, verifier *presence.Verifier) EnrollRequest {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	k := newFakeKey(t, true)
+	useKey(t, &fakeStore{key: k})
+
+	var got EnrollRequest
+	restore := newIssuerClient
+	newIssuerClient = func(IssuerAddr) (IssuerClient, error) {
+		return stubIssuer{fingerprint: testFingerprint, captured: &got, verifier: verifier}, nil
+	}
+	defer func() { newIssuerClient = restore }()
+
+	if err := cmdEnroll(context.Background(), []string{"https://issuer.example#sha256:" + testFingerprint}); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+	return got
+}
+
+func mustDigest(t *testing.T, in presence.EnrollmentInput) []byte {
+	t.Helper()
+	d, err := in.Digest()
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	return d
 }

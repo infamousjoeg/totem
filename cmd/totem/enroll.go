@@ -6,7 +6,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/sha256"
 	"crypto/x509"
-	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -93,11 +92,6 @@ func cmdEnroll(ctx context.Context, args []string) error {
 	// Ask for the challenge before generating a key, for the same reason: a
 	// failure here must not orphan a key the issuer will never know about.
 	hostname, _ := os.Hostname()
-	challenge, err := client.Challenge(ctx, ChallengeRequest{Hostname: hostname, OS: runtime.GOOS})
-	if err != nil {
-		return err
-	}
-
 	if platform.Open == nil {
 		return failf("Run 'totem doctor' to see what this build is missing.",
 			"this build of totem cannot create a device key.")
@@ -135,19 +129,44 @@ func cmdEnroll(ctx context.Context, args []string) error {
 	// the wrong key and look fine doing it.
 	devicePub, err := publicKeyDER(key.Public())
 	if err != nil {
-		return failf("Run 'totem doctor' for what this machine can do.",
-			"totem could not read this device's own key back: %v", err)
+		return abandonEnrollment(ctx, store, failf("Run 'totem doctor' for what this machine can do.",
+			"totem could not read this device's own key back: %v", err))
 	}
-	fingerprintHex := hex.EncodeToString(hashPublicKey(devicePub))
+	// presence.PreEnrollmentDeviceID rather than a local derivation, even
+	// though the derivation is one line: the issuer mints the challenge for
+	// this value and expects it back, so agent and issuer computing it from
+	// two copies of the same one-liner is a drift waiting to happen.
+	fingerprintHex := presence.PreEnrollmentDeviceID(devicePub)
 
 	var presencePub []byte
 	presenceState := presence.StateNone
 	if pp := key.PresencePublic(); pp != nil {
 		presenceState = presence.StatePresent
 		if presencePub, err = publicKeyDER(pp); err != nil {
-			return failf("Run 'totem doctor' for what this machine can do.",
-				"totem could not read the key that confirms it's you: %v", err)
+			return abandonEnrollment(ctx, store, failf("Run 'totem doctor' for what this machine can do.",
+				"totem could not read the key that confirms it's you: %v", err))
 		}
+	}
+
+	// The challenge is minted FOR this device, so it can only be asked for
+	// once the key exists: the issuer binds it to the device identifier
+	// derived from the public key, and expects that same identifier back on
+	// the assertion.
+	//
+	// That ordering is why establishIssuer runs first. The issuer has already
+	// answered and proved it is the right one by this point, so reaching this
+	// call and failing is a narrow race rather than the common case of a
+	// laptop with no network. If it does fail, the key that was just created
+	// is removed rather than left orphaned: an unenrolled key the issuer has
+	// never heard of is exactly the thing platform.ErrKeyExists would later
+	// refuse to replace.
+	challenge, err := client.Challenge(ctx, ChallengeRequest{
+		DeviceFingerprint: fingerprintHex,
+		Hostname:          hostname,
+		OS:                runtime.GOOS,
+	})
+	if err != nil {
+		return abandonEnrollment(ctx, store, err)
 	}
 
 	// Everything the issuer will be asked to stand behind is bound into the
@@ -168,6 +187,7 @@ func cmdEnroll(ctx context.Context, args []string) error {
 		IssuerURL:         addr.URL,
 		IssuerFingerprint: addr.FingerprintHex,
 		FirstContact:      addr.FirstContact,
+		SignedTarget:      td,
 		BootstrapCode:     *code,
 		EncodingVersion:   presence.EncodingVersion,
 		Challenge:         challenge.Challenge,
@@ -219,8 +239,8 @@ func cmdEnroll(ctx context.Context, args []string) error {
 		// RequestHash being this enrollment's digest.
 		assertion, aerr := presence.Sign(ctx, key, presence.SigningInput{
 			DeviceID:    fingerprintHex,
-			Tool:        "totem",
-			Target:      addr.URL,
+			Tool:        presence.EnrollmentTool,
+			Target:      req.SignedTarget,
 			Challenge:   challenge.Challenge,
 			RequestHash: digest,
 		})
@@ -347,4 +367,25 @@ func hostOf(raw string) string {
 		return ""
 	}
 	return u
+}
+
+// abandonEnrollment removes the device key this run just created, then returns
+// the failure that caused the abandonment.
+//
+// A key the issuer has never heard of is worse than no key. It is not usable
+// for anything, and platform.Generate refuses to replace an existing label, so
+// leaving it behind turns a transient failure into a device that cannot enroll
+// at all until somebody runs uninstall. When the cleanup itself fails the
+// human is told plainly rather than left to discover it on the next attempt.
+func abandonEnrollment(ctx context.Context, store platform.KeyStore, cause error) error {
+	if store == nil {
+		return cause
+	}
+	if err := store.Delete(ctx, platform.DeviceKeyLabel); err != nil && !errors.Is(err, platform.ErrKeyNotFound) {
+		ce := asCLIError(cause)
+		return failf(
+			"Run 'totem uninstall' to clear the leftover key, then run 'totem enroll' again. "+ce.fix,
+			"%s totem also could not clear the key it had just created, so it is still on this device.", ce.what)
+	}
+	return cause
 }

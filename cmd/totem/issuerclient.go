@@ -184,6 +184,25 @@ type EnrollRequest struct {
 	// the signature below is bound to, and the issuer can recompute it, so the
 	// signature cannot be lifted onto a different device's enrollment.
 	DeviceFingerprint string `json:"device_fingerprint"`
+	// SignedTarget is the issuer NAME this device believes it is joining: the
+	// trust domain, not the address it dialed.
+	//
+	// The name rather than the URL, because the name is the one string both
+	// sides provably agree on before enrollment finishes. A device may reach
+	// its issuer over Tailscale, a LAN address, or a bare IP, so the URL it
+	// dialed is not something the issuer can predict; the trust domain is, by
+	// definition, since it is either the issuer's hostname or the value the
+	// operator configured. It is also the better thing to show a human, who is
+	// approving "this device is joining <name>", not an address.
+	//
+	// THE ISSUER MUST NOT VERIFY AGAINST THIS FIELD. It verifies against its
+	// own trust domain and this value is diagnostic only: when the two differ,
+	// it turns an opaque "assertion did not verify" into "this device thinks
+	// we are called X and we are called Y", which is a typo in an enroll
+	// command rather than a mystery. Using it for verification would let a
+	// device pick the name it is checked against, which is the whole thing the
+	// binding exists to prevent.
+	SignedTarget string `json:"signed_target"`
 	// EncodingVersion is the presence encoding version the signatures were
 	// made under.
 	EncodingVersion uint8 `json:"encoding_version"`

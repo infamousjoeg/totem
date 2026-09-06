@@ -164,7 +164,10 @@ func humanRefusal(err error, ident *attest.Identity) string {
 	case errors.Is(err, attest.ErrInterpreterWrapped):
 		return who + " runs as a script under an interpreter, which any program running as you can rewrite, so totem will not identify it."
 	case errors.Is(err, attest.ErrChainChanged):
-		return "the program that started " + who + " has since exited, so totem can no longer see what asked for this."
+		if ident == nil || ident.Tool == "" {
+			return "the program that launched the one calling totem has since exited, so totem can no longer see what asked for this."
+		}
+		return "the program that launched " + who + " has since exited, so totem can no longer see what asked for this."
 	case errors.Is(err, attest.ErrUnsignedAtWritablePath):
 		return who + " carries no signature totem can trace back to its maker, and it sits somewhere any program running as you could replace it, so totem has no way to know it is still the program you installed."
 	case errors.Is(err, platform.ErrPresenceDenied):
