@@ -268,6 +268,93 @@ func (s *Summoner) Ref(name string) (Reference, error) {
 	return decl.Ref, nil
 }
 
+// RotationOf reports the rotation shape declared for ref.
+//
+// It reads the DECLARATION, not a value: it never runs the provider, never
+// touches the filesystem, and works before Start. That is what lets a consumer
+// check the shape of a secret at open time, before it has resolved anything.
+//
+// Use this when a caller needs to say something different for each shape.
+// RequireSealing is the one-call gate for a caller that just needs a yes or
+// no; the two are not redundant, they serve callers with different jobs.
+//
+// An unknown reference is ErrNoSuchReference, and the Rotation returned
+// alongside any error is RotationUnset, never RotationPull. The distinction
+// matters to the caller: "declared pull-rotated, refuse" and "I cannot find
+// this reference at all" want different messages, and the second is already
+// covered at start by the missing-reference path. An unknown reference must
+// also never read as the safe answer, which is why the zero value is not a
+// legal shape and is not the one returned here.
+func (s *Summoner) RotationOf(ref Reference) (Rotation, error) {
+	name, known := s.nameOf[ref]
+	if !known {
+		return RotationUnset, fmt.Errorf("%w: %q is not configured for this resolver", ErrNoSuchReference, ref)
+	}
+	decl := s.byName[name]
+	switch decl.Rotation {
+	case RotationPull, RotationSealsDataAtRest:
+		return decl.Rotation, nil
+	default:
+		// Unreachable through New, which refuses an undeclared shape. Kept
+		// because the alternative to a defensive refusal here is returning
+		// RotationUnset with a nil error, which a caller would read as a shape
+		// it could act on.
+		//
+		// It reports ErrNoSuchReference rather than a third sentinel so that a
+		// caller has exactly two error cases to distinguish, which is what
+		// internal/ca asked for: a shape it can read and act on, or a shape it
+		// cannot determine. "Configured but undeclared" belongs to the second,
+		// because what the caller can do about it is the same.
+		//
+		// The TEXT still separates them, because the two mean very different
+		// things to a person. An unconfigured reference is usually a typo in a
+		// config key. This one cannot happen through New, which refuses an
+		// undeclared shape at load, so if it ever fires it means something
+		// built a resolver without going through that check, and whoever is
+		// reading the log at three in the morning needs to be sent at the load
+		// path rather than at the config file.
+		return RotationUnset, fmt.Errorf("%w: %q (%s) is configured but has no declared rotation shape; "+
+			"summon.New refuses that at config load, so this resolver was built without it",
+			ErrNoSuchReference, name, ref)
+	}
+}
+
+// RequireSealing returns nil only if ref is configured in r AND declared
+// RotationSealsDataAtRest. Every other outcome is an error, including a
+// reference the resolver has never heard of.
+//
+// It is a function over the Resolver interface rather than a method, because
+// the packages that need this gate hold a Resolver and not a *Summoner. A gate
+// only the concrete type can reach is a gate its actual callers cannot use.
+//
+// It exists so the rule can be enforced by the thing that gets hurt. A value
+// that seals material at rest bricks its holder at the NEXT START if it is
+// pull-rotated, and no amount of care in whoever builds the config prevents a
+// rename or a refactor from classifying it wrongly one day. A holder that
+// refuses to open against a pull-rotated reference does not depend on that
+// care: there is no running issuer in the broken state, because the CA never
+// opened.
+//
+// Use this when a caller needs a yes or no: err != nil is the whole check,
+// with no comparison that can be written backwards. RotationOf is for a caller
+// that needs to say something different for each shape, which is what
+// internal/ca does. The two are not redundant and neither should be deleted as
+// a duplicate of the other; they serve callers with different jobs, and this
+// one is the safer default for a caller that does not need two messages.
+func RequireSealing(r Resolver, ref Reference) error {
+	rot, err := r.RotationOf(ref)
+	if err != nil {
+		return err
+	}
+	if rot != RotationSealsDataAtRest {
+		return fmt.Errorf("%w: %q is declared %s, but it is used to seal material kept on disk; "+
+			"declare it with summon.Sealing in the issuer config so it is excluded from pull-based rotation, "+
+			"or the material it seals becomes unreadable at the next start after a rotation",
+			ErrNotSealing, ref, rot)
+	}
+	return nil
+}
+
 // Err reports the fatal error that stopped this Summoner, if any. The issuer
 // treats a non-nil Err as terminal: it holds no usable secrets any more.
 func (s *Summoner) Err() error {

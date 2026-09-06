@@ -143,12 +143,37 @@ func checkProviderConfigured(opts Options) error {
 	if ref == "" {
 		ref = summon.Reference(DataKeyRefName)
 	}
+	found := false
 	for _, name := range opts.Resolver.Refs() {
 		if name == string(ref) || name == DataKeyRefName {
-			return nil
+			found = true
+			break
 		}
 	}
-	return fmt.Errorf("%w: no reference configured for %q", ErrProviderNotConfigured, ref)
+	if !found {
+		return fmt.Errorf("%w: no reference configured for %q", ErrProviderNotConfigured, ref)
+	}
+
+	// The data key must be declared as sealing material at rest, and the store
+	// refuses to open behind one that is not.
+	//
+	// This store is the reason that declaration exists. The data key seals rows
+	// on disk that Summon has no way to re-seal, so pull-rotating it is not a
+	// rotation, it is a delayed brick: the running issuer breaks on its next
+	// read, and a restarted one finds every row wrapped under a value nobody
+	// kept. Rotating it is a two-part operation instead, RotateDataKey here
+	// followed by the provider being told the reseal happened, and refusing the
+	// wrong declaration at open is what keeps the two parts from drifting.
+	rot, err := opts.Resolver.RotationOf(ref)
+	if err != nil {
+		return fmt.Errorf("%w: rotation shape of %q: %v", ErrProviderNotConfigured, ref, err)
+	}
+	if rot != summon.RotationSealsDataAtRest {
+		return fmt.Errorf("%w: %q is declared %s, but the store's data key seals every row on disk; "+
+			"declare it as sealing material at rest and rotate it with RotateDataKey",
+			summon.ErrNotSealing, ref, rot)
+	}
+	return nil
 }
 
 // withDataKey resolves the data key, hands it to fn, and zeroes it afterwards.

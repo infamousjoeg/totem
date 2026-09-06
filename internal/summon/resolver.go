@@ -33,6 +33,28 @@ type Resolver interface {
 	// Refs returns the logical secret names this resolver is configured for, so
 	// startup can fail on a missing reference rather than at first use.
 	Refs() []string
+
+	// RotationOf reports the declared rotation shape of a reference, so a
+	// package whose material is sealed under a value can refuse to open
+	// against one that will be pull-rotated out from under it. It returns
+	// ErrNoSuchReference when the reference is not configured here.
+	//
+	// This exists because the alternative is a caller supplying the shape
+	// alongside the reference, which verifies the caller's CLAIM about the
+	// value rather than what the resolver will actually do with it. That is
+	// the same mistake as accepting a serial number in place of a verified
+	// certificate: the party being checked would be the party asserting the
+	// fact.
+	//
+	// It is a required method rather than an optional interface discovered by
+	// type assertion. An optional method makes "cannot determine the shape"
+	// the default for every implementation that has not opted in, and a caller
+	// that cannot determine the shape must refuse, so the coordination cost is
+	// identical either way and this version is honest about it. Every fake
+	// implementing Resolver has to answer, which is the point: a test harness
+	// that declares nothing is exactly the shape a future non-test caller
+	// copies.
+	RotationOf(ref Reference) (Rotation, error)
 }
 
 // Value is a resolved secret. It is held in mlocked memory with core dumps

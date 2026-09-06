@@ -24,7 +24,6 @@ func seedChain(t *testing.T, d *DB, n int) [][]byte {
 	for i := 0; i < n; i++ {
 		h, err := d.Append(ctx, Record{
 			Kind:    kinds[i%len(kinds)],
-			At:      time.Unix(1757102400, int64(i)).UTC(),
 			Payload: []byte(fmt.Sprintf(`{"n":%d}`, i)),
 		})
 		if err != nil {
@@ -77,19 +76,24 @@ func TestChainAppendAndVerify(t *testing.T) {
 	}
 }
 
-// TestAppendComputesTheLinkAndKeepsTheCallersTime pins which fields of a Record
-// the caller owns. The links are the store's; the event time is the caller's.
-func TestAppendComputesTheLinkAndKeepsTheCallersTime(t *testing.T) {
+// TestAppendStampsEveryFieldButKindAndPayload pins which fields of a Record the
+// caller owns: two. Everything else the store assigns, including the time.
+func TestAppendStampsEveryFieldButKindAndPayload(t *testing.T) {
 	ctx := context.Background()
-	d, _ := openTestStore(t)
+	clk := newTestClock()
+	d := openTestStoreWithClock(t, newFakeResolver(testKey(0x11)), clk.Now)
 	seedChain(t, d, 2)
 
-	at := time.Unix(1757102400, 987654321).UTC()
+	// A caller that supplies a sequence, a time and both hashes gets none of
+	// them honoured. The backdated time is the one that matters: it is what an
+	// attacker with append access would set.
+	backdated := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
 	forged := bytes.Repeat([]byte{0xAA}, 32)
+	before := clk.Now()
 	if _, err := d.Append(ctx, Record{
 		Seq:      500,
 		Kind:     KindExchange,
-		At:       at,
+		At:       backdated,
 		Payload:  []byte("body"),
 		PrevHash: forged,
 		Hash:     forged,
@@ -108,26 +112,28 @@ func TestAppendComputesTheLinkAndKeepsTheCallersTime(t *testing.T) {
 	if r.Seq != 3 {
 		t.Errorf("Seq = %d, want 3 (the caller's 500 must be ignored)", r.Seq)
 	}
-	if !r.At.Equal(at) {
-		t.Errorf("At = %v, want the caller's %v", r.At, at)
+	if r.At.Equal(backdated) {
+		t.Error("the caller's backdated time was stored; an audit log must not take its timestamps from what it audits")
+	}
+	if !r.At.After(before) {
+		t.Errorf("At = %v, want a time from the store clock after %v", r.At, before)
 	}
 	if bytes.Equal(r.PrevHash, forged) || bytes.Equal(r.Hash, forged) {
 		t.Error("a caller-supplied hash was stored")
+	}
+	if r.Kind != KindExchange || string(r.Payload) != "body" {
+		t.Errorf("the caller's own two fields were not kept: %s %q", r.Kind, r.Payload)
 	}
 	if ok, _, err := d.Verify(ctx); !ok || err != nil {
 		t.Fatalf("Verify: %v", err)
 	}
 
-	// An unset time falls back to the store clock rather than to the zero time.
-	if _, err := d.Append(ctx, Record{Kind: KindIssuance, Payload: []byte("no time")}); err != nil {
-		t.Fatal(err)
-	}
-	got = got[:0]
-	if err := d.Walk(ctx, 4, func(r Record) error { got = append(got, r); return nil }); err != nil {
-		t.Fatal(err)
-	}
-	if got[0].At.IsZero() || got[0].At.Before(at) {
-		t.Errorf("At = %v; an unset time should come from the store clock", got[0].At)
+	// The stamped time is covered by the hash, so it cannot be revised later
+	// without breaking the chain.
+	execSQL(t, d, `UPDATE chain SET at = at + 1 WHERE seq = 3`)
+	ok, bad, err := d.Verify(ctx)
+	if ok || bad != 3 {
+		t.Fatalf("editing a stamped time went undetected: ok=%v bad=%d err=%v", ok, bad, err)
 	}
 }
 

@@ -226,6 +226,19 @@ func newAuthority(cfg Config) (*authority, error) {
 	if a.rootProv == nil {
 		a.rootProv = &localRoot{a: a}
 	}
+	// Before the passphrase is resolved, before the salt is read, before
+	// anything on disk is touched: refuse if this passphrase is one that
+	// pull-based rotation may replace.
+	//
+	// It sits in newAuthority rather than in Open because Init is exactly as
+	// broken: it CREATES the material sealed under that passphrase, so
+	// initialising against a pull-rotated reference produces a CA that can
+	// never be opened, from a command that reported success. Both constructors
+	// go through here, and nothing else returns an *authority, so there is no
+	// path to a CA that skipped the check.
+	if err := a.requirePassphraseSealed(); err != nil {
+		return nil, err
+	}
 	return a, nil
 }
 

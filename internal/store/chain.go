@@ -10,31 +10,8 @@ import (
 	"time"
 )
 
-// ChainBreak says WHERE a chain stopped verifying. It wraps ErrChainBroken, so
-// errors.Is still identifies the category and errors.As recovers the sequence.
-//
-// It exists because Walk reports a break through its error and nothing else: a
-// caller handed a bare sentinel would have to parse prose to learn which record
-// went bad, and "which record" is the single most useful fact an operator has
-// after a compromise. It is also what makes Verify and Walk structurally unable
-// to disagree about where a break is, since both read the sequence out of the
-// same value.
-type ChainBreak struct {
-	// Seq is the first sequence that does not verify. For a removed or
-	// truncated record it is the sequence that should be there and is not.
-	Seq int64
-	// Detail says what was wrong, in an operator's words.
-	Detail string
-}
-
-// Error describes the break and the sequence it happened at.
-func (b *ChainBreak) Error() string {
-	return fmt.Sprintf("%s at sequence %d: %s", ErrChainBroken.Error(), b.Seq, b.Detail)
-}
-
-// Unwrap makes errors.Is(err, ErrChainBroken) true for every break.
-func (b *ChainBreak) Unwrap() error { return ErrChainBroken }
-
+// chainBreak builds the *ChainBreak the contract promises. Every break in the
+// walk goes through it, so no call site can invent a different shape.
 func chainBreak(seq int64, format string, args ...any) *ChainBreak {
 	return &ChainBreak{Seq: seq, Detail: fmt.Sprintf(format, args...)}
 }
@@ -49,17 +26,13 @@ func chainBreak(seq int64, format string, args ...any) *ChainBreak {
 // a device" (docs/totem-design.md, "Issuer (broker box)"). A second chain for
 // policy would reopen exactly that gap.
 //
-// The sequence number is assigned here and a caller-supplied Seq is ignored: a
-// caller that chose its own sequence would be choosing where its record lands
-// in the evidence. PrevHash and Hash are likewise computed, never accepted, so
-// there is no way to hand the store a record that claims a link it does not
-// have.
-//
-// Record.At IS the caller's when it is set, defaulting to the store clock when
-// it is not, because the time an issuance happened is a fact the caller knows
-// and the store does not. It is covered by the hash, so a time can be chosen
-// once, at the moment of writing, and never revised afterwards without breaking
-// the chain.
+// Kind and Payload are the caller's. EVERYTHING ELSE ON THE RECORD IS THE
+// STORE'S and a caller-supplied value is ignored: Seq, because a caller that
+// chose its own sequence would be choosing where its record lands in the
+// evidence; PrevHash and Hash, so there is no way to hand the store a record
+// claiming a link it does not have; and At, because an audit log whose
+// timestamps come from the thing being audited accepts a lie at write time
+// however well the chain protects it afterwards.
 //
 // Append refuses to extend a chain whose recorded tip does not match its last
 // row: appending onto a broken chain would launder the break under a run of
@@ -71,10 +44,11 @@ func (d *DB) Append(ctx context.Context, rec Record) ([]byte, error) {
 	if len(rec.Payload) > MaxPayloadBytes {
 		return nil, fmt.Errorf("%w: chain payload is %d bytes, limit is %d", ErrValueTooLarge, len(rec.Payload), MaxPayloadBytes)
 	}
-	at := rec.At
-	if at.IsZero() {
-		at = d.opts.Clock()
-	}
+	// The time is the store's, never the caller's: see Record.At in store.go.
+	// Tests that need a controlled or historical clock inject one through
+	// Options.Clock, which is the seam for that and keeps the write path with
+	// no caller-supplied time in it at all.
+	at := d.opts.Clock()
 
 	d.mu.Lock()
 	defer d.mu.Unlock()

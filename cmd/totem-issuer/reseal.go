@@ -69,40 +69,82 @@ func cmdResealCA(ctx context.Context, args []string) error {
 			"this issuer's CA does not seal its keys with a passphrase.")
 	}
 
-	// Ask the real question first: does a restart succeed right now. If it
-	// does, there is nothing to do, and doing nothing is the correct outcome
-	// rather than a re-seal that rewrites every file for no reason.
-	switch err := op.VerifyPassphrase(ctx); {
-	case err == nil:
-		fmt.Println("Nothing to do. The CA material already opens under the passphrase your provider returns, so this issuer will restart.")
-		return nil
-	case !errors.Is(err, ca.ErrPassphraseChanged):
-		return err
+	// WHICH OF THE TWO SITUATIONS IS THIS. They need opposite handling, and
+	// telling them apart is the whole of what this command has to get right.
+	//
+	// DRIFTED. The provider now returns a different value, and internal/summon
+	// is deliberately still SERVING THE OLD ONE, because a secret that seals
+	// material at rest is excluded from pull-based rotation. So the CA opens
+	// perfectly right now and will not after a restart. Critically, everything
+	// that asks the resolver "what is the passphrase" gets the OLD value, which
+	// means ca.VerifyPassphrase SUCCEEDS and ca.Reseal is a NO-OP: it re-seals
+	// files that already open under what it was handed. The adoption has to
+	// happen first, or this command reports success having changed nothing.
+	//
+	// NOT DRIFTED. The value in use is the one the operator wants and the files
+	// are sealed under something else, which is what a restore from a backup
+	// taken before a passphrase change looks like. Here ca.Reseal does the real
+	// work directly and there is nothing to adopt.
+	drifted := false
+	for _, name := range rt.summoner.Drifted() {
+		if name == CAPassphraseRefName {
+			drifted = true
+			break
+		}
 	}
 
-	fmt.Fprintln(os.Stderr, "The CA material does not open under the passphrase your provider returns now, so this issuer will not restart until it is re-sealed.")
+	if !drifted {
+		switch err := op.VerifyPassphrase(ctx); {
+		case err == nil:
+			fmt.Println("Nothing to do. The CA material already opens under the passphrase your provider returns, so this issuer will restart.")
+			return nil
+		case !errors.Is(err, ca.ErrPassphraseChanged):
+			return err
+		}
+		fmt.Fprintln(os.Stderr, "The CA material does not open under the passphrase in use, so this issuer will not restart until it is re-sealed.")
+	} else {
+		fmt.Fprintln(os.Stderr, "Your provider has returned a new value for the CA passphrase.")
+		fmt.Fprintln(os.Stderr, "The old value is still in use, so this issuer is serving normally and will NOT restart until the CA material is re-sealed.")
+	}
+
+	// Read the previous value BEFORE anything is adopted or written, so a run
+	// with nothing on stdin fails having changed nothing at all.
 	previous, err := readPassphrase(os.Stdin, os.Stderr)
 	if err != nil {
 		return err
 	}
 	defer zero(previous)
-	if len(previous) == 0 {
+	if len(previous) == 0 && !drifted {
 		return failf("Pipe it in: totem-issuer reseal-ca < old-passphrase",
-			"re-sealing needs the previous passphrase, and none was given on stdin.")
+			"re-sealing needs the passphrase the CA material is currently sealed under, and none was given on stdin.")
+	}
+
+	if drifted {
+		// Adopt first. From here the resolver returns the NEW value, which is
+		// what ca.Reseal means by "the passphrase the resolver returns now", and
+		// only now can it re-seal anything. If the step after this fails, the
+		// files are still under the old value and the fix is to run this command
+		// again with the right one: recoverable, and loudly so.
+		if err := rt.summoner.ResealCompleted(ctx, CAPassphraseRefName); err != nil {
+			return err
+		}
 	}
 
 	if err := op.Reseal(ctx, previous); err != nil {
 		if errors.Is(err, ca.ErrPassphraseChanged) {
-			return failf(
-				"Check that what you piped in is the passphrase the provider returned BEFORE the change, then run reseal-ca again. "+
-					"Re-sealing is idempotent, so re-running it with the right value finishes the job.",
-				"that is not the passphrase the CA material is sealed under, so nothing further was changed.")
+			fix := "Check that what you piped in is the passphrase the CA material is sealed under, then run reseal-ca again. " +
+				"Re-sealing is idempotent, so re-running it with the right value finishes the job."
+			if drifted {
+				fix = "The new value is now the one in use, and the CA material is still sealed under the old one, so this issuer will not restart yet. " +
+					"Run reseal-ca again and pipe in the OLD passphrase. Re-sealing is idempotent, so re-running it with the right value finishes the job."
+			}
+			return failf(fix, "that is not the passphrase the CA material is sealed under: %v", err)
 		}
 		return err
 	}
 
 	// Confirm the property that was actually wanted rather than trusting that
-	// the writes added up to it.
+	// the writes added up to it: would a restart succeed.
 	if err := op.VerifyPassphrase(ctx); err != nil {
 		return err
 	}

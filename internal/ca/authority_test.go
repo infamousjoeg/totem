@@ -96,7 +96,7 @@ func TestInitRefusesToOverwriteALiveRoot(t *testing.T) {
 func TestOpenBeforeInit(t *testing.T) {
 	t.Parallel()
 	_, err := Open(context.Background(), Config{
-		Dir: t.TempDir(), Resolver: &fakeResolver{pass: "x"}, PassphraseRef: "ca_passphrase",
+		Dir: t.TempDir(), Resolver: &fakeResolver{pass: "x", rotation: summon.RotationSealsDataAtRest}, PassphraseRef: "ca_passphrase",
 		TrustDomain: testTrustDomain,
 	})
 	if !errors.Is(err, ErrNotInitialized) {
@@ -182,7 +182,7 @@ func TestWrongPassphraseCannotOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := Open(context.Background(), Config{
-		Dir: ca.dir, Resolver: &fakeResolver{pass: "not the passphrase"},
+		Dir: ca.dir, Resolver: &fakeResolver{pass: "not the passphrase", rotation: summon.RotationSealsDataAtRest},
 		PassphraseRef: "ca_passphrase", TrustDomain: testTrustDomain, Now: ca.clk.now,
 	})
 	if err == nil || !strings.Contains(err.Error(), "unseal") {

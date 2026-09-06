@@ -31,6 +31,12 @@ type fakeResolver struct {
 	pass  string
 	calls int
 	err   error
+	// rotation is what RotationOf reports. The zero value would be
+	// summon.RotationUnset, which Open refuses, so the constructor sets it
+	// explicitly: a test fake must not be able to pass the gate by accident,
+	// and it must not fail it by accident either.
+	rotation    summon.Rotation
+	rotationErr error
 }
 
 // Resolve hands back a FRESH copy every time, because callers are required to
@@ -49,6 +55,18 @@ func (r *fakeResolver) Resolve(_ context.Context, _ summon.Reference) (summon.Va
 }
 
 func (r *fakeResolver) Refs() []string { return []string{"ca_passphrase"} }
+
+// RotationOf reports the declared rotation shape, the property ca.Open gates
+// on. A real Summoner reads this from the operator's declaration; this fake
+// lets a test choose it so every branch of the gate is reachable.
+func (r *fakeResolver) RotationOf(_ summon.Reference) (summon.Rotation, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.rotationErr != nil {
+		return summon.RotationUnset, r.rotationErr
+	}
+	return r.rotation, nil
+}
 
 func (r *fakeResolver) callCount() int {
 	r.mu.Lock()
@@ -100,7 +118,7 @@ func newTestCA(tb testing.TB) *testCA {
 	tb.Helper()
 	dir := tb.TempDir()
 	clk := newClock(T0)
-	res := &fakeResolver{pass: "a-passphrase-only-summon-knows"}
+	res := &fakeResolver{pass: "a-passphrase-only-summon-knows", rotation: summon.RotationSealsDataAtRest}
 	a, err := Init(context.Background(), InitParams{
 		Config: Config{
 			Dir:           dir,

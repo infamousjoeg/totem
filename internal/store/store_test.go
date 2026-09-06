@@ -164,6 +164,69 @@ func TestOpenRefusesWithoutAProvider(t *testing.T) {
 	}
 }
 
+// TestOpenRefusesADataKeyThatIsNotDeclaredSealing pins the store's half of the
+// rotation-shape contract. A data key declared pull-rotated is not a
+// misconfiguration that shows up at the next rotation; it is one that shows up
+// at the next START, against rows sealed under a value nobody kept.
+func TestOpenRefusesADataKeyThatIsNotDeclaredSealing(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name     string
+		rotation summon.Rotation
+		want     error
+	}{
+		{"undeclared", summon.RotationUnset, summon.ErrNotSealing},
+		{"pull-rotated", summon.RotationPull, summon.ErrNotSealing},
+		{"sealing", summon.RotationSealsDataAtRest, nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := newFakeResolver(testKey(0x11))
+			r.setRotation(c.rotation)
+			d, err := Open(ctx, t.TempDir()+"/state.db", Options{Resolver: r})
+			if c.want == nil {
+				if err != nil {
+					t.Fatalf("Open: %v", err)
+				}
+				_ = d.Close()
+				return
+			}
+			wantErrIs(t, err, c.want, "Open")
+			if d != nil {
+				t.Fatal("Open returned a store it had just refused to open")
+			}
+		})
+	}
+}
+
+// TestRestoreRefusesADataKeyThatIsNotDeclaredSealing: the same gate guards the
+// path an operator reaches for after losing a machine, and it refuses there
+// before touching anything, like every other restore refusal.
+func TestRestoreRefusesADataKeyThatIsNotDeclaredSealing(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	r := newFakeResolver(testKey(0x11))
+	d, err := Open(ctx, dir+"/state.db", Options{Resolver: r})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+	mustPut(t, d, CollectionEnrollments, "device-01", []byte("still here"))
+	archive := dir + "/b.enc"
+	if err := d.Backup(ctx, archive, testPassphrase); err != nil {
+		t.Fatal(err)
+	}
+
+	r.setRotation(summon.RotationPull)
+	err = d.Restore(ctx, archive, testPassphrase)
+	wantErrIs(t, err, summon.ErrNotSealing, "Restore")
+
+	r.setRotation(summon.RotationSealsDataAtRest)
+	if got := mustGet(t, d, CollectionEnrollments, "device-01"); string(got) != "still here" {
+		t.Fatalf("the live database was touched by a refused restore: %q", got)
+	}
+}
+
 func TestReopenWithTheWrongDataKeyIsRefused(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

@@ -29,6 +29,10 @@ func (i *Issuer) load(ctx context.Context) error {
 		if !strings.HasPrefix(r.Kind, kindPolicyPrefix) || r.Kind == kindPolicyPrefix+"bootstrap-issued" {
 			return nil
 		}
+		// Replay reads rec.At from the signed payload, never r.At: the
+		// store's stamp says when the chain recorded the change, the
+		// payload's says when the issuer applied it, and authority and
+		// expiry are judged by the latter. See Issuer.record.
 		var rec signedRecord
 		if err := json.Unmarshal(r.Payload, &rec); err != nil {
 			return fmt.Errorf("%w: seq %d: %v", ErrRecordInvalid, r.Seq, err)

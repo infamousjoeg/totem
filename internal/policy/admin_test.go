@@ -341,7 +341,7 @@ func TestConfigRefusesMissingPrimitives(t *testing.T) {
 	}
 	clk := newClock()
 	_, err = New(ctxb(), Config{TrustDomain: "x", Verifier: presence.NewVerifier(0, clk.Now), Sessions: presence.NewSessionStore(clk.Now),
-		Grants: presence.NewRegistry(clk.Now), Lot: presence.NewLot(clk.Now, 0, 0), Store: newMemStore(),
+		Grants: presence.NewRegistry(clk.Now), Lot: presence.NewLot(clk.Now, 0, 0), Store: newMemStore(clk.Now),
 		Windows: []presence.Window{{Tool: "claude", Duration: 3 * time.Hour, Level: presence.LevelWindow}}})
 	mustErr(t, err, ErrPolicyInvalid)
 }

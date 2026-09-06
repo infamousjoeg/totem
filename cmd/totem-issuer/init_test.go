@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -206,5 +207,109 @@ func TestNoStackTraceReachesTheOperator(t *testing.T) {
 		if strings.Contains(ce.what, "goroutine ") || strings.Contains(ce.what, ".go:") {
 			t.Errorf("%v leaked a stack trace: %q", err, ce.what)
 		}
+	}
+}
+
+// TestAtRestSecretsAreClassifiedAndRequired pins the property the secrets owner
+// raised and the build lead asked to have asserted rather than reasoned about.
+//
+// declare() decides which references are excluded from pull-based rotation by
+// switching on the LOGICAL NAME, and that name is an operator-editable key in
+// issuer.json. Rename it and the classification silently becomes Rotating, the
+// provider's hourly rotation replaces the value that seals material at rest, and
+// the issuer runs perfectly until a restart that then fails. internal/summon has
+// no name-based special case on its side by design, so the whole protection
+// lives in declare(); this is what stops it resting on an unwritten agreement.
+func TestAtRestSecretsAreClassifiedAndRequired(t *testing.T) {
+	t.Parallel()
+	required := RequiredRefs()
+	if len(required) != 3 {
+		t.Fatalf("RequiredRefs has %d entries (%v); the three at-rest secrets are the CA passphrase, "+
+			"the store data key and the backup passphrase", len(required), required)
+	}
+	sealing := summon.Sealing("totem/x").Rotation
+	rotating := summon.Rotating("totem/x").Rotation
+	if sealing == rotating {
+		t.Fatal("Sealing and Rotating are indistinguishable; this whole test proves nothing")
+	}
+	for _, name := range required {
+		if got := declare(name, "totem/x").Rotation; got != sealing {
+			t.Errorf("%s is declared %v; a value that seals material at rest must never be pull-rotated", name, got)
+		}
+	}
+	if got := declare("claude_0", "totem/anthropic").Rotation; got != rotating {
+		t.Errorf("a bridge credential is declared %v; it must take part in pull-based rotation", got)
+	}
+}
+
+// TestRenamingAnAtRestSecretFailsAtStart. Every one of the three, individually,
+// because the backup passphrase is the one with no accidental protection: nothing
+// resolves it until a restore, which is the worst possible moment to find out,
+// with no old value to recover and no working system to recover it from.
+func TestRenamingAnAtRestSecretFailsAtStart(t *testing.T) {
+	t.Parallel()
+	for _, name := range RequiredRefs() {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := &Config{
+				TrustDomain: "issuer.ts.net",
+				ExternalURL: "https://issuer.ts.net",
+				Listen:      ":8443",
+				Secrets:     SecretsConfig{FileProviderDir: dir + "/secrets", Refs: DefaultRefs("totem")},
+			}
+			// The rename an operator makes while tidying up a config file.
+			cfg.Secrets.Refs[name+"_v2"] = cfg.Secrets.Refs[name]
+			delete(cfg.Secrets.Refs, name)
+
+			if err := cfg.Validate(); !errors.Is(err, ErrRefMissing) {
+				t.Fatalf("a config with %s renamed validated: %v", name, err)
+			}
+			if err := cfg.Save(dir); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(dir)
+			if !errors.Is(err, ErrRefMissing) {
+				t.Fatalf("loading a config with %s renamed returned %v; it must fail at start, "+
+					"before anything is sealed under a value that will then rotate away", name, err)
+			}
+			if !strings.Contains(err.Error(), name) {
+				t.Errorf("the failure does not name the missing reference: %v", err)
+			}
+			ce := classify(err)
+			if !strings.Contains(ce.fix, "refs") {
+				t.Errorf("the fix does not say where to put it back: %q", ce.fix)
+			}
+
+			// The second line of defence, which is what made this safe by
+			// accident before it was asserted: the renamed entry is now
+			// classified Rotating, and the only reason that is not a brick is
+			// that resolving it by its canonical name fails.
+			if got := declare(name+"_v2", "totem/x").Rotation; got != summon.Rotating("totem/x").Rotation {
+				t.Errorf("a renamed at-rest secret classified as %v; the hazard this test exists for is that it does not", got)
+			}
+			s, err := summon.New(cfg.Summon(dir))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			if _, err := s.Ref(name); !errors.Is(err, summon.ErrNoSuchReference) {
+				t.Errorf("resolving %s by its canonical name returned %v, want ErrNoSuchReference", name, err)
+			}
+		})
+	}
+}
+
+// TestValidateAcceptsTheShippedDefaults, so the check cannot drift into
+// rejecting what init itself writes.
+func TestValidateAcceptsTheShippedDefaults(t *testing.T) {
+	t.Parallel()
+	cfg := &Config{Secrets: SecretsConfig{Refs: DefaultRefs("totem")}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("init writes a config its own loader rejects: %v", err)
+	}
+	// An empty value is as bad as a missing key and must be caught the same way.
+	cfg.Secrets.Refs[CAPassphraseRefName] = "   "
+	if err := cfg.Validate(); !errors.Is(err, ErrRefMissing) {
+		t.Fatalf("a blank reference validated: %v", err)
 	}
 }

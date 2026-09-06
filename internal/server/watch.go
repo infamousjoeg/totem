@@ -214,6 +214,13 @@ func (w *Watcher) pollPassphrase(ctx context.Context) {
 	switch {
 	case err == nil:
 		if w.warned {
+			// Recovery is its OWN record rather than the warnings merely
+			// stopping. Absence of a warning is not evidence of anything: a
+			// reader of the chain cannot tell "it was fixed" from "the process
+			// restarted", "the ticker stalled", or "someone changed the log
+			// level", and those have opposite implications for whether the next
+			// restart works. One line saying it was fixed answers the question
+			// the silence cannot.
 			w.warned = false
 			w.log(Event{Kind: EventPassphraseChanged, Outcome: "resealed"})
 			w.warnf("totem-issuer: the CA material opens under the current passphrase again. This issuer will restart.\n")
@@ -223,9 +230,19 @@ func (w *Watcher) pollPassphrase(ctx context.Context) {
 		return
 	}
 
-	// Repeated on purpose, every tick, for as long as it is true. The operator
-	// who needs to see this may not look for weeks, and the consequence is not
-	// visible until a restart that then fails.
+	// REPEATED ON EVERY TICK, ON PURPOSE, for as long as it is true. Do not
+	// "fix" this into an edge-triggered warning or a deduplicated one; the
+	// instinct to do that is right for almost every other alarm and wrong here.
+	//
+	// The usual argument for warning once is that a repeated message trains
+	// people to ignore it, which assumes someone is watching when it first
+	// fires. Nobody is. This condition costs a running issuer nothing: it
+	// serves, it signs, it looks healthy, and the damage is invisible until a
+	// restart that may be weeks away and will not be planned. A single line
+	// scrolled past at 3am is the whole of the notice, and the person who needs
+	// it is whoever is looking at the moment they still have the old value in
+	// memory to re-seal with. Repeating is what makes the warning present WHEN
+	// someone happens to look, rather than only when it happened.
 	w.warned = true
 	w.log(Event{Kind: EventPassphraseChanged, Outcome: "will-not-restart", Reason: "passphrase_changed"})
 	w.warnf("totem-issuer: THIS ISSUER WILL NOT RESTART. The CA passphrase the secrets provider returns "+

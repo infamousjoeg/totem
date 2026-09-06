@@ -255,7 +255,14 @@ type Config struct {
 
 	// Resolver is the ONLY way the CA passphrase enters this package. There is
 	// no flag, no environment variable, no plaintext path and no dev mode; see
-	// internal/summon. The value is used at the moment it is needed and
+	// internal/summon.
+	//
+	// Open asks it, through summon.Resolver.RotationOf, whether this passphrase
+	// is excluded from pull-based rotation, and refuses unless it is. Because
+	// RotationOf is on the Resolver interface rather than an optional one,
+	// there is no such thing as a resolver that cannot be asked: the case where
+	// nobody knows the answer is removed by construction rather than refused at
+	// runtime. The value is used at the moment it is needed and
 	// released, never cached across a rotation, because a cached Value is a
 	// zeroed buffer after one.
 	Resolver summon.Resolver
@@ -823,6 +830,19 @@ var (
 	// waiting for a restart to become visible: shout, repeatedly, and run
 	// `issuer reseal-ca` while the previous value is still reachable.
 	ErrPassphraseChanged = errors.New("ca: the resolved CA passphrase no longer opens the sealed CA material; the issuer will not restart until it is re-sealed")
+
+	// ErrRotationShapeUnknown means the Resolver answered with no rotation
+	// shape at all: summon.RotationUnset with no error, which summon's own
+	// Summoner never returns and a hand-written Resolver can.
+	//
+	// It is a REFUSAL, and deliberately not the same error as "declared
+	// pull-rotated". Those two want different messages: one says an operator
+	// declared the wrong thing and names the fix, the other says a resolver
+	// implementation returned a shape that is not a shape. What they share is
+	// that neither may open, because defaulting an unanswered question to the
+	// safe-looking answer is exactly how the declaration's zero value would
+	// have become a silent brick in the first place.
+	ErrRotationShapeUnknown = errors.New("ca: the resolver cannot report whether the CA passphrase is excluded from pull-based rotation")
 
 	// ErrClosed means the Authority has been closed.
 	ErrClosed = errors.New("ca: authority is closed")

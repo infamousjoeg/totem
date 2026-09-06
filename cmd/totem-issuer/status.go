@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/infamousjoeg/totem/internal/server"
@@ -65,6 +66,17 @@ func cmdStatus(ctx context.Context, args []string) error {
 			fmt.Printf("             %s (%s, %s) approve with: totem devices approve %s\n",
 				p.Hostname, p.OS, p.ProtectionLevel, p.Code)
 		}
+	}
+	// The drift alarm, surfaced where someone who is LOOKING will see it. It is
+	// logged at ERROR on every rotation cycle and every resolve, but the person
+	// who needs it is often the one running a command after something felt off,
+	// not the one tailing logs, and the consequence does not show up until a
+	// restart that then fails.
+	if drifted := rt.summoner.Drifted(); len(drifted) > 0 {
+		fmt.Printf("Sealed:      CHANGED: %s\n", strings.Join(drifted, ", "))
+		fmt.Println("             Your provider returns a new value for these, and the material on disk is still sealed under the old one.")
+		fmt.Println("             THIS ISSUER WILL NOT RESTART until it is re-sealed. Run 'totem-issuer reseal-ca' now,")
+		fmt.Println("             while the value in use is still in memory.")
 	}
 	if rt.cfg.Secrets.Provider == "" {
 		fmt.Println("Secrets:     plain files on this box. Move them into a real secrets provider.")

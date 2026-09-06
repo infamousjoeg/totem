@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -42,6 +41,21 @@ func (p *testProvider) Resolve(_ context.Context, ref summon.Reference) (summon.
 	return testValue(append([]byte(nil), v...)), nil
 }
 
+// RotationOf answers the shape the issuer declares for these references. The
+// data key seals rows at rest, so it is Sealing; anything else a test wires up
+// is an ordinary credential. A fake that declared nothing here would be exactly
+// the shape a future non-test caller copies, which is why the method is
+// required rather than optional.
+func (p *testProvider) RotationOf(ref summon.Reference) (summon.Rotation, error) {
+	if _, ok := p.refs[ref]; !ok {
+		return summon.RotationUnset, summon.ErrNoSuchReference
+	}
+	if ref == summon.Reference(store.DataKeyRefName) {
+		return summon.Sealing(ref).Rotation, nil
+	}
+	return summon.Rotating(ref).Rotation, nil
+}
+
 func (p *testProvider) Refs() []string {
 	out := make([]string, 0, len(p.refs))
 	for r := range p.refs {
@@ -61,29 +75,8 @@ func (v testValue) Zero() {
 
 var _ summon.Resolver = (*testProvider)(nil)
 
-// skipIfPolicyRecordsCannotPersist turns a live cross-package defect into a
-// skip with its name on it, rather than a red tree or a silent gap.
-//
-// internal/store's validName allows only [A-Za-z0-9-_.:@] in Record.Kind and
-// its own tests assert that ("kind with a separator" -> ErrBadName), while
-// internal/policy writes kinds of the form "policy/<action>" and
-// "grant/session". The two contracts contradict, so no policy record persists
-// and no enrollment can complete. Reported to the build lead. When it is fixed
-// these tests start running again on their own, which is why the guard is a
-// skip on that specific error and not a t.Skip at the top of the file.
-func skipIfPolicyRecordsCannotPersist(t *testing.T, err error) {
-	t.Helper()
-	if errors.Is(err, store.ErrBadName) {
-		t.Skipf("BLOCKED: internal/store rejects the record kinds internal/policy writes (%v). "+
-			"store/schema.go validName forbids \"/\"; policy/records.go uses \"policy/<action>\".", err)
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
 // realIssuer wires a policy engine over a real SQLite store.
-func realIssuer(t *testing.T) *policy.Issuer {
+func realIssuer(t *testing.T) (*policy.Issuer, *store.DB) {
 	t.Helper()
 	ctx := context.Background()
 	key := bytes.Repeat([]byte{0x2b}, 32)
@@ -109,7 +102,7 @@ func realIssuer(t *testing.T) *policy.Issuer {
 	if err != nil {
 		t.Fatalf("building the real policy engine: %v", err)
 	}
-	return issuer
+	return issuer, db
 }
 
 func realServer(t *testing.T, issuer *policy.Issuer) (*Server, *bytes.Buffer) {
@@ -159,11 +152,13 @@ func enrollThrough(t *testing.T, s *Server, d *enrollingDevice, code string) *ht
 // flagged admin."
 func TestFoundingDeviceEnrollsEndToEnd(t *testing.T) {
 	t.Parallel()
-	issuer := realIssuer(t)
+	issuer, db := realIssuer(t)
 	s, audit := realServer(t, issuer)
 
 	code, expires, err := issuer.IssueBootstrapCode(context.Background())
-	skipIfPolicyRecordsCannotPersist(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if d := time.Until(expires); d > BootstrapCodeTTL+time.Minute || d <= 0 {
 		t.Errorf("bootstrap code expires in %s; the spec says ten minutes", d)
 	}
@@ -217,16 +212,53 @@ func TestFoundingDeviceEnrollsEndToEnd(t *testing.T) {
 	if ok, bad := VerifyChain(records); !ok {
 		t.Fatalf("the audit chain broke at seq %d", bad)
 	}
+
+	// The durable chain, not just the stdout stream. This is the regression
+	// guard for the defect that blocked this test: internal/store forbids "/"
+	// in a record kind (its backup writes a tarball, so a kind with a separator
+	// becomes a path inside a tar entry) while internal/policy wrote
+	// "policy/<action>". Both suites were green and the seam was broken, and
+	// the symptom was that no policy record persisted at all, so no enrollment
+	// could complete. Asserting the record is really in the chain is what makes
+	// a repeat of that loud here instead of silent.
+	var kinds []string
+	if err := db.Walk(context.Background(), 0, func(rec store.Record) error {
+		kinds = append(kinds, rec.Kind)
+		return nil
+	}); err != nil {
+		t.Fatalf("walking the durable chain: %v", err)
+	}
+	if len(kinds) == 0 {
+		t.Fatal("the founding enrollment wrote nothing to the durable hash chain")
+	}
+	var sawPolicy bool
+	for _, k := range kinds {
+		if strings.Contains(k, "/") {
+			t.Errorf("record kind %q contains a path separator; internal/store refuses those and backup would "+
+				"turn it into a path inside a tar entry", k)
+		}
+		if strings.HasPrefix(k, "policy.") {
+			sawPolicy = true
+		}
+	}
+	if !sawPolicy {
+		t.Errorf("no admin-signed policy record reached the chain; kinds were %v", kinds)
+	}
+	if ok, badSeq, err := db.Verify(context.Background()); err != nil || !ok {
+		t.Fatalf("the durable chain does not verify (first bad seq %d): %v", badSeq, err)
+	}
 }
 
 // TestSecondDeviceIsPendingAndPrintsItsApprovalCode. "A second device prints
 // the exact `totem devices approve` command to run on an existing one."
 func TestSecondDeviceIsPendingAndPrintsItsApprovalCode(t *testing.T) {
 	t.Parallel()
-	issuer := realIssuer(t)
+	issuer, _ := realIssuer(t)
 	s, _ := realServer(t, issuer)
 	code, _, err := issuer.IssueBootstrapCode(context.Background())
-	skipIfPolicyRecordsCannotPersist(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if w := enrollThrough(t, s, newEnrollingDevice(t, true), code); w.Code != http.StatusOK {
 		t.Fatalf("founding enroll: %d %s", w.Code, w.Body.String())
 	}
@@ -263,7 +295,7 @@ func TestSecondDeviceIsPendingAndPrintsItsApprovalCode(t *testing.T) {
 // the enrollment is not one the issuer should record."
 func TestEnrollmentAgainstAnotherIssuersCertificateIsRefused(t *testing.T) {
 	t.Parallel()
-	issuer := realIssuer(t)
+	issuer, _ := realIssuer(t)
 	s, _ := realServer(t, issuer)
 
 	d := newEnrollingDevice(t, true)
@@ -289,10 +321,12 @@ func TestEnrollmentAgainstAnotherIssuersCertificateIsRefused(t *testing.T) {
 // captured enrollment must not be replayable.
 func TestReplayingAnEnrollmentIsRefused(t *testing.T) {
 	t.Parallel()
-	issuer := realIssuer(t)
+	issuer, _ := realIssuer(t)
 	s, _ := realServer(t, issuer)
 	code, _, err := issuer.IssueBootstrapCode(context.Background())
-	skipIfPolicyRecordsCannotPersist(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
 	d := newEnrollingDevice(t, true)
 
 	w := post(t, s, "/v1/enroll/challenge", ChallengeRequest{

@@ -8,9 +8,46 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/infamousjoeg/totem/internal/summon"
 )
 
 var _ PassphraseOperator = (*authority)(nil)
+
+// requirePassphraseSealed refuses to build an authority at all unless the CA
+// passphrase is declared as sealing material at rest, and therefore excluded
+// from pull-based rotation. Both Init and Open go through it.
+//
+// The comparison is written against the ONE shape that is acceptable rather
+// than against the shapes that are not. `rot != RotationSealsDataAtRest` stays
+// correct when a fourth rotation shape is added to summon; `rot ==
+// RotationPull` would silently start admitting it. That asymmetry is the whole
+// reason this check lives in one function instead of at its call site.
+//
+// Three refusals, three different things to tell the operator:
+//
+//   - RotationOf failed: wrapped, so errors.Is still matches
+//     summon.ErrNoSuchReference (not configured) or summon.ErrNotSealing
+//     (configured with no declared shape). Those are different fixes.
+//   - declared pull-rotated: wrapped as summon.ErrNotSealing, naming the
+//     reference and the shape, because this is the one that means someone will
+//     brick this CA at the next restart after a rotation.
+//   - no shape at all: ErrRotationShapeUnknown.
+func (a *authority) requirePassphraseSealed() error {
+	rot, err := a.resolver.RotationOf(a.passRef)
+	if err != nil {
+		return fmt.Errorf("ca: cannot confirm the CA passphrase is excluded from pull-based rotation: %w", err)
+	}
+	if rot == summon.RotationSealsDataAtRest {
+		return nil
+	}
+	if rot == summon.RotationPull {
+		return fmt.Errorf("ca: %w: %q is declared %s, but the CA's private keys on disk are sealed under it; "+
+			"declare it with summon.Sealing so rotation cannot replace it, or the CA becomes unopenable at the next restart after a rotation",
+			summon.ErrNotSealing, a.passRef, rot)
+	}
+	return fmt.Errorf("%w: %q reported %s", ErrRotationShapeUnknown, a.passRef, rot)
+}
 
 // sealedKeyFiles lists every sealed key file in the CA directory: roots and
 // intermediates alike. Re-sealing or verifying a subset is worse than doing

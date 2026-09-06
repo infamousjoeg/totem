@@ -23,24 +23,20 @@
 //   - Fully real: enrollment cryptography including the founding device's
 //     bootstrap-code redemption and its real device SVID minted by a real
 //     internal/ca.Authority, chain-verified with stdlib crypto/x509 against
-//     exactly what Authority.Bundle publishes (enroll_test.go); presence
-//     window evaluation (window_test.go); grant narrowing and re-widening
-//     (grant_test.go); parked step-up approval (parked_test.go); and a full
-//     timed Backup+Restore round trip through a real internal/store.DB,
-//     including the release gate's ten-minute budget with the measured
-//     duration logged (backup_test.go). Each includes negative assertions
-//     and, where the property is actually about concurrency (single-use
-//     consumption racing, concurrent narrowing), a real concurrency test
-//     under -race rather than a round trip.
+//     exactly what Authority.Bundle publishes; the founding device recorded
+//     as admin through a real policy.Issuer backed by a real store.DB, and a
+//     second device's attempt to redeem the same already-spent bootstrap
+//     code refused, with its own freshly minted challenge (enroll_test.go);
+//     presence window evaluation (window_test.go); grant narrowing and
+//     re-widening (grant_test.go); parked step-up approval (parked_test.go);
+//     and a full timed Backup+Restore round trip through a real
+//     internal/store.DB, including the release gate's ten-minute budget with
+//     the measured duration logged (backup_test.go). Each includes negative
+//     assertions and, where the property is actually about concurrency
+//     (single-use consumption racing, concurrent narrowing), a real
+//     concurrency test under -race rather than a round trip.
 //
-//   - Honestly skipped, for two different reasons:
-//
-//     internal/policy is mid-transition as of this writing (its stub.go,
-//     explicitly marked temporary, still declares symbols records.go/
-//     admin.go/grants.go/evaluate.go have already replaced, so the package
-//     does not currently build) -- see TestFoundingDeviceIsRecordedAsAdmin
-//     in enroll_test.go, which needs it to record the founding device as
-//     admin and refuse a second redemption of the same bootstrap code.
+//   - Honestly skipped, one reason left:
 //
 //     internal/summon's three provider-ownership refusals (secrets_test.go)
 //     are not a gap at all, ruled and closed: the implementation is real and
@@ -221,39 +217,85 @@ func touchAlways(t *testing.T, v *presence.Verifier, key *deviceKey, deviceID, t
 // corrupt every other caller's view of "the same" secret, which would be a
 // fake that agrees with itself rather than one that models the contract --
 // exactly the shape internal/ca's and internal/store's own fakeResolvers use.
+//
+// Every entry carries an explicit summon.Rotation, with no default, mirroring
+// summon.Secret's own rule that RotationUnset is illegal. The precise reason,
+// stated narrowly rather than as a general "fakes should be configurable"
+// rule: internal/ca.requirePassphraseSealed branches on RotationOf's answer
+// (RotationSealsDataAtRest accepted, RotationPull refused as ErrNotSealing,
+// an unconfigured reference refused as ErrNoSuchReference), so a fake that
+// could only ever answer one of those would make the branches it can't
+// produce permanently untestable from this package -- indistinguishable from
+// a refusal that does not work at all, and the same failure mode as the key
+// fake that verified an enrollment against the key it had just signed with.
+// sealingSecret / rotatingSecret exist because there are exactly two branches
+// real code takes on this value; this is not a general policy of giving fakes
+// more knobs; a fake with a knob no branch of the real code inspects would be
+// surface for its own sake, which is the opposite failure and just as real.
+// See ca_rotation_test.go for both refusal branches actually firing, and the
+// accept path succeeding again once the same reference is redeclared Sealing.
 type fakeResolver struct {
-	mu     sync.Mutex
-	values map[string][]byte
-	err    error
+	mu      sync.Mutex
+	entries map[string]fakeSecretEntry
 }
 
-// newFakeResolver returns a resolver serving values keyed by logical
+// fakeSecretEntry is one value fakeResolver serves, paired with the honest
+// rotation shape a real Resolver of that reference would report.
+type fakeSecretEntry struct {
+	value    []byte
+	rotation summon.Rotation
+}
+
+// sealingSecret declares an entry whose value seals material at rest (a CA
+// passphrase, a store data key) and must never be pull-rotated.
+func sealingSecret(value []byte) fakeSecretEntry {
+	return fakeSecretEntry{value: value, rotation: summon.RotationSealsDataAtRest}
+}
+
+// rotatingSecret declares an entry a remote service accepts as soon as it
+// changes, safe for ordinary pull-based rotation.
+func rotatingSecret(value []byte) fakeSecretEntry {
+	return fakeSecretEntry{value: value, rotation: summon.RotationPull}
+}
+
+// newFakeResolver returns a resolver serving entries keyed by logical
 // reference name (e.g. store.DataKeyRefName, "ca_passphrase").
-func newFakeResolver(values map[string][]byte) *fakeResolver {
-	return &fakeResolver{values: values}
+func newFakeResolver(entries map[string]fakeSecretEntry) *fakeResolver {
+	return &fakeResolver{entries: entries}
 }
 
 func (f *fakeResolver) Resolve(_ context.Context, ref summon.Reference) (summon.Value, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.err != nil {
-		return nil, f.err
-	}
-	v, ok := f.values[string(ref)]
+	e, ok := f.entries[string(ref)]
 	if !ok {
 		return nil, summon.ErrNoSuchReference
 	}
-	return &fakeValue{b: append([]byte(nil), v...)}, nil
+	return &fakeValue{b: append([]byte(nil), e.value...)}, nil
 }
 
 func (f *fakeResolver) Refs() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := make([]string, 0, len(f.values))
-	for k := range f.values {
+	out := make([]string, 0, len(f.entries))
+	for k := range f.entries {
 		out = append(out, k)
 	}
 	return out
+}
+
+// RotationOf answers from the same entry Resolve serves, never from a
+// caller-supplied default, so a test that forgets to declare a reference's
+// shape fails with ErrNoSuchReference rather than silently getting an
+// answer nobody chose.
+func (f *fakeResolver) RotationOf(ref summon.Reference) (summon.Rotation, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	e, ok := f.entries[string(ref)]
+	if !ok {
+		return 0, summon.ErrNoSuchReference
+	}
+	return e.rotation, nil
 }
 
 type fakeValue struct{ b []byte }

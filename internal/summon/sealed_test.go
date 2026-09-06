@@ -508,3 +508,238 @@ func TestNameAloneDoesNotSealAnything(t *testing.T) {
 		t.Fatalf("Drifted() = %v: a reference declared Rotating has nothing to drift from", got)
 	}
 }
+
+// The rule enforced by its victim: a holder can ask, before it opens anything,
+// whether the reference it is about to seal with is declared for that.
+func TestRotationOfReportsTheDeclaredShape(t *testing.T) {
+	s, _, _, _ := sealedSummoner(t, nil)
+	cases := []struct {
+		ref  Reference
+		want Rotation
+	}{
+		{"totem/ca-passphrase", RotationSealsDataAtRest},
+		{"totem/anthropic", RotationPull},
+	}
+	for _, tc := range cases {
+		got, err := s.RotationOf(tc.ref)
+		if err != nil {
+			t.Fatalf("RotationOf(%q): %v", tc.ref, err)
+		}
+		if got != tc.want {
+			t.Fatalf("RotationOf(%q) = %v, want %v", tc.ref, got, tc.want)
+		}
+	}
+}
+
+// The lead's constraint: an unknown reference must be distinguishable from a
+// pull-rotated one, and must not read as the safe answer either.
+func TestRotationOfDistinguishesUnknownFromRotating(t *testing.T) {
+	s, _, _, _ := sealedSummoner(t, nil)
+
+	got, err := s.RotationOf("totem/never-configured")
+	if !errors.Is(err, ErrNoSuchReference) {
+		t.Fatalf("RotationOf of an unknown reference = %v, want ErrNoSuchReference", err)
+	}
+	if errors.Is(err, ErrNotSealing) {
+		t.Fatal("an unknown reference must not report as a declared-but-wrong shape; those want different messages")
+	}
+	if got == RotationPull {
+		t.Fatal("an unknown reference read back as RotationPull, which is a declared shape a caller could act on")
+	}
+	if got != RotationUnset {
+		t.Fatalf("RotationOf of an unknown reference = %v, want RotationUnset", got)
+	}
+	// And the shape a caller would compare against still refuses, so even a
+	// caller that drops the error fails closed.
+	if got == RotationSealsDataAtRest {
+		t.Fatal("an unknown reference read back as sealed: a dropped error would have opened the CA")
+	}
+}
+
+func TestRequireSealingAcceptsOnlyASealedDeclaration(t *testing.T) {
+	s, _, _, _ := sealedSummoner(t, nil)
+
+	if err := RequireSealing(s, "totem/ca-passphrase"); err != nil {
+		t.Fatalf("RequireSealing on the sealed reference = %v, want nil", err)
+	}
+
+	err := RequireSealing(s, "totem/anthropic")
+	if !errors.Is(err, ErrNotSealing) {
+		t.Fatalf("RequireSealing on a pull-rotated reference = %v, want ErrNotSealing", err)
+	}
+	for _, want := range []string{"totem/anthropic", "pull", "summon.Sealing", "unreadable at the next start"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the refusal must contain %q so it says what to change: %v", want, err)
+		}
+	}
+
+	if err := RequireSealing(s, "totem/never-configured"); !errors.Is(err, ErrNoSuchReference) {
+		t.Fatalf("RequireSealing on an unknown reference = %v, want ErrNoSuchReference", err)
+	}
+}
+
+// It reads the declaration, not a value: usable before Start, and the provider
+// is never run for it. A gate that had to resolve a secret first would be a
+// gate the CA could only pass after doing the thing it is gating.
+func TestRequireSealingWorksBeforeStartAndNeverRunsTheProvider(t *testing.T) {
+	dir := sandbox(t)
+	provider, calls := echoProvider(t, dir, "value")
+	cfg := testConfig(t, dir, provider, map[string]Secret{
+		"ca_passphrase": Sealing("totem/ca-passphrase"),
+		"anthropic":     Rotating("totem/anthropic"),
+	})
+	s, err := newForTest(cfg, os.Geteuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately not started.
+	if err := RequireSealing(s, "totem/ca-passphrase"); err != nil {
+		t.Fatalf("RequireSealing before Start = %v, want nil", err)
+	}
+	if err := RequireSealing(s, "totem/anthropic"); !errors.Is(err, ErrNotSealing) {
+		t.Fatalf("RequireSealing before Start on a rotating reference = %v, want ErrNotSealing", err)
+	}
+	if n := callCount(t, calls); n != 0 {
+		t.Fatalf("the provider ran %d times for a question about the config", n)
+	}
+}
+
+// The defensive branch. New cannot produce an undeclared shape, so this
+// reaches past it to prove the answer is a refusal rather than a nil error
+// beside a zero value a caller would act on.
+func TestRequireSealingRefusesAnUndeclaredShape(t *testing.T) {
+	s, _, _, _ := sealedSummoner(t, nil)
+	s.byName["ca_passphrase"] = Secret{Ref: "totem/ca-passphrase"} // Rotation left unset
+
+	got, err := s.RotationOf("totem/ca-passphrase")
+	if err == nil {
+		t.Fatal("an undeclared shape returned a nil error, which a caller would read as an answer")
+	}
+	// A caller has two error cases, not three: a shape it can act on, or a
+	// shape it cannot determine. Configured-but-undeclared is the second.
+	if !errors.Is(err, ErrNoSuchReference) {
+		t.Fatalf("RotationOf on an undeclared shape = %v, want it to join the cannot-determine case (ErrNoSuchReference)", err)
+	}
+	if got != RotationUnset {
+		t.Fatalf("RotationOf = %v, want RotationUnset alongside the error", got)
+	}
+	if err := RequireSealing(s, "totem/ca-passphrase"); err == nil {
+		t.Fatal("RequireSealing accepted an undeclared shape")
+	}
+}
+
+// One sentinel for the caller, two sentences for the human. The two ways
+// RotationOf can fail to give an answer want the same handling in code and
+// very different handling by a person: an unconfigured reference is usually a
+// typo in a config key, while a configured-but-undeclared one cannot happen
+// through New and therefore means something built a resolver around it.
+func TestTheTwoCannotDetermineCasesReadDifferently(t *testing.T) {
+	s, _, _, _ := sealedSummoner(t, nil)
+
+	_, unknownErr := s.RotationOf("totem/never-configured")
+	if !errors.Is(unknownErr, ErrNoSuchReference) {
+		t.Fatalf("unknown reference = %v, want ErrNoSuchReference", unknownErr)
+	}
+
+	s.byName["ca_passphrase"] = Secret{Ref: "totem/ca-passphrase"} // reached past New
+	_, undeclaredErr := s.RotationOf("totem/ca-passphrase")
+	if !errors.Is(undeclaredErr, ErrNoSuchReference) {
+		t.Fatalf("undeclared shape = %v, want the same sentinel so a caller has two cases, not three", undeclaredErr)
+	}
+
+	// Same sentinel, so a caller cannot accidentally treat one as safe.
+	// Different text, so a person is sent to the right place.
+	if unknownErr.Error() == undeclaredErr.Error() {
+		t.Fatal("the two cannot-determine cases produce identical text; a person debugging one would be sent to the wrong place")
+	}
+	if !strings.Contains(unknownErr.Error(), "is not configured") {
+		t.Fatalf("the unconfigured case must say so plainly: %v", unknownErr)
+	}
+	for _, want := range []string{"has no declared rotation shape", "summon.New refuses that at config load"} {
+		if !strings.Contains(undeclaredErr.Error(), want) {
+			t.Fatalf("the undeclared case must point at the load path, not the config file: %v", undeclaredErr)
+		}
+	}
+	if strings.Contains(unknownErr.Error(), "summon.New refuses") {
+		t.Fatalf("a typo in a config key must not be reported as a load-path violation: %v", unknownErr)
+	}
+}
+
+// legalRotations is the closed set of declarable rotation shapes. It exists so
+// that adding a shape to this package is a decision rather than an accident.
+//
+// internal/ca made the case for this and it is worth stating where the shapes
+// live rather than only where they are consumed: every at-rest consumer gates
+// with `rot != RotationSealsDataAtRest`, chosen over `rot == RotationPull`
+// because it stays correct when a shape is added. That asymmetry protects the
+// consumers, but the shape itself would arrive HERE, with nothing to prompt
+// whoever adds it to think about what a CA or a store should do with it.
+//
+// So: if you are adding a shape and this test is failing, that is the prompt.
+// Decide what every holder of material at rest does with the new shape before
+// you add it to the list, and check that each of them still refuses by
+// default rather than by luck.
+var legalRotations = []Rotation{RotationPull, RotationSealsDataAtRest}
+
+func TestTheSetOfRotationShapesIsClosed(t *testing.T) {
+	dir := sandbox(t)
+	provider, _ := echoProvider(t, dir, "value")
+
+	// SCAN for what config validation actually accepts rather than probing a
+	// few values it probably rejects. Picking arbitrary out-of-set numbers
+	// tests nothing: a shape added at the next free value sits in the gap
+	// between the ones chosen, and the test passes while the guard it claims
+	// to be does not exist. Ask the code what it admits, then compare that
+	// with the list.
+	accepted := map[Rotation]bool{}
+	for i := -8; i < 64; i++ {
+		rot := Rotation(i)
+		cfg := testConfig(t, dir, provider, map[string]Secret{"s": {Ref: "totem/a", Rotation: rot}})
+		if _, err := New(cfg); err == nil {
+			accepted[rot] = true
+		}
+	}
+
+	want := map[Rotation]bool{}
+	for _, rot := range legalRotations {
+		want[rot] = true
+		if !accepted[rot] {
+			t.Errorf("config validation refuses the legal shape %v", rot)
+		}
+	}
+	for rot := range accepted {
+		if !want[rot] {
+			t.Errorf("config validation accepts shape %d (%v), which is not in legalRotations. "+
+				"If you are adding a shape, decide what every holder of material at rest does with it "+
+				"and add it to the list deliberately", rot, rot)
+		}
+	}
+	// RotationUnset is deliberately absent from the list: the zero value is
+	// not a shape, it is the absence of one.
+	if accepted[RotationUnset] {
+		t.Error("config validation accepts RotationUnset; the zero value must never be a legal declaration")
+	}
+}
+
+// The consumer-side half of the same guard, asserted here so it does not rest
+// on every consumer remembering it: the gate opens for exactly one shape, and
+// anything else this package could ever return refuses. A shape added
+// carelessly fails closed at every holder of material at rest rather than
+// being admitted by a comparison that was written the other way round.
+func TestOnlySealingOpensTheGateWhateverShapeArrives(t *testing.T) {
+	s, _, _, _ := sealedSummoner(t, nil)
+	for i := -2; i < 12; i++ {
+		rot := Rotation(i)
+		s.byName["ca_passphrase"] = Secret{Ref: "totem/ca-passphrase", Rotation: rot}
+		err := RequireSealing(s, "totem/ca-passphrase")
+		if rot == RotationSealsDataAtRest {
+			if err != nil {
+				t.Fatalf("the gate refused the one shape it must accept (%v): %v", rot, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Fatalf("the gate opened for shape %d; only RotationSealsDataAtRest may open it", i)
+		}
+	}
+}

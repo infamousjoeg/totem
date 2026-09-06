@@ -43,14 +43,19 @@ func (c *clock) Advance(d time.Duration) {
 
 // memStore is an in-memory store.Store with a real hash chain, so Append
 // and Verify behave like the contract says and a tampered payload breaks
-// the chain.
+// the chain. Like the real store it STAMPS Record.At from its own clock on
+// Append and ignores the caller's value: a fake that honoured a caller's
+// timestamp would pass tests that mean nothing against the real thing.
 type memStore struct {
 	mu   sync.Mutex
+	now  func() time.Time
 	rows map[string]map[string][]byte
 	log  []store.Record
 }
 
-func newMemStore() *memStore { return &memStore{rows: make(map[string]map[string][]byte)} }
+func newMemStore(now func() time.Time) *memStore {
+	return &memStore{now: now, rows: make(map[string]map[string][]byte)}
+}
 
 func (m *memStore) Migrate(context.Context) error { return nil }
 func (m *memStore) Get(_ context.Context, c, id string) ([]byte, error) {
@@ -137,6 +142,7 @@ func (m *memStore) Append(_ context.Context, r store.Record) ([]byte, error) {
 		prev = m.log[n-1].Hash
 	}
 	r.Seq = int64(len(m.log) + 1)
+	r.At = m.now()
 	r.PrevHash = prev
 	r.Hash = chainHash(prev, r)
 	m.log = append(m.log, r)
@@ -172,6 +178,15 @@ func (m *memStore) Walk(_ context.Context, from int64, fn func(store.Record) err
 		}
 	}
 	return nil
+}
+func (m *memStore) Head(context.Context) (int64, []byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.log) == 0 {
+		return 0, nil, nil
+	}
+	last := m.log[len(m.log)-1]
+	return last.Seq, bytes.Clone(last.Hash), nil
 }
 func (m *memStore) Close() error { return nil }
 
@@ -283,7 +298,8 @@ type world struct {
 
 func newWorld(t *testing.T) *world {
 	t.Helper()
-	w := &world{t: t, clk: newClock(), st: newMemStore(), keys: map[string]*fakeKey{}, names: map[string]string{}}
+	w := &world{t: t, clk: newClock(), keys: map[string]*fakeKey{}, names: map[string]string{}}
+	w.st = newMemStore(w.clk.Now)
 	w.ver = presence.NewVerifier(0, w.clk.Now)
 	w.sess = presence.NewSessionStore(w.clk.Now)
 	w.reg = presence.NewRegistry(w.clk.Now)

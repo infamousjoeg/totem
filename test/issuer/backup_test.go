@@ -34,7 +34,7 @@ func TestRestoreFromBackupOnAFreshBoxIsUnderTenMinutes(t *testing.T) {
 	if _, err := rand.Read(dataKey); err != nil {
 		t.Fatalf("generate data key: %v", err)
 	}
-	resolver := newFakeResolver(map[string][]byte{store.DataKeyRefName: dataKey})
+	resolver := newFakeResolver(map[string]fakeSecretEntry{store.DataKeyRefName: sealingSecret(dataKey)})
 
 	liveDir := t.TempDir()
 	livePath := filepath.Join(liveDir, "state.db")
@@ -138,7 +138,7 @@ func TestRestoreRefusesAWrongPassphraseWithoutTouchingTheLiveDatabase(t *testing
 	if _, err := rand.Read(dataKey); err != nil {
 		t.Fatalf("generate data key: %v", err)
 	}
-	resolver := newFakeResolver(map[string][]byte{store.DataKeyRefName: dataKey})
+	resolver := newFakeResolver(map[string]fakeSecretEntry{store.DataKeyRefName: sealingSecret(dataKey)})
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.db")

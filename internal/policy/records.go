@@ -636,6 +636,13 @@ func validateWindows(ws []presence.Window) error {
 
 // record chains one signed change. Under the state lock; the ordinal is
 // assigned here, and the chain is the only copy.
+//
+// A policy record carries two times, and they are not redundant. rec.At in
+// the signed payload is when the SIGNER'S change was applied by this
+// issuer's clock and is what replay reasons from; store.Record.At is
+// stamped by the STORE on Append and a caller's value is ignored, so it is
+// when the chain recorded it. Both are under the chain hash. A large gap
+// between them is itself evidence.
 func (i *Issuer) record(ctx context.Context, rec *signedRecord) error {
 	i.state.ordinal++
 	rec.Ordinal = i.state.ordinal

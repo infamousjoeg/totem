@@ -55,6 +55,11 @@ func classify(err error) *cliError {
 		return &cliError{cause: err,
 			what: "the secrets provider is not the one this issuer pinned.",
 			fix:  "If you upgraded it on purpose, run 'totem-issuer trust-provider'. If you did not, stop and find out why it changed."}
+	case errors.Is(err, ErrRefMissing):
+		return &cliError{cause: err,
+			what: fmt.Sprintf("the issuer config does not name a secret this issuer cannot start without: %v", err),
+			fix: "Add it to the refs block in issuer.json under exactly that name. These names are not cosmetic: " +
+				"they are what marks a secret as sealing material at rest, so a renamed one would be rotated away and the issuer would not restart."}
 	case errors.Is(err, summon.ErrNoSuchReference), errors.Is(err, summon.ErrBadReference):
 		return &cliError{cause: err,
 			what: fmt.Sprintf("a secret this issuer needs is not configured: %v", err),

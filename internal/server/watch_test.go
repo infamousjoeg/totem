@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -36,6 +37,20 @@ func (p *mutableProvider) Resolve(_ context.Context, ref summon.Reference) (summ
 		return nil, summon.ErrNoSuchReference
 	}
 	return testValue(append([]byte(nil), v...)), nil
+}
+
+// RotationOf: the CA passphrase seals the CA private keys at rest, so it is
+// Sealing. That is the declaration the whole exclusion is keyed on.
+func (p *mutableProvider) RotationOf(ref summon.Reference) (summon.Rotation, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.refs[ref]; !ok {
+		return summon.RotationUnset, summon.ErrNoSuchReference
+	}
+	if ref == testPassphraseRef {
+		return summon.Sealing(ref).Rotation, nil
+	}
+	return summon.Rotating(ref).Rotation, nil
 }
 
 func (p *mutableProvider) Refs() []string {
@@ -325,4 +340,169 @@ func TestWatcherRefusesAnIncompleteConfig(t *testing.T) {
 	if _, err := NewWatcher(WatcherConfig{CA: authority}); err == nil {
 		t.Error("a watcher with no audit log was accepted")
 	}
+}
+
+// TestResealDoesNothingUntilTheResolverReturnsTheNewValue is the evidence
+// behind the ordering `totem-issuer reseal-ca` uses, and behind a note to the
+// secrets owner and the build lead.
+//
+// internal/summon deliberately keeps SERVING the old value for a secret that
+// seals material at rest: it is excluded from pull-based rotation, so when the
+// provider starts returning something new, summon alarms and carries on with the
+// value in use until `ResealCompleted` adopts the new one. Both ca.Reseal and
+// ca.VerifyPassphrase ask the resolver "what is the passphrase now". While
+// summon is still serving the old value, that answer is the old value, so
+// VerifyPassphrase SUCCEEDS and Reseal has nothing to do.
+//
+// The consequence is that re-sealing before adoption is inert. A reseal-ca that
+// ran ca.Reseal first and adopted afterwards would report success having changed
+// nothing, and then adopt the new value on top of files still sealed under the
+// old one, producing exactly the failed restart it exists to prevent. So the
+// command adopts first and re-seals second, and this test is why.
+func TestResealDoesNothingUntilTheResolverReturnsTheNewValue(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	authority, provider, _ := realCA(t)
+	op, ok := authority.(ca.PassphraseOperator)
+	if !ok {
+		t.Skip("this CA implementation seals nothing")
+	}
+	const original = "the original passphrase"
+
+	// While the resolver still returns the old value, which is precisely what
+	// summon does during a drift alarm:
+	if err := op.VerifyPassphrase(ctx); err != nil {
+		t.Fatalf("the CA should open under the value in use: %v", err)
+	}
+	// ...a re-seal is a no-op, and says nothing about whether it did anything.
+	// Note it succeeds even with a previous value that is flatly wrong, because
+	// every file already opens under what the resolver returned.
+	if err := op.Reseal(ctx, []byte("a completely wrong previous value")); err != nil {
+		t.Fatalf("Reseal before adoption should be inert, not an error: %v", err)
+	}
+	if err := op.VerifyPassphrase(ctx); err != nil {
+		t.Fatalf("the inert re-seal changed something: %v", err)
+	}
+
+	// Now the resolver returns the new value, which is what ResealCompleted
+	// does on summon's side. Only from here does Reseal mean anything.
+	provider.set(testPassphraseRef, []byte("the adopted passphrase"))
+	if err := op.VerifyPassphrase(ctx); !errors.Is(err, ca.ErrPassphraseChanged) {
+		t.Fatalf("after adoption the CA must report it will not restart; got %v", err)
+	}
+	if err := op.Reseal(ctx, []byte(original)); err != nil {
+		t.Fatalf("re-sealing after adoption: %v", err)
+	}
+	if err := op.VerifyPassphrase(ctx); err != nil {
+		t.Fatalf("after re-sealing, a restart would still fail: %v", err)
+	}
+
+	// And the wrong previous value after adoption is a real refusal, unlike the
+	// inert case above. This is the difference the command reports to the
+	// operator, and getting it backwards is how a success message hides a brick.
+	provider.set(testPassphraseRef, []byte("a third passphrase"))
+	if err := op.Reseal(ctx, []byte("still not the right one")); err == nil {
+		t.Fatal("re-sealing with a wrong previous value after adoption reported success")
+	}
+}
+
+// declaringProvider answers RotationOf with whatever the test wants, so the
+// question "does my Sealing declaration actually do anything" can be asked by
+// taking it away. It is the deliberate counterpart to mutableProvider, which
+// answers truthfully; a suite that only ever contains the truthful fake proves
+// that the truthful fake agrees with itself.
+type declaringProvider struct {
+	value    []byte
+	rotation summon.Rotation
+	err      error
+}
+
+func (p *declaringProvider) Resolve(context.Context, summon.Reference) (summon.Value, error) {
+	return testValue(append([]byte(nil), p.value...)), nil
+}
+func (p *declaringProvider) Refs() []string { return []string{string(testPassphraseRef)} }
+func (p *declaringProvider) RotationOf(summon.Reference) (summon.Rotation, error) {
+	return p.rotation, p.err
+}
+
+var _ summon.Resolver = (*declaringProvider)(nil)
+
+// TestCARefusesToOpenUnlessThePassphraseIsDeclaredSealing makes this package's
+// Sealing declarations load-bearing rather than incidental.
+//
+// mutableProvider declares testPassphraseRef as Sealing because in these tests
+// that reference genuinely does seal the CA private keys on disk. That is the
+// truthful answer, but on its own it is unfalsifiable: every test would pass
+// identically if internal/ca ignored the declaration entirely. So this asserts
+// the other side, that taking the declaration away STOPS the CA existing. That
+// is the last soft edge on the passphrase brick closed: not "the config is
+// checked" but "there is no running issuer whose CA passphrase can be
+// pull-rotated out from under the key files it sealed".
+//
+// It also documents the honest answer for a harness with no opinion. An
+// undeclared reference is ErrNoSuchReference and the CA refuses, and that
+// refusal is correct behaviour rather than an obstacle to route around: a fake
+// that declared a shape it does not have would be the shape a future non-test
+// caller copies.
+func TestCARefusesToOpenUnlessThePassphraseIsDeclaredSealing(t *testing.T) {
+	t.Parallel()
+	sealing := summon.Sealing(testPassphraseRef).Rotation
+	rotating := summon.Rotating(testPassphraseRef).Rotation
+
+	for _, tc := range []struct {
+		name     string
+		rotation summon.Rotation
+		err      error
+		want     error
+	}{
+		{
+			name:     "declared pull-rotated",
+			rotation: rotating,
+			want:     summon.ErrNotSealing,
+		},
+		{
+			name:     "no shape at all",
+			rotation: summon.RotationUnset,
+			want:     ca.ErrRotationShapeUnknown,
+		},
+		{
+			name: "the resolver has no opinion",
+			err:  summon.ErrNoSuchReference,
+			want: summon.ErrNoSuchReference,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := ca.Init(context.Background(), ca.InitParams{
+				Config: ca.Config{
+					Dir:           filepath.Join(t.TempDir(), "ca"),
+					Resolver:      &declaringProvider{value: []byte("p"), rotation: tc.rotation, err: tc.err},
+					PassphraseRef: testPassphraseRef,
+					TrustDomain:   testTrustDomain,
+				},
+				Subject: "totem test",
+			})
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("ca.Init with a passphrase %s returned %v, want %v; "+
+					"a CA that opens here is a CA whose passphrase can be rotated away from the keys it sealed",
+					tc.name, err, tc.want)
+			}
+		})
+	}
+
+	// And the truthful declaration this package actually makes still works, so
+	// the check above is a refusal of the wrong shape rather than of everything.
+	authority, err := ca.Init(context.Background(), ca.InitParams{
+		Config: ca.Config{
+			Dir:           filepath.Join(t.TempDir(), "ca"),
+			Resolver:      &declaringProvider{value: []byte("p"), rotation: sealing},
+			PassphraseRef: testPassphraseRef,
+			TrustDomain:   testTrustDomain,
+		},
+		Subject: "totem test",
+	})
+	if err != nil {
+		t.Fatalf("ca.Init with a correctly declared Sealing passphrase: %v", err)
+	}
+	_ = authority.Close()
 }

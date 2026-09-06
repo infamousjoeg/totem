@@ -3,15 +3,19 @@ package issuer
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/infamousjoeg/totem/internal/ca"
+	"github.com/infamousjoeg/totem/internal/policy"
 	"github.com/infamousjoeg/totem/internal/presence"
 	"github.com/infamousjoeg/totem/internal/spiffe"
+	"github.com/infamousjoeg/totem/internal/store"
 )
 
 // fixedIssuerFingerprint stands in for the SHA-256 of a real issuer
@@ -199,7 +203,7 @@ func TestEnrollmentChallengeIsSingleUseAcrossDevices(t *testing.T) {
 // about.
 func TestFoundingDeviceReceivesAnSVID(t *testing.T) {
 	ctx := context.Background()
-	res := &fakeResolver{values: map[string][]byte{"ca_passphrase": []byte("a-passphrase-only-summon-knows")}}
+	res := &fakeResolver{entries: map[string]fakeSecretEntry{"ca_passphrase": sealingSecret([]byte("a-passphrase-only-summon-knows"))}}
 	authority, err := ca.Init(ctx, ca.InitParams{
 		Config: ca.Config{
 			Dir:           t.TempDir(),
@@ -268,19 +272,198 @@ func TestFoundingDeviceReceivesAnSVID(t *testing.T) {
 	}
 }
 
+// newTestPolicyIssuer builds a real policy.Issuer wired to a real store.DB
+// (SQLite, sealed data key) and real presence components -- Verifier,
+// SessionStore, Registry, Lot -- exactly as cmd/totem-issuer will assemble
+// them, rather than a policy-package-internal fake of any of them.
+func newTestPolicyIssuer(t *testing.T, clk *testClock) *policy.Issuer {
+	t.Helper()
+	ctx := context.Background()
+
+	dataKey := make([]byte, 32)
+	if _, err := rand.Read(dataKey); err != nil {
+		t.Fatalf("generate data key: %v", err)
+	}
+	resolver := newFakeResolver(map[string]fakeSecretEntry{store.DataKeyRefName: sealingSecret(dataKey)})
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "state.db"), store.Options{Resolver: resolver, Clock: clk.Now})
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	iss, err := policy.New(ctx, policy.Config{
+		TrustDomain: testTrustDomain,
+		Verifier:    presence.NewVerifier(0, clk.Now),
+		Sessions:    presence.NewSessionStore(clk.Now),
+		Grants:      presence.NewRegistry(clk.Now),
+		Lot:         presence.NewLot(clk.Now, 0, 0),
+		Store:       db,
+		Now:         clk.Now,
+	})
+	if err != nil {
+		t.Fatalf("policy.New: %v", err)
+	}
+	return iss
+}
+
+// enrollDevice drives one device through the real wire shape a `totem
+// enroll` would produce against a real policy.Issuer: mint the enrollment
+// challenge from the issuer itself, sign both halves for real, and submit.
+// bootstrapCode is the plaintext code when redeeming the founding bootstrap
+// code, or "" for an ordinary (pending) enrollment.
+func enrollDevice(t *testing.T, iss *policy.Issuer, key *deviceKey, bootstrapCode string) (*policy.EnrollResult, string) {
+	t.Helper()
+	devicePub := marshalPub(t, key.Public())
+	presencePub := marshalPub(t, key.PresencePublic())
+	deviceID := presence.PreEnrollmentDeviceID(devicePub)
+
+	challenge, err := iss.EnrollmentChallenge(devicePub)
+	if err != nil {
+		t.Fatalf("EnrollmentChallenge: %v", err)
+	}
+
+	var codeHash []byte
+	if bootstrapCode != "" {
+		codeHash = presence.BootstrapCodeHash(challenge, bootstrapCode)
+	}
+	in := presence.EnrollmentInput{
+		Version:           presence.EncodingVersion,
+		Challenge:         challenge,
+		IssuerFingerprint: fixedIssuerFingerprint(),
+		DevicePublicKey:   devicePub,
+		PresencePublicKey: presencePub,
+		ProtectionLevel:   spiffe.ProtectionSoftware,
+		Hostname:          "joes-mac-studio",
+		OS:                "darwin",
+		FirstContact:      presence.FirstContactFragment,
+		BootstrapCodeHash: codeHash,
+	}
+	deviceSig, err := presence.SignEnrollment(context.Background(), key, in)
+	if err != nil {
+		t.Fatalf("SignEnrollment: %v", err)
+	}
+	digest, err := in.Digest()
+	if err != nil {
+		t.Fatalf("Digest: %v", err)
+	}
+	a, err := presence.Sign(context.Background(), key, presence.SigningInput{
+		DeviceID:    deviceID,
+		Tool:        presence.EnrollmentTool,
+		Target:      testTrustDomain,
+		Challenge:   challenge,
+		RequestHash: digest,
+	})
+	if err != nil {
+		t.Fatalf("Sign (enrollment presence half): %v", err)
+	}
+
+	result, err := iss.Enroll(context.Background(), policy.EnrollRequest{
+		Input:             in,
+		Signature:         deviceSig,
+		PresenceSignature: a.Signature,
+		BootstrapCode:     bootstrapCode,
+		Name:              "test-device",
+	}, fixedIssuerFingerprint())
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	return result, deviceID
+}
+
 // TestFoundingDeviceIsRecordedAsAdmin is the remaining piece of item 1 beyond
-// the SVID: the issuer must persist an EnrollmentRecord for the founding
-// device with Admin set, and must refuse a second device that tries to
-// redeem the same already-consumed bootstrap code. Both are policy/store
-// concerns (internal/policy is still the step-1 scaffold with no evaluation
-// or persistence logic; internal/store has no concrete implementation yet),
-// not something presence.Verifier.Enroll does on its own -- it verifies
-// signatures and challenge freshness only, and returns no Admin field.
+// the SVID, now real: the issuer persists an EnrollmentRecord for the
+// founding device with Admin and Founding set, through a real policy.Issuer
+// backed by a real store.DB, and refuses a second device that tries to
+// redeem the same already-consumed bootstrap code, with a freshly minted
+// challenge of its own.
 func TestFoundingDeviceIsRecordedAsAdmin(t *testing.T) {
-	t.Skip("not yet functional: internal/policy has no admin-recording or enrollment-persistence logic " +
-		"yet beyond its step-1 scaffold types, and internal/store has no concrete implementation to " +
-		"persist an EnrollmentRecord against. Will enroll the founding device for real, hand the " +
-		"Enrolled result and the redeemed bootstrap code to the real policy/store layer, assert the " +
-		"resulting EnrollmentRecord has Admin=true, and assert a second enrollment attempt bearing the " +
-		"same (now-redeemed) bootstrap code is refused even with a freshly minted challenge.")
+	clk := newTestClock()
+	iss := newTestPolicyIssuer(t, clk)
+
+	code, expires, err := iss.IssueBootstrapCode(context.Background())
+	if err != nil {
+		t.Fatalf("IssueBootstrapCode: %v", err)
+	}
+	if !expires.After(clk.Now()) {
+		t.Fatalf("bootstrap code expiry %s is not after now %s", expires, clk.Now())
+	}
+
+	key := newDeviceKey(t)
+	result, deviceID := enrollDevice(t, iss, key, code)
+	if !result.Approved {
+		t.Fatal("founding device's EnrollResult.Approved = false, want true")
+	}
+	if result.DeviceID != deviceID {
+		t.Errorf("EnrollResult.DeviceID = %q, want %q", result.DeviceID, deviceID)
+	}
+
+	rec, err := iss.Device(deviceID)
+	if err != nil {
+		t.Fatalf("Device: %v", err)
+	}
+	if !rec.Admin {
+		t.Error("founding device's EnrollmentRecord.Admin = false, want true")
+	}
+	if !rec.Founding {
+		t.Error("founding device's EnrollmentRecord.Founding = false, want true")
+	}
+	if !rec.Live() {
+		t.Error("founding device's EnrollmentRecord.Live() = false, want true")
+	}
+
+	// A second device tries to redeem the SAME bootstrap code with its OWN,
+	// freshly minted challenge: the code was spent by the first redemption,
+	// so this must be refused even though the hash-over-challenge binding is
+	// individually well formed.
+	secondKey := newDeviceKey(t)
+	devicePub2 := marshalPub(t, secondKey.Public())
+	presencePub2 := marshalPub(t, secondKey.PresencePublic())
+	deviceID2 := presence.PreEnrollmentDeviceID(devicePub2)
+	challenge2, err := iss.EnrollmentChallenge(devicePub2)
+	if err != nil {
+		t.Fatalf("EnrollmentChallenge (second device): %v", err)
+	}
+	in2 := presence.EnrollmentInput{
+		Version:           presence.EncodingVersion,
+		Challenge:         challenge2,
+		IssuerFingerprint: fixedIssuerFingerprint(),
+		DevicePublicKey:   devicePub2,
+		PresencePublicKey: presencePub2,
+		ProtectionLevel:   spiffe.ProtectionSoftware,
+		Hostname:          "a-second-machine",
+		OS:                "darwin",
+		FirstContact:      presence.FirstContactFragment,
+		BootstrapCodeHash: presence.BootstrapCodeHash(challenge2, code),
+	}
+	deviceSig2, err := presence.SignEnrollment(context.Background(), secondKey, in2)
+	if err != nil {
+		t.Fatalf("SignEnrollment (second device): %v", err)
+	}
+	digest2, err := in2.Digest()
+	if err != nil {
+		t.Fatalf("Digest (second device): %v", err)
+	}
+	a2, err := presence.Sign(context.Background(), secondKey, presence.SigningInput{
+		DeviceID: deviceID2, Tool: presence.EnrollmentTool, Target: testTrustDomain,
+		Challenge: challenge2, RequestHash: digest2,
+	})
+	if err != nil {
+		t.Fatalf("Sign (second device): %v", err)
+	}
+
+	_, err = iss.Enroll(context.Background(), policy.EnrollRequest{
+		Input:             in2,
+		Signature:         deviceSig2,
+		PresenceSignature: a2.Signature,
+		BootstrapCode:     code,
+		Name:              "second-machine",
+	}, fixedIssuerFingerprint())
+	if !errors.Is(err, policy.ErrBootstrapInvalid) {
+		t.Fatalf("second device redeeming the already-spent bootstrap code = %v, want ErrBootstrapInvalid", err)
+	}
+
+	// The second device must not have been recorded at all.
+	if _, err := iss.Device(deviceID2); !errors.Is(err, policy.ErrDeviceNotFound) {
+		t.Errorf("Device(second device) after a refused enrollment = %v, want ErrDeviceNotFound", err)
+	}
 }

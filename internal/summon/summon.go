@@ -11,6 +11,7 @@
 package summon
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -53,6 +54,12 @@ type FileProvider struct {
 	// is not a legal segment.
 	Dir string
 }
+
+// ErrNotSealing means a reference a caller intends to use for sealing material
+// at rest is not declared RotationSealsDataAtRest. It is distinct from
+// ErrNoSuchReference on purpose: "declared pull-rotated, refuse" and "I cannot
+// find this reference at all" are different facts and want different messages.
+var ErrNotSealing = errors.New("summon: reference is not declared as sealing material at rest")
 
 // Rotation is the shape a reference's rotation has. It is a required property
 // of every configured secret, and it is deliberately impossible to leave

@@ -99,6 +99,9 @@ func Load(dir string) (*Config, error) {
 		return nil, fmt.Errorf("the issuer config at %s could not be read: %w", path, err)
 	}
 	c.path = path
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
 	return &c, nil
 }
 
@@ -152,6 +155,56 @@ func (c *Config) Summon(dir string) summon.Config {
 	return cfg
 }
 
+// RequiredRefs are the logical secret names that MUST be present in every
+// issuer config, because each one seals material at rest and the issuer cannot
+// come back without it.
+//
+// They exist as a list rather than as three checks so that declare() and
+// Validate cannot drift apart: TestAtRestSecretsAreClassifiedAndRequired walks
+// this list for both. Adding an at-rest secret without adding it here fails
+// that test rather than shipping a value that quietly pull-rotates.
+func RequiredRefs() []string {
+	return []string{CAPassphraseRefName, store.DataKeyRefName, store.BackupPassphraseRefName}
+}
+
+// Validate refuses a config that is missing any at-rest secret reference.
+//
+// This closes a hazard the secrets owner raised about declare(). declare()
+// decides which references are excluded from pull-based rotation by switching
+// on the LOGICAL NAME, and that name is an operator-editable key in this file.
+// Rename "ca_passphrase" to anything else and declare() falls through to
+// Rotating, the provider's hourly rotation replaces the value that seals the CA
+// private keys, and the issuer keeps running perfectly until the next restart,
+// at which point the old value is gone and the CA will not open.
+//
+// In practice a renamed CA passphrase already fails at start, because runtime.go
+// resolves it by that exact name and internal/summon answers ErrNoSuchReference,
+// and a renamed data key already fails because internal/store checks for its own
+// name. But both of those are properties of OTHER packages that happen to agree
+// with this one today, nothing asserted them, and one refactor removes them
+// silently. The backup passphrase had no such accident at all: nothing resolves
+// it until a restore, which is the worst possible moment to discover it, because
+// there is no old value to recover and no working system to recover it from.
+//
+// So the check lives here, at start, where the config is read, and says which
+// name is missing.
+func (c *Config) Validate() error {
+	var missing []string
+	for _, name := range RequiredRefs() {
+		if strings.TrimSpace(c.Secrets.Refs[name]) == "" {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrRefMissing, strings.Join(missing, ", "))
+}
+
+// ErrRefMissing means the config does not name a secret the issuer cannot start
+// without. It is deliberately fatal at start rather than at first use.
+var ErrRefMissing = errors.New("the issuer config is missing a secret reference it cannot start without")
+
 // declare classifies a reference by what its value protects, which is what
 // internal/summon needs to know before it will rotate anything.
 //
@@ -165,12 +218,12 @@ func (c *Config) Summon(dir string) summon.Config {
 // timer. Everything else is a credential a remote service accepts as soon as it
 // changes, and rotating those on a pull is the whole point.
 func declare(name string, ref summon.Reference) summon.Secret {
-	switch name {
-	case CAPassphraseRefName, store.DataKeyRefName, store.BackupPassphraseRefName:
-		return summon.Sealing(ref)
-	default:
-		return summon.Rotating(ref)
+	for _, atRest := range RequiredRefs() {
+		if name == atRest {
+			return summon.Sealing(ref)
+		}
 	}
+	return summon.Rotating(ref)
 }
 
 // DefaultRefs are the references every issuer needs regardless of which bridges

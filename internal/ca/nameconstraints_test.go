@@ -8,6 +8,8 @@ import (
 	"encoding/asn1"
 	"net/url"
 	"testing"
+
+	"github.com/infamousjoeg/totem/internal/summon"
 	"time"
 )
 
@@ -162,7 +164,7 @@ func TestDisableNameConstraintsIsTheDocumentedBackOut(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	clk := newClock(T0)
-	res := &fakeResolver{pass: "a-passphrase-only-summon-knows"}
+	res := &fakeResolver{pass: "a-passphrase-only-summon-knows", rotation: summon.RotationSealsDataAtRest}
 	a, err := Init(ctx, InitParams{Config: Config{
 		Dir: dir, Resolver: res, PassphraseRef: "ca_passphrase",
 		TrustDomain: testTrustDomain, Now: clk.now,
