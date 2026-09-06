@@ -43,13 +43,15 @@
 //     admin and refuse a second redemption of the same bootstrap code.
 //
 //     internal/summon's three provider-ownership refusals (secrets_test.go)
-//     are a different kind of gap: the implementation is real and complete,
-//     but every exported entry point (summon.New, summon.TrustProvider)
-//     hardcodes the trusted provider-chain owner to root with no override,
-//     so no Summoner built from outside the package can even reach Start
-//     successfully -- proven empirically, not assumed, by
-//     TestProviderHardeningIsUnreachableWithoutRootFromThisPackage. This is
-//     an architectural question for the lead, not a "not implemented yet."
+//     are not a gap at all, ruled and closed: the implementation is real and
+//     complete, every exported entry point (summon.New, summon.TrustProvider)
+//     hardcodes the trusted provider-chain owner to root with no override, and
+//     that is deliberate -- no test seam will be added, because an override
+//     is exactly the code path the hardening control exists to forbid.
+//     TestProviderHardeningIsUnreachableWithoutRootFromThisPackage pins the
+//     ruling as a property the code asserts about itself, proven empirically
+//     rather than assumed. Coverage for all three lives, for real, inside
+//     internal/summon's own test suite via its unexported newForTest.
 package issuer
 
 import (

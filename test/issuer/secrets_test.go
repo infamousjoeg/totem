@@ -51,38 +51,45 @@ import (
 // covered for real, just not by this package -- internal/summon's own test
 // suite (harden_test.go, pin_test.go, reference_test.go, fifo_unix_test.go)
 // uses newForTest to exercise exactly the accept/refuse pairs named below.
-// What remains open is whether an issuer-level integration test for this is
-// wanted at all given that constraint, or whether coverage living entirely in
-// internal/summon's own suite is accepted -- flagged to the lead rather than
-// guessed at.
+//
+// RULED, not open: no test seam gets added for this. The control here is
+// "the trusted owner of the provider chain is root, always, with no
+// override" -- an override is precisely the code path that control exists to
+// forbid, and a build-tag-gated one is one CI misconfiguration away from
+// being compiled into a real deployment. Weakening a hardening check in
+// production so a second test suite can observe it is a worse trade than
+// leaving this coverage where it already lives for real: inside
+// internal/summon's own package, exercising the real implementation, not a
+// fake. See TestProviderHardeningIsUnreachableWithoutRootFromThisPackage,
+// which pins that ruling as a property the code asserts about itself rather
+// than a decision that only exists in a conversation.
 func TestProviderRefusesNonRootOwnedProviderDirectory(t *testing.T) {
-	t.Skip("not drivable from this package: summon.New hardcodes the trusted provider-chain owner to " +
-		"root with no exported override (see this file's package comment for the empirical proof and " +
-		"the architectural reason). internal/summon's own test suite already covers this pair " +
-		"(root-owned accepted, non-root-owned refused) via its unexported newForTest. Flagged to the " +
-		"lead: whether this needs a production-safe seam (e.g. an exported WithTrustedUID test option " +
-		"gated to build with a test tag) so an issuer-level integration test can exercise it too, or " +
-		"whether internal/summon's own coverage is accepted as sufficient.")
+	t.Skip("not drivable from this package, by design, not by gap: summon.New hardcodes the trusted " +
+		"provider-chain owner to root with no exported override, and that is a ruled decision (see this " +
+		"file's package comment) -- no test seam will be added, because an override is precisely the " +
+		"code path the hardening control exists to forbid. internal/summon's own test suite already " +
+		"covers this pair (root-owned accepted, non-root-owned refused) for real via its unexported " +
+		"newForTest, exercising the real implementation from inside its own package.")
 }
 
 func TestProviderRefusesAWorldReadableFileProvider(t *testing.T) {
-	t.Skip("not drivable from this package: even the built-in file provider's own directory check uses " +
-		"the current euid and would accept a directory this test owns, but Start's FIRST hardening " +
-		"check (Config.Path, the issuer config file) is hardcoded to require root ownership regardless " +
-		"of which provider is configured, so no Summoner built from this package ever gets far enough " +
-		"to reach the file-provider-specific permission check. Verified empirically (see this file's " +
-		"package comment). internal/summon's own test suite covers the world-readable-file refusal " +
-		"directly, unblocked by this outer check because it runs inside the package.")
+	t.Skip("not drivable from this package, by design, not by gap: Start's FIRST hardening check " +
+		"(Config.Path, the issuer config file) is hardcoded to require root ownership regardless of " +
+		"which provider is configured, so no Summoner built from this package ever gets far enough to " +
+		"reach the file-provider-specific permission check -- verified empirically (see this file's " +
+		"package comment), and ruled as the correct state rather than a gap to close. internal/summon's " +
+		"own test suite covers the world-readable-file refusal directly, unblocked by this outer check " +
+		"because it runs inside the package.")
 }
 
 func TestProviderRefusesAHashThatNoLongerMatchesItsPin(t *testing.T) {
-	t.Skip("not drivable from this package, for the same reason as the other two in this file: the " +
-		"outer Config.Path ownership check refuses before a Summoner ever reaches verifyPinLocked. " +
-		"Also worth noting for whoever revisits this: verifyPinLocked is skipped entirely for the " +
-		"built-in file provider (it only applies to an external Provider.Path), so even a hypothetical " +
-		"root-owned config would still need an external provider binary, also root-owned, to reach this " +
-		"check at all. internal/summon's own test suite (pin_test.go) covers the hash-mismatch refusal " +
-		"directly.")
+	t.Skip("not drivable from this package, by design, not by gap, for the same reason as the other two " +
+		"in this file: the outer Config.Path ownership check refuses before a Summoner ever reaches " +
+		"verifyPinLocked. Also worth noting for whoever revisits this: verifyPinLocked is skipped " +
+		"entirely for the built-in file provider (it only applies to an external Provider.Path), so " +
+		"even a hypothetical root-owned config would still need an external provider binary, also " +
+		"root-owned, to reach this check at all. internal/summon's own test suite (pin_test.go) covers " +
+		"the hash-mismatch refusal directly, for real, from inside the package.")
 }
 
 // probeProviderPathAlwaysRefusedFromHere is not a test; it exists so the claim
@@ -109,12 +116,21 @@ func probeProviderPathAlwaysRefusedFromHere(t *testing.T, dir string) error {
 	return s.Start(context.Background())
 }
 
-// TestProviderHardeningIsUnreachableWithoutRootFromThisPackage pins the claim
-// the three skips above make, so it fails loudly (rather than the skips
-// silently going stale) if internal/summon ever adds an exported way to run
-// with a non-root trusted owner: today, Start must fail with
-// ErrProviderUnsafe purely because this test process is not root, before any
-// reference is ever resolved.
+// TestProviderHardeningIsUnreachableWithoutRootFromThisPackage is not a gap
+// marker. It is the permanent artifact of a deliberate ruling: no test seam
+// (no WithTrustedUID, no build-tag override, nothing) will ever be added to
+// let a Summoner run with a non-root trusted provider-chain owner, because
+// that override is exactly the code path the hardening control exists to
+// forbid, and the cost of a seam -- a real weakening of production hardening
+// for a second test suite's convenience, when internal/summon's own suite
+// already exercises the real implementation for real -- was judged not worth
+// paying. This test is what makes that a property the code asserts about
+// itself rather than a decision that only lives in a conversation: if
+// internal/summon ever grows an exported way to run with a non-root trusted
+// owner, this fails LOUDLY and asks whoever added it to justify reopening the
+// ruling, rather than the three skips above going quietly stale. Today, Start
+// must fail with ErrProviderUnsafe purely because this test process is not
+// root, before any reference is ever resolved.
 func TestProviderHardeningIsUnreachableWithoutRootFromThisPackage(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("this test process is running as root, so the constraint this file documents does not " +
