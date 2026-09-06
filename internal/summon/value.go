@@ -1,6 +1,7 @@
 package summon
 
 import (
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"runtime"
@@ -116,6 +117,21 @@ func (s *secret) bytes() []byte {
 		return nil
 	}
 	return s.buf[:s.n]
+}
+
+// sameAs reports whether two secrets hold the same bytes, in constant time so
+// the comparison cannot be turned into an oracle for a value it is checking.
+// It is used only to detect that a sealed secret changed underneath the
+// issuer; neither value is logged, returned, or kept.
+func (s *secret) sameAs(other *secret) bool {
+	if s == nil || other == nil {
+		return false
+	}
+	a, b := s.bytes(), other.bytes()
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	return subtle.ConstantTimeCompare(a, b) == 1
 }
 
 // setLen records how many bytes of the mapping the provider actually wrote.

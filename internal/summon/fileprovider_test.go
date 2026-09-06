@@ -10,7 +10,7 @@ import (
 )
 
 // fileConfig wires the built-in file provider at dir/secrets.
-func fileConfig(t *testing.T, dir string, refs map[string]Reference) Config {
+func fileConfig(t *testing.T, dir string, refs map[string]Secret) Config {
 	t.Helper()
 	secrets := filepath.Join(dir, "secrets")
 	if err := os.MkdirAll(secrets, 0o700); err != nil {
@@ -41,7 +41,7 @@ func writeSecret(t *testing.T, dir string, ref Reference, value string, mode os.
 
 func TestFileProviderReadsA0600File(t *testing.T) {
 	dir := sandbox(t)
-	cfg := fileConfig(t, dir, map[string]Reference{"anthropic": "totem/anthropic"})
+	cfg := fileConfig(t, dir, map[string]Secret{"anthropic": Rotating("totem/anthropic")})
 	writeSecret(t, cfg.File.Dir, "totem/anthropic", "sk-ant-secret", 0o600)
 
 	s, err := newForTest(cfg, os.Geteuid())
@@ -152,7 +152,7 @@ func TestFileProviderRefusals(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := sandbox(t)
-			cfg := fileConfig(t, dir, map[string]Reference{"anthropic": "totem/anthropic"})
+			cfg := fileConfig(t, dir, map[string]Secret{"anthropic": Rotating("totem/anthropic")})
 			p := writeSecret(t, cfg.File.Dir, "totem/anthropic", "sk-ant-secret", tc.mode)
 			if tc.setup != nil {
 				tc.setup(t, cfg.File.Dir, p)
@@ -192,7 +192,7 @@ func TestFileProviderRefusesSyncedFolderNames(t *testing.T) {
 			cfg := Config{
 				Path:   writeConfigFile(t, dir),
 				File:   FileProvider{Dir: synced},
-				Refs:   map[string]Reference{"anthropic": "totem/anthropic"},
+				Refs:   map[string]Secret{"anthropic": Rotating("totem/anthropic")},
 				Logger: discardLogger(),
 			}
 			writeSecret(t, synced, "totem/anthropic", "sk-ant-secret", 0o600)
@@ -213,7 +213,7 @@ func TestFileProviderRefusesSyncedFolderNames(t *testing.T) {
 
 func TestFileProviderMissingSecretIsNoSuchReference(t *testing.T) {
 	dir := sandbox(t)
-	cfg := fileConfig(t, dir, map[string]Reference{"anthropic": "totem/anthropic"})
+	cfg := fileConfig(t, dir, map[string]Secret{"anthropic": Rotating("totem/anthropic")})
 	s, err := newForTest(cfg, os.Geteuid())
 	if err != nil {
 		t.Fatal(err)
@@ -226,7 +226,7 @@ func TestFileProviderMissingSecretIsNoSuchReference(t *testing.T) {
 
 func TestFileProviderTrimsOnlyTheEditorsNewline(t *testing.T) {
 	dir := sandbox(t)
-	cfg := fileConfig(t, dir, map[string]Reference{"a": "totem/a"})
+	cfg := fileConfig(t, dir, map[string]Secret{"a": Rotating("totem/a")})
 	writeSecret(t, cfg.File.Dir, "totem/a", "sk-ant-secret\n", 0o600)
 	s, err := newForTest(cfg, os.Geteuid())
 	if err != nil {
@@ -249,7 +249,7 @@ func TestFileProviderTrimsOnlyTheEditorsNewline(t *testing.T) {
 
 func TestFileProviderRefusesAnEmptySecret(t *testing.T) {
 	dir := sandbox(t)
-	cfg := fileConfig(t, dir, map[string]Reference{"a": "totem/a"})
+	cfg := fileConfig(t, dir, map[string]Secret{"a": Rotating("totem/a")})
 	writeSecret(t, cfg.File.Dir, "totem/a", "\n", 0o600)
 	s, err := newForTest(cfg, os.Geteuid())
 	if err != nil {
@@ -264,7 +264,7 @@ func TestFileProviderRefusesAnEmptySecret(t *testing.T) {
 // was validated before it became a path.
 func TestFileProviderReferenceCannotEscapeItsDirectory(t *testing.T) {
 	dir := sandbox(t)
-	cfg := fileConfig(t, dir, map[string]Reference{"a": "totem/a"})
+	cfg := fileConfig(t, dir, map[string]Secret{"a": Rotating("totem/a")})
 	writeSecret(t, cfg.File.Dir, "totem/a", "value", 0o600)
 	outside := filepath.Join(dir, "outside")
 	if err := os.WriteFile(outside, []byte("not yours"), 0o600); err != nil {
@@ -294,7 +294,7 @@ func TestFileProviderWarnsOnEveryStartAndCannotBeSilenced(t *testing.T) {
 	defer restore()
 
 	for i := 0; i < 3; i++ {
-		cfg := fileConfig(t, dir, map[string]Reference{"a": "totem/a"})
+		cfg := fileConfig(t, dir, map[string]Secret{"a": Rotating("totem/a")})
 		writeSecret(t, cfg.File.Dir, "totem/a", "value", 0o600)
 		// The most hostile logger a caller can supply: one that throws
 		// everything away.
@@ -326,7 +326,7 @@ func TestFileProviderWarningReachesTheLogger(t *testing.T) {
 	restore := setWarnSink(&strings.Builder{})
 	defer restore()
 
-	cfg := fileConfig(t, dir, map[string]Reference{"a": "totem/a"})
+	cfg := fileConfig(t, dir, map[string]Secret{"a": Rotating("totem/a")})
 	writeSecret(t, cfg.File.Dir, "totem/a", "value", 0o600)
 	var buf logBuffer
 	cfg.Logger = buf.logger()
@@ -352,7 +352,7 @@ func TestExecProviderDoesNotWarn(t *testing.T) {
 	defer restore()
 
 	provider, _ := echoProvider(t, dir, "value")
-	if _, err := startWith(t, dir, provider, map[string]Reference{"a": "totem/a"}, nil); err != nil {
+	if _, err := startWith(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if stderr.Len() != 0 {
@@ -398,7 +398,7 @@ func TestCheckSecretFileRefusesAnotherUsersFile(t *testing.T) {
 
 func TestFileProviderRefusesAnOversizedSecret(t *testing.T) {
 	dir := sandbox(t)
-	cfg := fileConfig(t, dir, map[string]Reference{"a": "totem/a"})
+	cfg := fileConfig(t, dir, map[string]Secret{"a": Rotating("totem/a")})
 	writeSecret(t, cfg.File.Dir, "totem/a", strings.Repeat("x", MaxValueSize+1), 0o600)
 	s, err := newForTest(cfg, os.Geteuid())
 	if err != nil {
@@ -412,7 +412,7 @@ func TestFileProviderRefusesAnOversizedSecret(t *testing.T) {
 
 func TestFileProviderAcceptsASecretAtTheSizeLimit(t *testing.T) {
 	dir := sandbox(t)
-	cfg := fileConfig(t, dir, map[string]Reference{"a": "totem/a"})
+	cfg := fileConfig(t, dir, map[string]Secret{"a": Rotating("totem/a")})
 	writeSecret(t, cfg.File.Dir, "totem/a", strings.Repeat("x", MaxValueSize), 0o600)
 	s, err := newForTest(cfg, os.Geteuid())
 	if err != nil {

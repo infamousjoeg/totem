@@ -36,7 +36,7 @@ func waitForValue(t *testing.T, s *Summoner, ref Reference, want string, within 
 func TestRotationOnTheInterval(t *testing.T) {
 	dir := sandbox(t)
 	provider := countingProvider(t, dir)
-	s, err := startWith(t, dir, provider, map[string]Reference{"a": "totem/a"}, func(c *Config) {
+	s, err := startWith(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")}, func(c *Config) {
 		c.RotateEvery = 40 * time.Millisecond
 		c.RetireAfter = 10 * time.Millisecond
 	})
@@ -52,7 +52,7 @@ func TestRotationOnTheInterval(t *testing.T) {
 func TestRotationOnSIGHUP(t *testing.T) {
 	dir := sandbox(t)
 	provider := countingProvider(t, dir)
-	s, err := startWith(t, dir, provider, map[string]Reference{"a": "totem/a"}, func(c *Config) {
+	s, err := startWith(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")}, func(c *Config) {
 		c.RotateEvery = time.Hour // only a HUP can rotate this one
 		c.RetireAfter = 10 * time.Millisecond
 	})
@@ -78,7 +78,7 @@ func TestRotationFailureKeepsThePreviousValue(t *testing.T) {
 	provider := providerScript(t, dir, "provider", fmt.Sprintf(
 		"if [ -f %q ]; then echo 'vault is sealed' >&2; exit 1; fi\nprintf 'good-value'\n", sealed))
 	var buf logBuffer
-	s, err := startWith(t, dir, provider, map[string]Reference{"a": "totem/a"}, func(c *Config) {
+	s, err := startWith(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")}, func(c *Config) {
 		c.Logger = buf.logger()
 		c.RotateEvery = time.Hour
 	})
@@ -110,7 +110,7 @@ func TestRotationFailureKeepsThePreviousValue(t *testing.T) {
 func TestRotationRefusesAnUnsafeProvider(t *testing.T) {
 	dir := sandbox(t)
 	provider := countingProvider(t, dir)
-	s, err := startWith(t, dir, provider, map[string]Reference{"a": "totem/a"}, func(c *Config) {
+	s, err := startWith(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")}, func(c *Config) {
 		c.RotateEvery = time.Hour
 	})
 	if err != nil {
@@ -158,7 +158,7 @@ printf '%%s' "$n" > %[1]q
 if [ "$n" -gt 1 ]; then sleep 2; fi
 printf 'value-%%s' "$n"
 `, counter))
-	s, err := startWith(t, dir, provider, map[string]Reference{"a": "totem/a"}, func(c *Config) {
+	s, err := startWith(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")}, func(c *Config) {
 		c.RotateEvery = time.Hour
 		c.Timeout = 10 * time.Second
 	})

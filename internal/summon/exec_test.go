@@ -12,7 +12,7 @@ import (
 
 // startWith builds a Summoner around a fake provider and starts it, or reports
 // why it would not start.
-func startWith(t *testing.T, dir, provider string, refs map[string]Reference, tune func(*Config)) (*Summoner, error) {
+func startWith(t *testing.T, dir, provider string, refs map[string]Secret, tune func(*Config)) (*Summoner, error) {
 	t.Helper()
 	cfg := testConfig(t, dir, provider, refs)
 	if tune != nil {
@@ -40,7 +40,7 @@ func TestProviderRunsWithACleanEnvironment(t *testing.T) {
 	t.Setenv("TOTEM_SECRET_LEAK", "should-not-be-visible")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "should-not-be-visible")
 
-	if _, err := startWith(t, dir, provider, map[string]Reference{"a": "totem/a"}, nil); err != nil {
+	if _, err := startWith(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")}, nil); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(out)
@@ -89,7 +89,7 @@ func TestProviderTimeoutKillsTheProcessGroup(t *testing.T) {
 	dir := sandbox(t)
 	provider := providerScript(t, dir, "provider", "sleep 30 &\nsleep 30\n")
 	start := time.Now()
-	_, err := startWith(t, dir, provider, map[string]Reference{"a": "totem/a"}, func(c *Config) {
+	_, err := startWith(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")}, func(c *Config) {
 		c.Timeout = 300 * time.Millisecond
 	})
 	elapsed := time.Since(start)
@@ -107,7 +107,7 @@ func TestProviderTimeoutKillsTheProcessGroup(t *testing.T) {
 func TestProviderNonZeroExitCarriesStderr(t *testing.T) {
 	dir := sandbox(t)
 	provider := providerScript(t, dir, "provider", "echo 'conjur: variable not found' >&2\nexit 7\n")
-	_, err := startWith(t, dir, provider, map[string]Reference{"a": "totem/a"}, nil)
+	_, err := startWith(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")}, nil)
 	if err == nil {
 		t.Fatal("a failing provider should not have started the issuer")
 	}
@@ -124,7 +124,7 @@ func TestProviderStderrIsSanitizedAndBounded(t *testing.T) {
 	dir := sandbox(t)
 	provider := providerScript(t, dir, "provider",
 		"printf 'bad\\033[31m\\nlevel=ERROR forged\\n' >&2\nhead -c 20000 /dev/zero | tr '\\0' 'x' >&2\nexit 1\n")
-	_, err := startWith(t, dir, provider, map[string]Reference{"a": "totem/a"}, nil)
+	_, err := startWith(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")}, nil)
 	if err == nil {
 		t.Fatal("expected a failure")
 	}
@@ -144,7 +144,7 @@ func TestProviderOversizedValueRefused(t *testing.T) {
 	dir := sandbox(t)
 	provider := providerScript(t, dir, "provider",
 		fmt.Sprintf("head -c %d /dev/zero | tr '\\0' 'x'\n", MaxValueSize+100))
-	_, err := startWith(t, dir, provider, map[string]Reference{"a": "totem/a"}, nil)
+	_, err := startWith(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")}, nil)
 	if err == nil {
 		t.Fatal("an oversized value should have been refused")
 	}
@@ -157,7 +157,7 @@ func TestProviderValueAtTheSizeLimitIsAccepted(t *testing.T) {
 	dir := sandbox(t)
 	provider := providerScript(t, dir, "provider",
 		fmt.Sprintf("head -c %d /dev/zero | tr '\\0' 'x'\n", MaxValueSize))
-	s, err := startWith(t, dir, provider, map[string]Reference{"a": "totem/a"}, nil)
+	s, err := startWith(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")}, nil)
 	if err != nil {
 		t.Fatalf("a value exactly at the limit was refused: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestProviderValueAtTheSizeLimitIsAccepted(t *testing.T) {
 func TestProviderEmptyValueRefused(t *testing.T) {
 	dir := sandbox(t)
 	provider := providerScript(t, dir, "provider", "exit 0\n")
-	_, err := startWith(t, dir, provider, map[string]Reference{"a": "totem/a"}, nil)
+	_, err := startWith(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")}, nil)
 	if err == nil {
 		t.Fatal("an empty value should have been refused")
 	}
@@ -189,7 +189,7 @@ func TestProviderReceivesTheReferenceAsItsOnlyArgument(t *testing.T) {
 	out := filepath.Join(dir, "argv.txt")
 	body := fmt.Sprintf("printf '%%s|%%s\\n' \"$#\" \"$1\" > %q\nprintf 'v'\n", out)
 	provider := providerScript(t, dir, "provider", body)
-	if _, err := startWith(t, dir, provider, map[string]Reference{"gh": "totem/github-app"}, nil); err != nil {
+	if _, err := startWith(t, dir, provider, map[string]Secret{"gh": Rotating("totem/github-app")}, nil); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(out)
@@ -207,7 +207,7 @@ func TestProviderReceivesTheReferenceAsItsOnlyArgument(t *testing.T) {
 func TestProviderValueIsNotAltered(t *testing.T) {
 	dir := sandbox(t)
 	provider := providerScript(t, dir, "provider", "printf 'sk-ant-0123 \\n'\n")
-	s, err := startWith(t, dir, provider, map[string]Reference{"a": "totem/a"}, nil)
+	s, err := startWith(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -54,6 +54,90 @@ type FileProvider struct {
 	Dir string
 }
 
+// Rotation is the shape a reference's rotation has. It is a required property
+// of every configured secret, and it is deliberately impossible to leave
+// unstated: a Config carrying an undeclared rotation fails at load.
+//
+// The shape of a secret's rotation is a property of what CONSUMES the value,
+// not of this package, which only hands values out. Some references are
+// credentials a remote service will accept the moment they change, and those
+// benefit from frequent rotation. Others are used to seal material at rest,
+// and this package cannot re-seal that material: replacing such a value leaves
+// the running process working, because what it sealed is already open in
+// memory, and breaks the NEXT START, because what is on disk is still sealed
+// under a value that by then may be gone. That failure surfaces weeks after
+// the change that caused it, which is the worst diagnostic shape there is.
+//
+// Requiring the declaration is the point. The alternative is a default that is
+// right for most secrets and silently catastrophic for the rest, discovered
+// once per incident. A new secret with this property is now handled by the
+// design rather than by someone remembering.
+type Rotation int
+
+const (
+	// RotationUnset is the zero value and is not a legal declaration. A
+	// Config containing one is refused by New, naming the secret, because a
+	// forgotten declaration must fail at config load rather than at the first
+	// rotation that quietly does the wrong thing.
+	RotationUnset Rotation = iota
+
+	// RotationPull is pull-based rotation: the issuer re-resolves this
+	// reference on the interval and on SIGHUP, replaces it atomically, and
+	// nothing restarts. This is right for a credential presented to a remote
+	// service, where the new value works as soon as it exists.
+	RotationPull
+
+	// RotationSealsDataAtRest excludes a reference from pull-based rotation.
+	// The value is used to seal material on disk that this issuer has no way
+	// to re-seal, so replacing it on a timer is strictly harmful: the process
+	// keeps running on material it already unsealed, and the next start fails
+	// against files sealed under a value nobody kept.
+	//
+	// Such a reference is still resolved at start and still re-checked on
+	// every rotation cycle, but as a COMPARISON rather than a replacement. If
+	// the provider begins returning a different value, the issuer keeps
+	// serving the one its files are sealed under and says so loudly, on every
+	// cycle and on every resolve, for as long as the difference stands. That
+	// converts a silent brick into a visible alarm raised while the value in
+	// use is still in memory and can still be handed to a re-seal.
+	//
+	// Rotating one of these is a deliberate two-part operation: re-seal the
+	// material with the old and new values, then tell this package the reseal
+	// happened, with ResealCompleted.
+	RotationSealsDataAtRest
+)
+
+// String names a Rotation for logs and errors.
+func (r Rotation) String() string {
+	switch r {
+	case RotationPull:
+		return "pull"
+	case RotationSealsDataAtRest:
+		return "seals-data-at-rest"
+	default:
+		return "undeclared"
+	}
+}
+
+// Secret is one configured secret: the reference to resolve, and the rotation
+// shape that reference has.
+type Secret struct {
+	// Ref is the reference the provider is asked for.
+	Ref Reference
+	// Rotation is how this reference may be rotated. It must be declared.
+	Rotation Rotation
+}
+
+// Rotating declares a reference that takes part in pull-based rotation. Use it
+// for a credential a remote service accepts as soon as it changes.
+func Rotating(ref Reference) Secret { return Secret{Ref: ref, Rotation: RotationPull} }
+
+// Sealing declares a reference whose value seals material at rest, and which
+// is therefore excluded from pull-based rotation. Use it for anything that
+// encrypts something this issuer keeps on disk: the CA passphrase, the store's
+// data key, the backup passphrase.
+func Sealing(ref Reference) Secret { return Secret{Ref: ref, Rotation: RotationSealsDataAtRest} }
+
 // Config maps each secret name the issuer needs to a Reference. Config holds
 // references only; values are resolved through the Provider at use and held in
 // mlocked memory, with core dumps off and zeroing on replacement.
@@ -73,9 +157,10 @@ type Config struct {
 	// File configures the built-in file provider, used only when
 	// Provider.Path is empty.
 	File FileProvider
-	// Refs maps a logical secret name (e.g. "anthropic_api_key") to its
-	// Reference (e.g. "totem/anthropic").
-	Refs map[string]Reference
+	// Refs maps a logical secret name (e.g. "anthropic_api_key") to the
+	// Secret behind it: its Reference, and the rotation shape that reference
+	// has. Every entry must declare a rotation shape; see Rotation.
+	Refs map[string]Secret
 	// Timeout bounds a single provider execution. Zero means DefaultTimeout.
 	Timeout time.Duration
 	// RotateEvery is the pull-based rotation interval. Zero means
@@ -141,12 +226,20 @@ func (c *Config) validate() error {
 			return err
 		}
 	}
-	for name, ref := range c.Refs {
+	for name, sec := range c.Refs {
 		if name == "" {
 			return fmt.Errorf("summon: a reference is configured under an empty name")
 		}
-		if err := validateReference(ref); err != nil {
+		if err := validateReference(sec.Ref); err != nil {
 			return fmt.Errorf("%w (configured as %q)", err, name)
+		}
+		switch sec.Rotation {
+		case RotationPull, RotationSealsDataAtRest:
+		default:
+			return fmt.Errorf("summon: %q (%s) does not declare a rotation shape: "+
+				"use summon.Rotating for a credential a remote service accepts as soon as it changes, "+
+				"or summon.Sealing for a value that seals material this issuer keeps on disk and cannot re-seal on its own",
+				name, sec.Ref)
 		}
 	}
 	return nil

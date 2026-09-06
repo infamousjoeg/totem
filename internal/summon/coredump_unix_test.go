@@ -14,7 +14,7 @@ import (
 func TestStartDisablesCoreDumps(t *testing.T) {
 	dir := sandbox(t)
 	provider, _ := echoProvider(t, dir, "value")
-	cfg := testConfig(t, dir, provider, map[string]Reference{"a": "totem/a"})
+	cfg := testConfig(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")})
 	s, err := newForTest(cfg, os.Geteuid())
 	if err != nil {
 		t.Fatal(err)

@@ -18,10 +18,10 @@ import (
 func TestRefsAndRef(t *testing.T) {
 	dir := sandbox(t)
 	provider, _ := echoProvider(t, dir, "value")
-	refs := map[string]Reference{
-		"ca_passphrase":      "totem/ca-passphrase",
-		"anthropic_api_key":  "totem/anthropic",
-		"claude_oauth_token": "totem/claude-oauth",
+	refs := map[string]Secret{
+		"ca_passphrase":      Rotating("totem/ca-passphrase"),
+		"anthropic_api_key":  Rotating("totem/anthropic"),
+		"claude_oauth_token": Rotating("totem/claude-oauth"),
 	}
 	s, err := startWith(t, dir, provider, refs, nil)
 	if err != nil {
@@ -46,9 +46,9 @@ func TestStartFailsOnAReferenceTheProviderCannotResolve(t *testing.T) {
 	dir := sandbox(t)
 	provider := providerScript(t, dir, "provider",
 		"if [ \"$1\" = totem/present ]; then printf 'v'; else echo 'no such variable' >&2; exit 1; fi\n")
-	cfg := testConfig(t, dir, provider, map[string]Reference{
-		"present": "totem/present",
-		"missing": "totem/missing",
+	cfg := testConfig(t, dir, provider, map[string]Secret{
+		"present": Rotating("totem/present"),
+		"missing": Rotating("totem/missing"),
 	})
 	s, err := newForTest(cfg, os.Geteuid())
 	if err != nil {
@@ -66,7 +66,7 @@ func TestStartFailsOnAReferenceTheProviderCannotResolve(t *testing.T) {
 func TestResolveBeforeStart(t *testing.T) {
 	dir := sandbox(t)
 	provider, calls := echoProvider(t, dir, "value")
-	cfg := testConfig(t, dir, provider, map[string]Reference{"a": "totem/a"})
+	cfg := testConfig(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")})
 	s, err := newForTest(cfg, os.Geteuid())
 	if err != nil {
 		t.Fatal(err)
@@ -82,7 +82,7 @@ func TestResolveBeforeStart(t *testing.T) {
 func TestDoubleStartAndDoubleClose(t *testing.T) {
 	dir := sandbox(t)
 	provider, _ := echoProvider(t, dir, "value")
-	cfg := testConfig(t, dir, provider, map[string]Reference{"a": "totem/a"})
+	cfg := testConfig(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")})
 	s, err := newForTest(cfg, os.Geteuid())
 	if err != nil {
 		t.Fatal(err)
@@ -106,7 +106,7 @@ func TestDoubleStartAndDoubleClose(t *testing.T) {
 func TestConcurrentResolveAndRotate(t *testing.T) {
 	dir := sandbox(t)
 	provider := countingProvider(t, dir)
-	s, err := startWith(t, dir, provider, map[string]Reference{"a": "totem/a", "b": "totem/b"}, func(c *Config) {
+	s, err := startWith(t, dir, provider, map[string]Secret{"a": Rotating("totem/a"), "b": Rotating("totem/b")}, func(c *Config) {
 		c.RotateEvery = 20 * time.Millisecond
 		// Long enough that no forced wipe lands while a reader is using a
 		// value; the forced wipe has its own test.
@@ -276,7 +276,7 @@ func TestConfigValidation(t *testing.T) {
 			cfg: Config{
 				Path: filepath.Join(dir, "totem.yaml"),
 				File: FileProvider{Dir: dir},
-				Refs: map[string]Reference{"": "totem/a"},
+				Refs: map[string]Secret{"": Rotating("totem/a")},
 			},
 			want: "empty name",
 		},
@@ -296,7 +296,7 @@ func TestConfigValidation(t *testing.T) {
 func TestErrorReturnsAnEmptyValue(t *testing.T) {
 	dir := sandbox(t)
 	provider, _ := echoProvider(t, dir, "value")
-	cfg := testConfig(t, dir, provider, map[string]Reference{"a": "totem/a"})
+	cfg := testConfig(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")})
 	s, err := newForTest(cfg, os.Geteuid())
 	if err != nil {
 		t.Fatal(err)

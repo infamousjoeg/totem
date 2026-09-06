@@ -33,11 +33,18 @@ type Summoner struct {
 	// test that does not run as root.
 	trustedUID int
 
-	// byName maps a logical secret name to its reference; known is the set of
+	// byName maps a logical secret name to its Secret; known is the set of
 	// references this Summoner will resolve at all. A reference that is not
 	// configured is refused rather than passed through to the provider.
-	byName map[string]Reference
+	// nameOf goes back the other way so an alarm can name the secret the way
+	// the operator's config does.
+	byName map[string]Secret
 	known  map[Reference]bool
+	nameOf map[Reference]string
+	// sealed is the set of references declared RotationSealsDataAtRest. They
+	// are resolved at start and compared on every rotation cycle, but never
+	// replaced by one.
+	sealed map[Reference]bool
 
 	mu       sync.Mutex
 	rotateMu sync.Mutex
@@ -45,6 +52,9 @@ type Summoner struct {
 	closed   bool
 	fatal    error
 	cache    map[Reference]*secret
+	// drift holds the sealed references whose provider value no longer matches
+	// the value the issuer's on-disk material is sealed under.
+	drift    map[Reference]bool
 	timers   map[uint64]*time.Timer
 	timerSeq uint64
 
@@ -70,15 +80,22 @@ func New(cfg Config) (*Summoner, error) {
 		retireAfter: cfg.retireAfter(),
 		log:         cfg.logger(),
 		trustedUID:  rootUID,
-		byName:      make(map[string]Reference, len(cfg.Refs)),
+		byName:      make(map[string]Secret, len(cfg.Refs)),
 		known:       make(map[Reference]bool, len(cfg.Refs)),
+		nameOf:      make(map[Reference]string, len(cfg.Refs)),
+		sealed:      make(map[Reference]bool),
 		cache:       make(map[Reference]*secret, len(cfg.Refs)),
+		drift:       make(map[Reference]bool),
 		timers:      make(map[uint64]*time.Timer),
 		stop:        make(chan struct{}),
 	}
-	for name, ref := range cfg.Refs {
-		s.byName[name] = ref
-		s.known[ref] = true
+	for name, sec := range cfg.Refs {
+		s.byName[name] = sec
+		s.known[sec.Ref] = true
+		s.nameOf[sec.Ref] = name
+		if sec.Rotation == RotationSealsDataAtRest {
+			s.sealed[sec.Ref] = true
+		}
 	}
 	return s, nil
 }
@@ -120,13 +137,13 @@ func (s *Summoner) Start(ctx context.Context) error {
 		"references", len(s.known),
 		"rotate_every", s.rotateEvery.String())
 
-	for name, ref := range s.byName {
-		sec, err := s.fetch(ctx, ref)
+	for name, decl := range s.byName {
+		sec, err := s.fetch(ctx, decl.Ref)
 		if err != nil {
 			s.wipeAllLocked()
 			return fmt.Errorf("summon: resolving %s at start: %w", name, err)
 		}
-		s.cache[ref] = sec
+		s.cache[decl.Ref] = sec
 	}
 	// SIGHUP is registered here rather than inside the loop goroutine, so
 	// that by the time Start returns the signal is already being caught. A
@@ -199,6 +216,13 @@ func (s *Summoner) Resolve(ctx context.Context, ref Reference) (Value, error) {
 		"provider", s.providerName(),
 		"provider_sha256", hash,
 		"cached", cached)
+	if s.drift[ref] {
+		// Every single resolve, not once: the operator has to be able to see
+		// this from whatever they happen to be looking at, and the window in
+		// which the value in use is still in memory is the only window in
+		// which the fix is cheap.
+		s.log.Error(sealAlarm(s.nameOf[ref], ref))
+	}
 	return sec.acquire(), nil
 }
 
@@ -237,11 +261,11 @@ func (s *Summoner) Refs() []string {
 // ErrNoSuchReference. It is how a caller that knows it needs the CA passphrase
 // gets the reference to resolve without holding the config itself.
 func (s *Summoner) Ref(name string) (Reference, error) {
-	ref, ok := s.byName[name]
+	decl, ok := s.byName[name]
 	if !ok {
 		return "", fmt.Errorf("%w: %q", ErrNoSuchReference, name)
 	}
-	return ref, nil
+	return decl.Ref, nil
 }
 
 // Err reports the fatal error that stopped this Summoner, if any. The issuer
@@ -282,9 +306,9 @@ func (s *Summoner) Rotate(ctx context.Context) error {
 		s.mu.Unlock()
 		return fmt.Errorf("summon: not running")
 	}
-	names := make(map[string]Reference, len(s.byName))
-	for name, ref := range s.byName {
-		names[name] = ref
+	names := make(map[string]Secret, len(s.byName))
+	for name, decl := range s.byName {
+		names[name] = decl
 	}
 	s.mu.Unlock()
 
@@ -298,12 +322,17 @@ func (s *Summoner) Rotate(ctx context.Context) error {
 	}
 
 	var firstErr error
-	for name, ref := range names {
+	for name, decl := range names {
+		if decl.Rotation == RotationSealsDataAtRest {
+			// Not replaced, checked. See checkSealed.
+			s.checkSealed(ctx, name, decl.Ref)
+			continue
+		}
 		// The provider runs with no lock held, so resolves keep being served
 		// from the current values for as long as rotation takes.
-		sec, err := s.fetch(ctx, ref)
+		sec, err := s.fetch(ctx, decl.Ref)
 		if err != nil {
-			s.log.Error("summon: rotation kept the previous value", "name", name, "reference", string(ref), "error", err.Error())
+			s.log.Error("summon: rotation kept the previous value", "name", name, "reference", string(decl.Ref), "error", err.Error())
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -315,13 +344,157 @@ func (s *Summoner) Rotate(ctx context.Context) error {
 			sec.discard()
 			return firstErr
 		}
-		old := s.cache[ref]
-		s.cache[ref] = sec
+		old := s.cache[decl.Ref]
+		s.cache[decl.Ref] = sec
 		s.retireLocked(old)
 		s.mu.Unlock()
-		s.log.Info("summon: rotated", "name", name, "reference", string(ref))
+		s.log.Info("summon: rotated", "name", name, "reference", string(decl.Ref))
 	}
 	return firstErr
+}
+
+// checkSealed compares what the provider returns now for a sealed reference
+// with the value the issuer is running on, and REPLACES NOTHING.
+//
+// This is the detector for the failure that made the exclusion necessary. The
+// value seals material on disk. If it is replaced, the running process is fine
+// because that material is already open in memory, and the next start fails
+// against files sealed under a value that is by then unreachable. The operator
+// sees a CA that will not open and has no reason to connect it to a rotation
+// weeks earlier.
+//
+// So the cycle that would have replaced the value instead asks whether it
+// changed, and shouts if it did. The alarm is raised while the value in use is
+// still in memory, which is the difference between an inconvenience and a lost
+// CA: at that moment both halves of a re-seal are still available.
+//
+// A provider that cannot be reached is a warning, not an alarm and not a fatal
+// error: not knowing whether the value changed is a different thing from
+// knowing that it did.
+func (s *Summoner) checkSealed(ctx context.Context, name string, ref Reference) {
+	probe, err := s.fetch(ctx, ref)
+	if err != nil {
+		s.log.Warn("summon: could not check a sealed secret for drift",
+			"name", name, "reference", string(ref), "error", err.Error())
+		return
+	}
+	s.mu.Lock()
+	cur, ok := s.cache[ref]
+	same := ok && cur.sameAs(probe)
+	if same {
+		delete(s.drift, ref)
+	} else {
+		s.drift[ref] = true
+	}
+	s.mu.Unlock()
+	// The probe never becomes a served value and never outlives this check.
+	probe.discard()
+
+	if same {
+		s.log.Debug("summon: sealed secret unchanged", "name", name, "reference", string(ref))
+		return
+	}
+	s.log.Error(sealAlarm(name, ref))
+}
+
+// sealAlarm is the one wording for the drift alarm, so the rotation cycle and
+// every resolve say the same thing. It names the secret and the fix and
+// carries no part of either value.
+func sealAlarm(name string, ref Reference) string {
+	if name == "" {
+		name = string(ref)
+	}
+	return "summon: SEALED SECRET CHANGED: the provider now returns a different value for " + name +
+		" (" + string(ref) + "), but the material this issuer keeps on disk is still sealed under the value in use. " +
+		"THIS ISSUER WILL NOT RESTART until that material is re-sealed. Re-seal it now, while the value in use is still in memory " +
+		"(for the CA passphrase: `totem issuer reseal-ca`), then confirm the reseal so the new value is adopted. " +
+		"Until then the old value is being served and nothing has been replaced."
+}
+
+// Drifted returns the logical names of sealed secrets whose provider value no
+// longer matches the value in use, sorted. `issuer status` and `doctor` surface
+// it, so the alarm is visible to someone who is looking rather than only to
+// someone reading logs.
+func (s *Summoner) Drifted() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	names := make([]string, 0, len(s.drift))
+	for ref := range s.drift {
+		if n, ok := s.nameOf[ref]; ok {
+			names = append(names, n)
+		} else {
+			names = append(names, string(ref))
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// ResealCompleted adopts the provider's current value for a sealed secret and
+// clears its alarm. It is the second half of rotating a value that seals
+// material at rest, and it is called only after the FIRST half has actually
+// happened: the material on disk has been re-sealed under the new value.
+//
+// Nothing calls this on its own. An automatic adoption would be the very
+// rotation this exclusion exists to prevent, just with extra steps: it would
+// leave the running process fine and the next start broken. It exists so that
+// `totem issuer reseal-ca`, having re-sealed the CA key files, can tell this
+// package the world changed underneath it.
+//
+// Calling it without having re-sealed anything is how you brick the issuer by
+// hand. The refusal it cannot make for you is the one where you have not.
+func (s *Summoner) ResealCompleted(ctx context.Context, name string) error {
+	s.rotateMu.Lock()
+	defer s.rotateMu.Unlock()
+
+	s.mu.Lock()
+	if s.fatal != nil {
+		err := s.fatal
+		s.mu.Unlock()
+		return err
+	}
+	if !s.started || s.closed {
+		s.mu.Unlock()
+		return fmt.Errorf("summon: not running")
+	}
+	decl, ok := s.byName[name]
+	if !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("%w: %q", ErrNoSuchReference, name)
+	}
+	if decl.Rotation != RotationSealsDataAtRest {
+		s.mu.Unlock()
+		return fmt.Errorf("summon: %q is declared %s, not a secret that seals material at rest; it rotates on its own and needs no reseal", name, decl.Rotation)
+	}
+	wasDrifted := s.drift[decl.Ref]
+	s.mu.Unlock()
+
+	if err := s.checkHardening(); err != nil {
+		s.poison(err)
+		return err
+	}
+	if _, err := s.verifyPin(); err != nil {
+		s.poison(err)
+		return err
+	}
+	sec, err := s.fetch(ctx, decl.Ref)
+	if err != nil {
+		return fmt.Errorf("summon: resolving %s after a reseal: %w", name, err)
+	}
+	s.mu.Lock()
+	if s.closed || s.fatal != nil {
+		s.mu.Unlock()
+		sec.discard()
+		return fmt.Errorf("summon: not running")
+	}
+	old := s.cache[decl.Ref]
+	s.cache[decl.Ref] = sec
+	delete(s.drift, decl.Ref)
+	s.retireLocked(old)
+	s.mu.Unlock()
+	s.log.Warn("summon: reseal confirmed, the new value is now in use",
+		"name", name, "reference", string(decl.Ref), "was_drifted", wasDrifted)
+	return nil
 }
 
 // Close stops rotation and zeroes every value this Summoner holds.

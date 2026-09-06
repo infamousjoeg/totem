@@ -12,6 +12,13 @@ import (
 // makes the lock and the later zeroing apply to the bytes the secret is
 // actually stored in.
 //
+// The limit of what this proves, stated here rather than only in a review
+// comment, because the temptation to upgrade it later is real: a successful
+// mlock means the SYSCALL RETURNED NIL. There is no portable way from
+// userspace to assert that a page is actually resident and locked, so that is
+// as far as any claim about this memory may go. Do not restate it as a
+// guarantee that the secret never reaches swap.
+//
 // A failed mlock is an error, not a warning. On Linux, RLIMIT_MEMLOCK can be
 // low enough to refuse even one page; the honest outcome there is a resolve
 // that fails and names the reason, so the operator raises the limit, rather

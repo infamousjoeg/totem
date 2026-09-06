@@ -31,7 +31,7 @@ printf 'value-%%s' "$n"
 func TestSupersededValueSurvivesTheInFlightWindow(t *testing.T) {
 	dir := sandbox(t)
 	provider := countingProvider(t, dir)
-	s, err := startWith(t, dir, provider, map[string]Reference{"a": "totem/a"}, func(c *Config) {
+	s, err := startWith(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")}, func(c *Config) {
 		c.RetireAfter = 2 * time.Second
 	})
 	if err != nil {
@@ -71,7 +71,7 @@ func TestSupersededValueSurvivesTheInFlightWindow(t *testing.T) {
 func TestCachedValueIsZeroedAfterTheRetireWindow(t *testing.T) {
 	dir := sandbox(t)
 	provider := countingProvider(t, dir)
-	s, err := startWith(t, dir, provider, map[string]Reference{"a": "totem/a"}, func(c *Config) {
+	s, err := startWith(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")}, func(c *Config) {
 		c.RetireAfter = 50 * time.Millisecond
 	})
 	if err != nil {
@@ -106,7 +106,7 @@ func TestCachedValueIsZeroedAfterTheRetireWindow(t *testing.T) {
 func TestReleasedSupersededValueIsZeroedAtOnce(t *testing.T) {
 	dir := sandbox(t)
 	provider := countingProvider(t, dir)
-	s, err := startWith(t, dir, provider, map[string]Reference{"a": "totem/a"}, func(c *Config) {
+	s, err := startWith(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")}, func(c *Config) {
 		c.RetireAfter = time.Hour // long enough that only the release can wipe it
 	})
 	if err != nil {
@@ -129,7 +129,7 @@ func TestReleasedSupersededValueIsZeroedAtOnce(t *testing.T) {
 func TestZeroIsIdempotent(t *testing.T) {
 	dir := sandbox(t)
 	provider, _ := echoProvider(t, dir, "value")
-	s, err := startWith(t, dir, provider, map[string]Reference{"a": "totem/a"}, nil)
+	s, err := startWith(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestZeroIsIdempotent(t *testing.T) {
 func TestCloseZeroesEveryValue(t *testing.T) {
 	dir := sandbox(t)
 	provider, _ := echoProvider(t, dir, "value")
-	cfg := testConfig(t, dir, provider, map[string]Reference{"a": "totem/a"})
+	cfg := testConfig(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")})
 	s, err := newForTest(cfg, os.Geteuid())
 	if err != nil {
 		t.Fatal(err)
@@ -191,7 +191,7 @@ func TestMemoryLockFailureIsFatal(t *testing.T) {
 	})
 	defer restore()
 
-	cfg := testConfig(t, dir, provider, map[string]Reference{"a": "totem/a"})
+	cfg := testConfig(t, dir, provider, map[string]Secret{"a": Rotating("totem/a")})
 	s, err := newForTest(cfg, os.Geteuid())
 	if err != nil {
 		t.Fatal(err)
@@ -218,7 +218,7 @@ func TestEveryValueComesFromTheLockingAllocator(t *testing.T) {
 	})
 	defer restore()
 
-	s, err := startWith(t, dir, provider, map[string]Reference{"a": "totem/a", "b": "totem/b"}, nil)
+	s, err := startWith(t, dir, provider, map[string]Secret{"a": Rotating("totem/a"), "b": Rotating("totem/b")}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

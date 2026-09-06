@@ -111,7 +111,7 @@ func writeConfigFile(t *testing.T, dir string) string {
 
 // testConfig wires a Config around a fake provider with the hash pinned, which
 // is what `totem issuer init` would have done.
-func testConfig(t *testing.T, dir, provider string, refs map[string]Reference) Config {
+func testConfig(t *testing.T, dir, provider string, refs map[string]Secret) Config {
 	t.Helper()
 	hash, err := trustProviderForTest(provider, os.Geteuid())
 	if err != nil {

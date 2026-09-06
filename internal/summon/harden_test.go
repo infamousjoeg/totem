@@ -201,7 +201,7 @@ func TestResolveRechecksHardeningOnEveryResolve(t *testing.T) {
 		t.Fatal(err)
 	}
 	provider, _ := echoProvider(t, libdir, "secret-value")
-	cfg := testConfig(t, dir, provider, map[string]Reference{"anthropic": "totem/anthropic"})
+	cfg := testConfig(t, dir, provider, map[string]Secret{"anthropic": Rotating("totem/anthropic")})
 	s, err := newForTest(cfg, os.Geteuid())
 	if err != nil {
 		t.Fatal(err)
@@ -238,7 +238,7 @@ func TestResolveRechecksHardeningOnEveryResolve(t *testing.T) {
 func TestResolveRechecksConfigFile(t *testing.T) {
 	dir := sandbox(t)
 	provider, _ := echoProvider(t, dir, "value")
-	cfg := testConfig(t, dir, provider, map[string]Reference{"anthropic": "totem/anthropic"})
+	cfg := testConfig(t, dir, provider, map[string]Secret{"anthropic": Rotating("totem/anthropic")})
 	s, err := newForTest(cfg, os.Geteuid())
 	if err != nil {
 		t.Fatal(err)
@@ -265,7 +265,7 @@ func TestResolveRechecksConfigFile(t *testing.T) {
 func TestStartRefusesUnsafeProvider(t *testing.T) {
 	dir := sandbox(t)
 	provider, calls := echoProvider(t, dir, "value")
-	cfg := testConfig(t, dir, provider, map[string]Reference{"anthropic": "totem/anthropic"})
+	cfg := testConfig(t, dir, provider, map[string]Secret{"anthropic": Rotating("totem/anthropic")})
 	// The pin is taken while the provider is still safe, exactly as `issuer
 	// init` would have done; the binary goes world-writable afterwards.
 	if err := os.Chmod(provider, 0o777); err != nil {
@@ -290,7 +290,7 @@ func TestProductionStartRequiresRootOwnedProvider(t *testing.T) {
 	}
 	dir := sandbox(t)
 	provider, calls := echoProvider(t, dir, "value")
-	cfg := testConfig(t, dir, provider, map[string]Reference{"anthropic": "totem/anthropic"})
+	cfg := testConfig(t, dir, provider, map[string]Secret{"anthropic": Rotating("totem/anthropic")})
 	s, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)

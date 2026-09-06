@@ -14,7 +14,7 @@ import (
 func TestResolveRefusesSwappedProvider(t *testing.T) {
 	dir := sandbox(t)
 	provider, _ := echoProvider(t, dir, "original-value")
-	cfg := testConfig(t, dir, provider, map[string]Reference{"anthropic": "totem/anthropic"})
+	cfg := testConfig(t, dir, provider, map[string]Secret{"anthropic": Rotating("totem/anthropic")})
 	pinned := cfg.Provider.PinnedHash
 	s, err := newForTest(cfg, os.Geteuid())
 	if err != nil {
@@ -52,7 +52,7 @@ func TestResolveRefusesSwappedProvider(t *testing.T) {
 func TestMismatchNeverRepins(t *testing.T) {
 	dir := sandbox(t)
 	provider, _ := echoProvider(t, dir, "original-value")
-	cfg := testConfig(t, dir, provider, map[string]Reference{"anthropic": "totem/anthropic"})
+	cfg := testConfig(t, dir, provider, map[string]Secret{"anthropic": Rotating("totem/anthropic")})
 	pinned := cfg.Provider.PinnedHash
 	s, err := newForTest(cfg, os.Geteuid())
 	if err != nil {
@@ -83,7 +83,7 @@ func TestMismatchNeverRepins(t *testing.T) {
 func TestUntrustedProviderWipesCachedValues(t *testing.T) {
 	dir := sandbox(t)
 	provider, _ := echoProvider(t, dir, "original-value")
-	cfg := testConfig(t, dir, provider, map[string]Reference{"anthropic": "totem/anthropic"})
+	cfg := testConfig(t, dir, provider, map[string]Secret{"anthropic": Rotating("totem/anthropic")})
 	s, err := newForTest(cfg, os.Geteuid())
 	if err != nil {
 		t.Fatal(err)
@@ -156,7 +156,7 @@ func TestTrustProviderMatchesTheHashResolveChecks(t *testing.T) {
 func TestNewRefusesMissingOrMalformedPin(t *testing.T) {
 	dir := sandbox(t)
 	provider, _ := echoProvider(t, dir, "value")
-	base := testConfig(t, dir, provider, map[string]Reference{"anthropic": "totem/anthropic"})
+	base := testConfig(t, dir, provider, map[string]Secret{"anthropic": Rotating("totem/anthropic")})
 
 	cases := []struct {
 		name string
@@ -182,7 +182,7 @@ func TestNewRefusesMissingOrMalformedPin(t *testing.T) {
 func TestResolveLogsTheProviderHash(t *testing.T) {
 	dir := sandbox(t)
 	provider, _ := echoProvider(t, dir, "value")
-	cfg := testConfig(t, dir, provider, map[string]Reference{"anthropic": "totem/anthropic"})
+	cfg := testConfig(t, dir, provider, map[string]Secret{"anthropic": Rotating("totem/anthropic")})
 	var buf logBuffer
 	cfg.Logger = buf.logger()
 	s, err := newForTest(cfg, os.Geteuid())

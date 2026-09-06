@@ -69,7 +69,7 @@ func TestValidateReferenceRefuses(t *testing.T) {
 func TestResolveValidatesBeforeExec(t *testing.T) {
 	dir := sandbox(t)
 	provider, calls := echoProvider(t, dir, "value")
-	cfg := testConfig(t, dir, provider, map[string]Reference{"anthropic": "totem/anthropic"})
+	cfg := testConfig(t, dir, provider, map[string]Secret{"anthropic": Rotating("totem/anthropic")})
 	s, err := newForTest(cfg, os.Geteuid())
 	if err != nil {
 		t.Fatal(err)
@@ -99,7 +99,7 @@ func TestResolveValidatesBeforeExec(t *testing.T) {
 func TestResolveRefusesUnconfiguredReference(t *testing.T) {
 	dir := sandbox(t)
 	provider, calls := echoProvider(t, dir, "value")
-	cfg := testConfig(t, dir, provider, map[string]Reference{"anthropic": "totem/anthropic"})
+	cfg := testConfig(t, dir, provider, map[string]Secret{"anthropic": Rotating("totem/anthropic")})
 	s, err := newForTest(cfg, os.Geteuid())
 	if err != nil {
 		t.Fatal(err)
@@ -123,7 +123,7 @@ func TestResolveRefusesUnconfiguredReference(t *testing.T) {
 func TestNewRefusesBadReferenceInConfig(t *testing.T) {
 	dir := sandbox(t)
 	provider, _ := echoProvider(t, dir, "value")
-	cfg := testConfig(t, dir, provider, map[string]Reference{"anthropic": "-totem/anthropic"})
+	cfg := testConfig(t, dir, provider, map[string]Secret{"anthropic": Rotating("-totem/anthropic")})
 	if _, err := New(cfg); !errors.Is(err, ErrBadReference) {
 		t.Fatalf("New with a bad reference = %v, want ErrBadReference", err)
 	}
