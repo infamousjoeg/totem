@@ -133,11 +133,17 @@ type Enrolled struct {
 //
 // The challenge must have been minted for PreEnrollmentDeviceID(in.
 // DevicePublicKey) and the assertion must name that DeviceID, EnrollmentTool,
-// and issuer as its target. A presence key without an assertion, an
-// assertion without a presence key, or an assertion over a different
-// challenge are each their own rejection. Like Verify, a failed Enroll has
-// spent the challenge.
-func (v *Verifier) Enroll(in EnrollmentInput, sig []byte, a *Assertion, issuer string) (*Enrolled, error) {
+// and trustDomain as its target. trustDomain is the issuer's own configured
+// trust domain (its hostname by default, or the explicit value an IP-only
+// issuer was given at init): the one string both sides agree on before
+// enrollment finishes, and what the human reads in the prompt ("this device
+// is joining <name>"). It is never the dialed URL or address, which
+// legitimately differs per device and per network path. The issuer passes
+// its own value here and never a value the device sent. A presence key
+// without an assertion, an assertion without a presence key, or an assertion
+// over a different challenge are each their own rejection. Like Verify, a
+// failed Enroll has spent the challenge.
+func (v *Verifier) Enroll(in EnrollmentInput, sig []byte, a *Assertion, trustDomain string) (*Enrolled, error) {
 	if in.Version != EncodingVersion {
 		return nil, fmt.Errorf("%w: %d", ErrUnsupportedVersion, in.Version)
 	}
@@ -193,7 +199,7 @@ func (v *Verifier) Enroll(in EnrollmentInput, sig []byte, a *Assertion, issuer s
 		PresenceKey: presenceKey,
 		DeviceID:    deviceID,
 		Tool:        EnrollmentTool,
-		Target:      issuer,
+		Target:      trustDomain,
 		Binding:     BindingRequired,
 		RequestHash: digest,
 	}, now)
