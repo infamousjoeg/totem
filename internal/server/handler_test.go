@@ -3,12 +3,18 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -529,3 +535,41 @@ func mustJSON(t *testing.T, v any) []byte {
 	}
 	return b
 }
+
+// attestedTLS synthesises the connection state an enrolled device's credential
+// produces: one verified chain whose leaf carries a totem SPIFFE URI SAN.
+//
+// The chain is built rather than verified, deliberately and narrowly. What is
+// under test here is what the HANDLER does once a caller is attested, and the
+// TLS layer's own verification is covered separately by TestFrontDoorOverRealTLS
+// against a real listener. The leaf is a real certificate with real DER, so
+// policy.AttestPeer parses the same bytes it would in production; nothing here
+// stands in for the decision that the chain was trustworthy.
+func attestedTLS(t *testing.T) *tls.ConnectionState {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uri, err := url.Parse("spiffe://" + testTrustDomain + "/device/" + attestedDeviceID + "/tool/totem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		URIs:         []*url.URL{uri},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &tls.ConnectionState{VerifiedChains: [][]*x509.Certificate{{leaf}}}
+}
+
+const attestedDeviceID = "aa11bb22cc33dd44"
