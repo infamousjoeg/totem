@@ -27,6 +27,43 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # EVIDENCE CAPTURE, temporary. internal/attest refuses an Apple-platform
+      # binary whose leaf carries an organizational unit, on the stated grounds
+      # that platform binaries have none. That claim is false: this runner pool
+      # serves several macOS images, and an older one signs /bin/zsh with a leaf
+      # carrying OU "Apple Software" while a newer one carries no OU at all. Both
+      # are genuine Apple platform leaves and the kernel certifies both.
+      #
+      # No machine we own can produce the older certificate, so the fix cannot be
+      # validated locally against the real artifact, only against a corrected
+      # assumption, which is the same mistake one layer up. This step brings the
+      # evidence back: it prints the leaf's subject, its extension OIDs, and the
+      # DER as base64 so the certificate can be reconstructed and pinned as a
+      # test fixture.
+      #
+      # It runs on EVERY run, pass or fail, because the run that draws the older
+      # image may well be one where nothing else went wrong. Delete this step
+      # once both variants are pinned as fixtures and the tests no longer read
+      # the host's own binaries.
+      - name: capture the apple platform signing leaf
+        if: always()
+        run: |
+          echo "runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          sw_vers
+          codesign -dv --verbose=4 /bin/zsh 2>&1 | sed 's/^/  /' || true
+          d=$(mktemp -d)
+          codesign -d --extract-certificates="$d/leaf_" /bin/zsh >/dev/null 2>&1 || true
+          if [ ! -f "$d/leaf_0" ]; then
+            echo "could not extract a leaf certificate from /bin/zsh"
+            exit 0
+          fi
+          echo "--- subject and issuer ---"
+          openssl x509 -inform DER -in "$d/leaf_0" -noout -subject -issuer
+          echo "--- extension OIDs ---"
+          openssl asn1parse -inform DER -in "$d/leaf_0" | grep -i 'OBJECT' | sed 's/^/  /'
+          echo "--- leaf DER, base64 (reconstruct with: base64 -d > leaf.der) ---"
+          base64 < "$d/leaf_0"
+
       - name: gofmt
         run: |
           unformatted=$(gofmt -l .)
