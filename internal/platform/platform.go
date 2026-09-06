@@ -37,14 +37,46 @@ type Prompt struct {
 	Target string
 	// DeviceID is the enrolled device the key belongs to.
 	DeviceID string
+	// RequestCode is the short code the CLI printed for a presence:always
+	// target, shown verbatim in the prompt so the human can compare what their
+	// terminal said against what the OS is asking them to approve. A malicious
+	// caller owns its own TTY, so the code is only meaningful because it
+	// appears in a prompt the caller cannot draw. Empty for windowed targets.
+	RequestCode string
 }
 
 // Key is one device key. The private half never leaves hardware on a hardware
 // protection level; Sign is the only operation that uses it.
 type Key interface {
-	// Public returns the public half, which is what the issuer enrolled and
-	// what it re-checks silently on every renewal.
+	// Public returns the device key's public half: what the issuer enrolled and
+	// what it re-checks silently on every device-SVID renewal at half-life.
 	Public() crypto.PublicKey
+
+	// PresencePublic returns the public half of the key that signs presence
+	// assertions.
+	//
+	// These are two keys on Apple silicon, and the spec allows it: "the device
+	// key, or a companion key, is created with a user-presence access control."
+	// A Secure Enclave key whose ACL carries user presence is gated by the SEP
+	// on EVERY signature, with no flag or LAContext trick to bypass it, so one
+	// such key cannot also serve the silent renewal the spec requires. The
+	// honest split is a device key with no presence ACL that signs renewals,
+	// and a companion key with a user-presence ACL that signs assertions. Both
+	// are Secure Enclave resident and non-exportable, so the theft claim holds
+	// for both, and the presence claim holds for the companion because its gate
+	// is in the key's access control rather than in our control flow.
+	//
+	// On levels where a single key does both, this returns the same value as
+	// Public(). It returns nil ONLY when the level has no presence capability
+	// at all, in which case Sign with Prompt.Required==true returns
+	// ErrPresenceUnavailable.
+	//
+	// This is a required method, not an optional interface a caller discovers
+	// by type assertion, because the failure mode of a forgotten assertion is
+	// silent and severe: enrollment would record only the device key, and every
+	// presence assertion would then verify against the wrong public half.
+	// Enrollment MUST send both halves to the issuer.
+	PresencePublic() crypto.PublicKey
 
 	// Sign produces a signature over challenge. The challenge is issuer-minted
 	// and one-shot; nothing replayable is ever held on the laptop. When
