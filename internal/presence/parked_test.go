@@ -121,6 +121,63 @@ func TestIrreversibleLifecycle(t *testing.T) {
 	}
 }
 
+// One Verified approves one parked request, even when two carry the same
+// request hash. (Reviewer M1, inverted.)
+func TestOneProofApprovesOneRequest(t *testing.T) {
+	clk, l := newLot(t)
+	a, h := park(t, l, Irreversible, "send $50 to bob")
+	b, _ := park(t, l, Irreversible, "send $50 to bob")
+	v := verified("d", clk.Now(), h)
+	if err := l.Approve(a, v); err != nil {
+		t.Fatal(err)
+	}
+	mustErr(t, l.Approve(b, v), ErrPresenceConsumed)
+	if item, _ := l.Poll(b); item.State != ParkedPending {
+		t.Fatalf("second request moved to %s on a spent proof", item.State)
+	}
+	// A refused approval does not spend the proof.
+	fresh := verified("d", clk.Now(), HashRequest([]byte("other")))
+	mustErr(t, l.Approve(b, fresh), ErrRequestHashMismatch)
+	if fresh.Used() {
+		t.Fatal("refused approval consumed the proof")
+	}
+	// Batch consumes once for the whole batch, and a spent proof cannot
+	// approve a second batch.
+	r1, _ := park(t, l, Reversible, "r1")
+	r2, _ := park(t, l, Reversible, "r2")
+	bv := verified("d", clk.Now(), BatchHash([]string{r1, r2}))
+	if err := l.ApproveBatch([]string{r1, r2}, bv); err != nil {
+		t.Fatal(err)
+	}
+	if !bv.Used() {
+		t.Fatal("batch did not consume its proof")
+	}
+	// A batch proof is bound to its sorted ids, so it can only ever match
+	// the same batch again, which is no longer pending; consume is the
+	// belt-and-braces behind that hash binding.
+	mustErr(t, l.ApproveBatch([]string{r1, r2}, bv), ErrParkedNotPending)
+}
+
+// Pending requests are capped per agent. (Reviewer L1.)
+func TestParkPerAgentCap(t *testing.T) {
+	clk, l := newLot(t)
+	for i := range MaxPendingPerAgent {
+		if _, err := l.Park("a", "g", Reversible, "x", HashRequest([]byte{byte(i)})); err != nil {
+			t.Fatalf("park %d: %v", i, err)
+		}
+	}
+	_, err := l.Park("a", "g", Reversible, "x", HashRequest([]byte("over")))
+	mustErr(t, err, ErrTooManyParked)
+	if _, err := l.Park("b", "g", Reversible, "x", HashRequest([]byte("other agent"))); err != nil {
+		t.Fatalf("cap leaked across agents: %v", err)
+	}
+	// Expiry frees the slots.
+	clk.Advance(DefaultParkTTL)
+	if _, err := l.Park("a", "g", Reversible, "x", HashRequest([]byte("after expiry"))); err != nil {
+		t.Fatalf("expired items still counted: %v", err)
+	}
+}
+
 func TestIrreversibleCannotBeBatched(t *testing.T) {
 	clk, l := newLot(t)
 	r1, _ := park(t, l, Reversible, "write notes")
@@ -258,7 +315,8 @@ func TestParkedExpiry(t *testing.T) {
 func TestParkedErrorsAreDistinct(t *testing.T) {
 	errs := []error{
 		ErrParkedNotFound, ErrParkedInvalid, ErrParkedNotPending, ErrParkedNotApproved,
-		ErrParkedExpired, ErrParkedConsumed, ErrIrreversibleInBatch, ErrPreSigned,
+		ErrParkedExpired, ErrParkedConsumed, ErrIrreversibleInBatch, ErrPreSigned, ErrTooManyParked,
+		ErrNotHolder, ErrPresenceConsumed,
 		ErrGrantNotFound, ErrGrantRevoked, ErrGrantExpired, ErrGrantInvalid, ErrGrantHashMismatch,
 		ErrNotNarrower, ErrExpiryWidens, ErrSessionNotFound, ErrNotAncestor, ErrRewidenRequiresPresence,
 		ErrInvalidWindow, ErrLevelHasNoSession, ErrBoundAssertionCannotOpenWindow,

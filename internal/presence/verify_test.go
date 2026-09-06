@@ -7,7 +7,9 @@ import (
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,7 +31,7 @@ func newFixture(t *testing.T, bound bool) *fixture {
 	clk := newClock()
 	ver := NewVerifier(DefaultChallengeTTL, clk.Now)
 	key := newFakeKey(t)
-	ch, err := ver.Mint()
+	ch, err := ver.Mint("mac-studio")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +65,7 @@ func TestSignBuildsPromptAndAssertion(t *testing.T) {
 	if !p.Required || p.Tool != "aws" || p.Target != "prod-admin" || p.DeviceID != "mac-studio" {
 		t.Fatalf("prompt did not name tool, target, device with presence required: %+v", p)
 	}
-	if p.RequestCode == "" || p.RequestCode != RequestCode(f.in.RequestHash) || len(p.RequestCode) != RequestCodeLen {
+	if p.RequestCode == "" || p.RequestCode != RequestCode(f.in.Challenge, f.in.RequestHash) {
 		t.Fatalf("bound prompt did not carry the request code: %q", p.RequestCode)
 	}
 	fw := newFixture(t, false)
@@ -138,15 +140,35 @@ func TestVerifyTable(t *testing.T) {
 			name: "challenge minted by a different issuer",
 			before: func(f *fixture) {
 				other := NewVerifier(0, f.clk.Now)
-				ch, _ := other.Mint()
+				ch, _ := other.Mint("mac-studio")
 				f.in.Challenge = ch
 			},
 			want: ErrUnknownChallenge,
 		},
 		{
-			name:   "wrong device",
-			before: func(f *fixture) { f.exp.DeviceID = "work-mbp" },
-			want:   ErrDeviceMismatch,
+			name: "challenge minted for another device",
+			before: func(f *fixture) {
+				ch, _ := f.ver.Mint("work-mbp")
+				f.in.Challenge = ch
+			},
+			want: ErrUnknownChallenge,
+		},
+		{
+			name: "wrong device: prompt named another device",
+			before: func(f *fixture) {
+				// Challenge minted for mac-studio, issuer expects mac-studio,
+				// but the signed record names work-mbp.
+				f.in.DeviceID = "work-mbp"
+			},
+			want: ErrDeviceMismatch,
+		},
+		{
+			name: "wrong device: exchange for a device the challenge was not minted for",
+			before: func(f *fixture) {
+				f.in.DeviceID = "work-mbp"
+				f.exp.DeviceID = "work-mbp"
+			},
+			want: ErrUnknownChallenge,
 		},
 		{
 			name:   "wrong tool",
@@ -222,16 +244,16 @@ func TestVerifyTable(t *testing.T) {
 			want: ErrBadSignature,
 		},
 		{
-			name: "boundary shift: signed (ab,c), presented (a,bc)",
+			name: "boundary shift: signed (aws,prod-admin), presented (awsp,rod-admin)",
 			after: func(t *testing.T, f *fixture, a *Assertion) *Assertion {
-				// Move one byte across the device/tool boundary. The
+				// Move one byte across the tool/target boundary. The
 				// naive concatenation is identical; the canonical bytes
 				// are not, so the signature must fail.
 				shifted := *a
-				shifted.DeviceID = a.DeviceID + a.Tool[:1]
-				shifted.Tool = a.Tool[1:]
-				f.exp.DeviceID = shifted.DeviceID
+				shifted.Tool = a.Tool + a.Target[:1]
+				shifted.Target = a.Target[1:]
 				f.exp.Tool = shifted.Tool
+				f.exp.Target = shifted.Target
 				return &shifted
 			},
 			want: ErrBadSignature,
@@ -354,6 +376,7 @@ func TestRejectionErrorsAreDistinct(t *testing.T) {
 		ErrChallengeExpired, ErrNoPresenceKey, ErrUnsupportedPresenceKey, ErrDeviceMismatch, ErrToolMismatch,
 		ErrTargetMismatch, ErrRequestHashRequired, ErrRequestHashUnexpected,
 		ErrRequestHashMismatch, ErrBadSignature, ErrExpectation, ErrPresenceRequired,
+		ErrPresenceConsumed, ErrTooManyChallenges,
 	}
 	for i := range errs {
 		for j := range errs {
@@ -370,11 +393,22 @@ func TestFailedVerifySpendsChallenge(t *testing.T) {
 	f := newFixture(t, false)
 	a := f.sign(t)
 	bad := f.exp
-	bad.DeviceID = "other"
-	if _, err := f.ver.Verify(a, bad); !errors.Is(err, ErrDeviceMismatch) {
+	bad.Tool = "other"
+	if _, err := f.ver.Verify(a, bad); !errors.Is(err, ErrToolMismatch) {
 		t.Fatalf("setup: %v", err)
 	}
 	_, err := f.ver.Verify(a, f.exp)
+	mustErr(t, err, ErrChallengeReplayed)
+
+	// A challenge presented for a device it was not minted for is spent too.
+	g := newFixture(t, false)
+	b := g.sign(t)
+	other := g.exp
+	other.DeviceID = "work-mbp"
+	if _, err := g.ver.Verify(b, other); !errors.Is(err, ErrUnknownChallenge) {
+		t.Fatalf("setup: %v", err)
+	}
+	_, err = g.ver.Verify(b, g.exp)
 	mustErr(t, err, ErrChallengeReplayed)
 }
 
@@ -408,7 +442,7 @@ func TestMintSweepsExpired(t *testing.T) {
 	clk := newClock()
 	ver := NewVerifier(time.Minute, clk.Now)
 	for range 5 {
-		if _, err := ver.Mint(); err != nil {
+		if _, err := ver.Mint("dev"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -416,7 +450,7 @@ func TestMintSweepsExpired(t *testing.T) {
 		t.Fatalf("outstanding = %d, want 5", got)
 	}
 	clk.Advance(2 * time.Minute)
-	if _, err := ver.Mint(); err != nil {
+	if _, err := ver.Mint("dev"); err != nil {
 		t.Fatal(err)
 	}
 	if got := ver.Outstanding(); got != 1 {
@@ -424,6 +458,110 @@ func TestMintSweepsExpired(t *testing.T) {
 	}
 	if got := len(ver.minted); got != 1 {
 		t.Fatalf("minted map holds %d, want 1", got)
+	}
+	if ver.perDevice["dev"] != 1 {
+		t.Fatalf("per-device count %d, want 1", ver.perDevice["dev"])
+	}
+}
+
+// Outstanding challenges are capped per device; spending, expiry, and other
+// devices each release or ignore the slot as they should. (Reviewer L1.)
+func TestMintPerDeviceCap(t *testing.T) {
+	clk := newClock()
+	ver := NewVerifier(time.Minute, clk.Now)
+	key := newFakeKey(t)
+	var last []byte
+	for i := range MaxOutstandingChallenges {
+		ch, err := ver.Mint("dev")
+		if err != nil {
+			t.Fatalf("mint %d: %v", i, err)
+		}
+		last = ch
+	}
+	_, err := ver.Mint("dev")
+	mustErr(t, err, ErrTooManyChallenges)
+	if _, err := ver.Mint("other"); err != nil {
+		t.Fatalf("cap leaked across devices: %v", err)
+	}
+	// Spending one (even unsuccessfully) frees a slot.
+	a, err := Sign(context.Background(), key, SigningInput{DeviceID: "dev", Tool: "t", Challenge: last})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ver.Verify(a, Expectation{PresenceKey: key.PresencePublic(), DeviceID: "dev", Tool: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ver.Mint("dev"); err != nil {
+		t.Fatalf("spent challenge did not free its slot: %v", err)
+	}
+	// Expiry frees them all.
+	clk.Advance(2 * time.Minute)
+	if _, err := ver.Mint("dev"); err != nil {
+		t.Fatalf("expired challenges did not free their slots: %v", err)
+	}
+	if ver.perDevice["dev"] != 1 {
+		t.Fatalf("per-device count %d, want 1", ver.perDevice["dev"])
+	}
+}
+
+// The request code is 48 bits, challenge-dependent, and formatted for a
+// human to compare. (Reviewer H1, inverted.)
+func TestRequestCode(t *testing.T) {
+	if RequestCodeLen < 12 {
+		t.Fatalf("RequestCodeLen = %d; below 48 bits a same-uid grinder collides inside the challenge TTL", RequestCodeLen)
+	}
+	rh := HashRequest([]byte("sts:AssumeRole"), []byte("prod-admin"))
+	c1 := bytes.Repeat([]byte{1}, ChallengeSize)
+	c2 := bytes.Repeat([]byte{2}, ChallengeSize)
+	code := RequestCode(c1, rh)
+	if len(code) != RequestCodeLen+2 || code[4] != '-' || code[9] != '-' {
+		t.Fatalf("format: %q", code)
+	}
+	for i, r := range code {
+		if i == 4 || i == 9 {
+			continue
+		}
+		if !(r >= '0' && r <= '9' || r >= 'A' && r <= 'F') {
+			t.Fatalf("non-hex in code: %q", code)
+		}
+	}
+	if RequestCode(c1, rh) != code {
+		t.Fatal("not deterministic")
+	}
+	if RequestCode(c2, rh) == code {
+		t.Fatal("same request under a different challenge produced the same code: precomputable")
+	}
+	if RequestCode(c1, HashRequest([]byte("sts:AssumeRole"), []byte("dev"))) == code {
+		t.Fatal("different request produced the same code")
+	}
+	if RequestCode(c1, nil) != "" {
+		t.Fatal("window touch carried a code")
+	}
+	// Domain separation: the code is not a prefix of any other hash.
+	if strings.HasPrefix(strings.ToUpper(hex.EncodeToString(rh)), code[:4]) && strings.HasPrefix(strings.ToUpper(hex.EncodeToString(rh))[4:], code[5:9]) {
+		t.Fatal("code is a prefix of the request hash")
+	}
+}
+
+// A Verified is single-use across every consumer. (Reviewer M1, inverted.)
+func TestVerifiedSingleUse(t *testing.T) {
+	clk := newClock()
+	v := verified("dev", clk.Now(), nil)
+	if v.Used() {
+		t.Fatal("fresh proof reads used")
+	}
+	if err := v.consume(); err != nil {
+		t.Fatal(err)
+	}
+	if !v.Used() {
+		t.Fatal("consumed proof reads unused")
+	}
+	mustErr(t, v.consume(), ErrPresenceConsumed)
+	var nilV *Verified
+	mustErr(t, nilV.consume(), ErrPresenceRequired)
+	mustErr(t, (&Verified{}).consume(), ErrPresenceRequired)
+	if nilV.Used() {
+		t.Fatal("nil reads used")
 	}
 }
 

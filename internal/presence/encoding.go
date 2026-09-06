@@ -34,6 +34,7 @@ const (
 	contextBatch     = "totem/parked-batch"
 	contextGrant     = "totem/grant"
 	contextWiden     = "totem/widen"
+	contextCode      = "totem/request-code"
 )
 
 // ErrMalformed is a structural rejection: a field is missing, over length, or
@@ -139,20 +140,33 @@ func hashParts(context string, parts ...[]byte) []byte {
 	return h.Sum(nil)
 }
 
-// RequestCodeLen is the length of the short request code shown to the human.
-const RequestCodeLen = 8
+// RequestCodeLen is the number of hex digits in the request code: 12, so 48
+// bits. The code is the only channel binding "what the human's terminal
+// said" to "what the OS prompt is asking", and a same-uid process can grind a
+// free-text field of its own request until the codes collide. At 32 bits
+// that grind takes about a minute on a workstation, inside the challenge
+// TTL; at 48 bits it takes days. Do not shorten this for readability; it is
+// displayed as three groups of four.
+const RequestCodeLen = 12
 
 // RequestCode is the short code the CLI prints for a presence:always request
-// and the OS prompt shows verbatim, derived from the request hash so both say
-// the same thing: the first RequestCodeLen hex characters of the hash, upper
-// case. A malicious caller owns its own TTY, so the code is only meaningful
-// because it appears in a prompt the caller cannot draw. Empty for an absent
-// hash.
-func RequestCode(requestHash []byte) string {
+// and the OS prompt shows verbatim, so the human can compare the two. It is
+// derived from BOTH the issuer-minted challenge and the request hash, under
+// its own context, so nothing about it is computable before the issuer mints
+// the challenge for this request: a same-uid process cannot precompute a
+// colliding request from shell history, and two requests for the same target
+// in the same second still show different codes. Rendered as
+// "XXXX-XXXX-XXXX" (upper-case hex). Empty for an absent request hash, so a
+// window touch carries no code.
+//
+// A malicious caller owns its own TTY, so the code is only meaningful because
+// it appears in a prompt the caller cannot draw.
+func RequestCode(challenge, requestHash []byte) string {
 	if len(requestHash) == 0 {
 		return ""
 	}
-	return strings.ToUpper(hex.EncodeToString(requestHash))[:RequestCodeLen]
+	h := strings.ToUpper(hex.EncodeToString(hashParts(contextCode, challenge, requestHash)))[:RequestCodeLen]
+	return h[0:4] + "-" + h[4:8] + "-" + h[8:12]
 }
 
 // HashRequest computes the request hash a presence:always assertion binds to.

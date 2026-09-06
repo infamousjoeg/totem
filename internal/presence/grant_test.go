@@ -83,6 +83,16 @@ func TestSponsor(t *testing.T) {
 			h.ID = "chosen"
 			return h
 		}, verified("mac-studio", clk.Now(), g.Hash()), ErrGrantInvalid},
+		{"longer than MaxGrantDuration", func() Grant {
+			h := g
+			h.Until = clk.At(MaxGrantDuration + time.Second)
+			return h
+		}, verified("mac-studio", clk.Now(), func() []byte { h := g; h.Until = clk.At(MaxGrantDuration + time.Second); return h.Hash() }()), ErrGrantInvalid},
+		{"exactly MaxGrantDuration", func() Grant {
+			h := g
+			h.Until = clk.At(MaxGrantDuration)
+			return h
+		}, verified("mac-studio", clk.Now(), func() []byte { h := g; h.Until = clk.At(MaxGrantDuration); return h.Hash() }()), nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -102,6 +112,12 @@ func TestSponsor(t *testing.T) {
 			if _, err := reg.Get(root.ID); err != nil {
 				t.Fatal(err)
 			}
+			if !tc.v.Used() {
+				t.Fatal("sponsoring proof not consumed")
+			}
+			// The same proof cannot sponsor a second grant.
+			_, err = reg.Sponsor(tc.g(), tc.v)
+			mustErr(t, err, ErrPresenceConsumed)
 		})
 	}
 }
@@ -127,7 +143,7 @@ func TestGrantExpiryAndRenewal(t *testing.T) {
 
 func TestNarrowInheritsLineageExpirySignedAt(t *testing.T) {
 	clk, reg, root := sponsored(t)
-	s, err := reg.Open(root.ID)
+	s, err := reg.Open(root.ID, root.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +192,7 @@ func TestNarrowInheritsLineageExpirySignedAt(t *testing.T) {
 
 func TestNarrowRefusesAddedCapability(t *testing.T) {
 	_, reg, root := sponsored(t)
-	s, _ := reg.Open(root.ID)
+	s, _ := reg.Open(root.ID, root.ID)
 	base := wideScope()
 	cases := []struct {
 		name string
@@ -222,10 +238,10 @@ func TestNarrowRefusesAddedCapability(t *testing.T) {
 
 func TestRevokeReachesEveryDescendant(t *testing.T) {
 	_, reg, root := sponsored(t)
-	s, _ := reg.Open(root.ID)
+	s, _ := reg.Open(root.ID, root.ID)
 	child, _ := reg.Narrow(s.ID, Scope{AWSProfiles: []string{"dev"}}, time.Time{})
 	grand, _ := reg.Narrow(s.ID, Scope{}, time.Time{})
-	s2, _ := reg.Open(root.ID)
+	s2, _ := reg.Open(root.ID, root.ID)
 	sibling, _ := reg.Narrow(s2.ID, Scope{GitHubScopes: []string{"infamousjoeg/totem:contents:write"}}, time.Time{})
 
 	reg.Revoke(child.ID)
@@ -248,7 +264,7 @@ func TestRevokeReachesEveryDescendant(t *testing.T) {
 		_, err := reg.Get(id)
 		mustErr(t, err, ErrGrantRevoked)
 	}
-	_, err = reg.Open(root.ID)
+	_, err = reg.Open(root.ID, root.ID)
 	mustErr(t, err, ErrGrantRevoked)
 }
 
@@ -258,7 +274,7 @@ func TestRevokeReachesEveryDescendant(t *testing.T) {
 // opted out.
 func TestNarrowingCannotRemoveObservabilityOrRevocability(t *testing.T) {
 	_, reg, root := sponsored(t)
-	s, _ := reg.Open(root.ID)
+	s, _ := reg.Open(root.ID, root.ID)
 	floor, err := reg.Narrow(s.ID, Scope{}, time.Time{})
 	if err != nil {
 		t.Fatal(err)
@@ -287,7 +303,7 @@ func TestNarrowingCannotRemoveObservabilityOrRevocability(t *testing.T) {
 
 func TestWidenRequiresFreshBoundPresence(t *testing.T) {
 	clk, reg, root := sponsored(t)
-	s, _ := reg.Open(root.ID)
+	s, _ := reg.Open(root.ID, root.ID)
 	child, _ := reg.Narrow(s.ID, Scope{AWSProfiles: []string{"dev"}}, time.Time{})
 	grand, _ := reg.Narrow(s.ID, Scope{}, time.Time{})
 	narrowedAt := clk.Now()
@@ -454,7 +470,7 @@ func TestNarrowingMonotonicProperty(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		s, _ := reg.Open(root.ID)
+		s, _ := reg.Open(root.ID, root.ID)
 
 		// Reflexive.
 		if !parent.Within(parent) {
@@ -506,6 +522,76 @@ func TestNarrowingMonotonicProperty(t *testing.T) {
 	}
 }
 
+// A session may be opened only on the presented grant or a descendant. A
+// caller wrapped in a sub-grant cannot open a fresh session on its root and
+// walk around monotonic narrowing. (Reviewer M2, inverted.)
+func TestOpenRequiresHolder(t *testing.T) {
+	_, reg, root := sponsored(t)
+	s, err := reg.Open(root.ID, root.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, _ := reg.Narrow(s.ID, Scope{AWSProfiles: []string{"dev"}}, time.Time{})
+	floor, _ := reg.Narrow(s.ID, Scope{}, time.Time{})
+	s2, _ := reg.Open(root.ID, root.ID)
+	sibling, _ := reg.Narrow(s2.ID, Scope{}, time.Time{})
+
+	cases := []struct {
+		name      string
+		presented string
+		target    string
+		want      error
+	}{
+		{"floor credential opens root", floor.ID, root.ID, ErrNotHolder},
+		{"floor credential opens parent", floor.ID, child.ID, ErrNotHolder},
+		{"floor credential opens sibling branch", floor.ID, sibling.ID, ErrNotHolder},
+		{"child credential opens root", child.ID, root.ID, ErrNotHolder},
+		{"floor credential opens itself", floor.ID, floor.ID, nil},
+		{"child credential opens its descendant", child.ID, floor.ID, nil},
+		{"root credential opens a descendant", root.ID, floor.ID, nil},
+		{"root credential opens itself", root.ID, root.ID, nil},
+		{"unknown presented", "nope", root.ID, ErrGrantNotFound},
+		{"unknown target", root.ID, "nope", ErrGrantNotFound},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sess, err := reg.Open(tc.presented, tc.target)
+			mustErr(t, err, tc.want)
+			if tc.want == nil && sess.ActiveGrantID != tc.target {
+				t.Fatalf("opened on %s, want %s", sess.ActiveGrantID, tc.target)
+			}
+		})
+	}
+	// A revoked presented grant opens nothing, even on itself.
+	reg.Revoke(child.ID)
+	_, err = reg.Open(floor.ID, floor.ID)
+	mustErr(t, err, ErrGrantRevoked)
+}
+
+// The widening proof is consumed. (Reviewer M1.)
+func TestWidenConsumesProof(t *testing.T) {
+	clk, reg, root := sponsored(t)
+	s, _ := reg.Open(root.ID, root.ID)
+	reg.Narrow(s.ID, Scope{}, time.Time{})
+	v := verified("mac-studio", clk.Now(), WidenHash(s.ID, root.ID))
+	if _, err := reg.Widen(s.ID, root.ID, v); err != nil {
+		t.Fatal(err)
+	}
+	if !v.Used() {
+		t.Fatal("widen did not consume its proof")
+	}
+	reg.Narrow(s.ID, Scope{}, time.Time{})
+	_, err := reg.Widen(s.ID, root.ID, v)
+	mustErr(t, err, ErrPresenceConsumed)
+	// A refused widen leaves the proof unused.
+	fresh := verified("mac-studio", clk.Now(), WidenHash(s.ID, "nope"))
+	_, err = reg.Widen(s.ID, "nope", fresh)
+	mustErr(t, err, ErrNotAncestor)
+	if fresh.Used() {
+		t.Fatal("refused widen consumed the proof")
+	}
+}
+
 func TestScopeNormalize(t *testing.T) {
 	s := Scope{
 		AWSProfiles:  []string{"b", "a", "b"},
@@ -523,6 +609,12 @@ func TestScopeNormalize(t *testing.T) {
 	}
 	if n.Money != (Money{StepUpAboveUSD: 3}) {
 		t.Fatalf("money: %+v", n.Money)
+	}
+	// -0.0 hashes as 0 (L6).
+	negZero := NewGrant("x", Scope{Money: Money{PerTransactionUSD: math.Copysign(0, -1)}}, newClock().Now())
+	posZero := NewGrant("x", Scope{Money: Money{PerTransactionUSD: 0}}, newClock().Now())
+	if string(negZero.Hash()) != string(posZero.Hash()) {
+		t.Fatal("-0 and 0 hash differently")
 	}
 	if !reflect.DeepEqual(s.Normalize(), n) {
 		t.Fatal("Normalize is not idempotent")
@@ -561,6 +653,16 @@ func TestMoneyDecide(t *testing.T) {
 		{"nan", m, math.NaN(), 0, MoneyOverCeiling},
 		{"inf", m, math.Inf(1), 0, MoneyOverCeiling},
 		{"zero money permits nothing", Money{}, 0.01, 0, MoneyOverCeiling},
+		{"zero money refuses a $0 hold", Money{}, 0, 0, MoneyOverCeiling},
+		{"NaN step-up cannot lift the floor (M3)", Money{PerTransactionUSD: 1e6, PerDayUSD: 1e6, StepUpAboveUSD: math.NaN()}, 50000, 0, MoneyStepUp},
+		{"NaN step-up reads as zero: even $1 steps up", Money{PerTransactionUSD: 1e6, PerDayUSD: 1e6, StepUpAboveUSD: math.NaN()}, 1, 0, MoneyStepUp},
+		{"NaN per-transaction permits nothing", Money{PerTransactionUSD: math.NaN(), PerDayUSD: 100, StepUpAboveUSD: 5}, 1, 0, MoneyOverCeiling},
+		{"NaN per-day permits nothing", Money{PerTransactionUSD: 50, PerDayUSD: math.NaN(), StepUpAboveUSD: 5}, 1, 0, MoneyOverCeiling},
+		{"NaN spent today", m, 1, math.NaN(), MoneyOverCeiling},
+		{"negative spent today", m, 1, -1e12, MoneyOverCeiling},
+		{"inf spent today", m, 1, math.Inf(1), MoneyOverCeiling},
+		{"inf ceilings still floor at trivial", Money{PerTransactionUSD: math.Inf(1), PerDayUSD: math.Inf(1), StepUpAboveUSD: math.Inf(1)}, 6, 0, MoneyStepUp},
+		{"inf ceilings, trivial amount delegated", Money{PerTransactionUSD: math.Inf(1), PerDayUSD: math.Inf(1), StepUpAboveUSD: math.Inf(1)}, 4, 0, MoneyDelegated},
 		{"huge step-up cannot beat the floor", Money{PerTransactionUSD: 1e6, PerDayUSD: 1e6, StepUpAboveUSD: 1e6}, TrivialMoneyUSD + 0.01, 0, MoneyStepUp},
 	}
 	for _, tc := range cases {
@@ -575,8 +677,8 @@ func TestMoneyDecide(t *testing.T) {
 func TestOpenRequiresActiveGrant(t *testing.T) {
 	clk, reg, root := sponsored(t)
 	clk.Advance(DefaultGrantDuration)
-	_, err := reg.Open(root.ID)
+	_, err := reg.Open(root.ID, root.ID)
 	mustErr(t, err, ErrGrantExpired)
-	_, err = reg.Open("nope")
+	_, err = reg.Open("nope", "nope")
 	mustErr(t, err, ErrGrantNotFound)
 }

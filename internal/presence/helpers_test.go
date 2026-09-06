@@ -68,9 +68,15 @@ func (k *fakeKey) ProtectionLevel() spiffe.ProtectionLevel { return spiffe.Prote
 // verified builds an in-package Verified as Verify would, for the session,
 // grant, and parking tests that are not about signature verification.
 func verified(device string, at time.Time, requestHash []byte) *Verified {
+	return verifiedFor(device, "test", "", at, requestHash)
+}
+
+// verifiedFor is verified with an explicit tool and target.
+func verifiedFor(device, tool, target string, at time.Time, requestHash []byte) *Verified {
 	return &Verified{
 		DeviceID:    device,
-		Tool:        "test",
+		Tool:        tool,
+		Target:      target,
 		RequestHash: requestHash,
 		Challenge:   make([]byte, ChallengeSize),
 		VerifiedAt:  at,

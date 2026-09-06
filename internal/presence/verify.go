@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -125,6 +126,11 @@ type Expectation struct {
 // package accepts wherever presence is required (opening a session, sponsoring
 // a grant, re-widening, approving a parked request). A Verified constructed by
 // hand is rejected everywhere, because only Verify sets the unexported marker.
+//
+// A Verified is single-use, like the challenge behind it: the first consumer
+// that accepts it (Touch, Sponsor, Widen, Approve, ApproveBatch) marks it
+// used and every later consumer refuses it with ErrPresenceConsumed. One
+// touch, one purpose. Pass it by pointer; it must not be copied.
 type Verified struct {
 	// DeviceID the human was present on.
 	DeviceID string
@@ -140,31 +146,68 @@ type Verified struct {
 	// authorization time recorded on the credential.
 	VerifiedAt time.Time
 
-	ok bool
+	ok   bool
+	used atomic.Bool
 }
 
-// Valid reports whether v was produced by Verify.
+// Valid reports whether v was produced by Verify. It does not say whether v
+// has been used; consumers find that out when they consume it.
 func (v *Verified) Valid() bool { return v != nil && v.ok }
 
-// ErrPresenceRequired is returned wherever a Verified is required and none, or
-// a hand-built one, was supplied.
-var ErrPresenceRequired = errors.New("presence: a verified presence assertion is required")
+// Used reports whether a consumer has already accepted v.
+func (v *Verified) Used() bool { return v != nil && v.used.Load() }
+
+// consume marks v used. It is called by every consumer after all its other
+// checks pass, so a refused use does not burn the proof, and exactly one
+// consumer ever succeeds.
+func (v *Verified) consume() error {
+	if !v.Valid() {
+		return ErrPresenceRequired
+	}
+	if v.used.Swap(true) {
+		return ErrPresenceConsumed
+	}
+	return nil
+}
+
+// Presence-proof errors shared by every consumer of a Verified.
+var (
+	// ErrPresenceRequired is returned wherever a Verified is required and
+	// none, or a hand-built one, was supplied.
+	ErrPresenceRequired = errors.New("presence: a verified presence assertion is required")
+	// ErrPresenceConsumed is returned when a Verified is presented to a second
+	// consumer. One touch authorizes one thing.
+	ErrPresenceConsumed = errors.New("presence: presence assertion already used")
+	// ErrTooManyChallenges: the device already has MaxOutstandingChallenges
+	// unspent challenges. A flood of mints is itself the alarm; refusing keeps
+	// issuer memory bounded by devices, not by whatever a same-uid process
+	// wants to send.
+	ErrTooManyChallenges = errors.New("presence: too many outstanding challenges for device")
+)
+
+// MaxOutstandingChallenges is the most unspent, unexpired challenges one device
+// may hold. A human answers one prompt at a time; a few dozen covers every
+// tool on the machine prompting at once with room to spare.
+const MaxOutstandingChallenges = 64
 
 // Verifier mints challenges and verifies assertions against them. It is the
 // issuer-side half of the assertion and holds the only record of which
 // challenges exist. Minted challenges are in memory only, single-use, and
 // expire on their TTL.
 type Verifier struct {
-	mu     sync.Mutex
-	now    func() time.Time
-	rand   io.Reader
-	ttl    time.Duration
-	minted map[[ChallengeSize]byte]*mintedChallenge
+	mu        sync.Mutex
+	now       func() time.Time
+	rand      io.Reader
+	ttl       time.Duration
+	minted    map[[ChallengeSize]byte]*mintedChallenge
+	perDevice map[string]int
+	lastSweep time.Time
 }
 
 type mintedChallenge struct {
-	at    time.Time
-	spent bool
+	device string
+	at     time.Time
+	spent  bool
 }
 
 // NewVerifier returns a verifier whose challenges expire after ttl (zero
@@ -177,17 +220,24 @@ func NewVerifier(ttl time.Duration, now func() time.Time) *Verifier {
 		now = time.Now
 	}
 	return &Verifier{
-		now:    now,
-		rand:   rand.Reader,
-		ttl:    ttl,
-		minted: make(map[[ChallengeSize]byte]*mintedChallenge),
+		now:       now,
+		rand:      rand.Reader,
+		ttl:       ttl,
+		minted:    make(map[[ChallengeSize]byte]*mintedChallenge),
+		perDevice: make(map[string]int),
 	}
 }
 
-// Mint issues a fresh single-use challenge and records it. Expired challenges
-// are swept on every mint so the map is bounded by the prompt rate times the
-// TTL.
-func (v *Verifier) Mint() ([]byte, error) {
+// Mint issues a fresh single-use challenge for deviceID and records it. The
+// challenge can only be spent by an assertion for that device. A device with
+// MaxOutstandingChallenges unspent challenges is refused
+// (ErrTooManyChallenges). Expired challenges are swept at most once per
+// quarter TTL, so a flood of mints costs the issuer a map insert each, not a
+// full scan each.
+func (v *Verifier) Mint(deviceID string) ([]byte, error) {
+	if deviceID == "" {
+		return nil, fmt.Errorf("%w: mint for empty device", ErrMalformed)
+	}
 	var c [ChallengeSize]byte
 	if _, err := io.ReadFull(v.rand, c[:]); err != nil {
 		return nil, fmt.Errorf("presence: mint: %w", err)
@@ -195,13 +245,44 @@ func (v *Verifier) Mint() ([]byte, error) {
 	now := v.now()
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	v.sweep(now)
+	if v.perDevice[deviceID] >= MaxOutstandingChallenges {
+		return nil, fmt.Errorf("%w: %s", ErrTooManyChallenges, deviceID)
+	}
+	v.minted[c] = &mintedChallenge{device: deviceID, at: now}
+	v.perDevice[deviceID]++
+	return c[:], nil
+}
+
+// sweep drops expired challenges, under the lock, at most once per quarter
+// TTL unless forced by a cap check.
+func (v *Verifier) sweep(now time.Time) {
+	if !v.lastSweep.IsZero() && now.Sub(v.lastSweep) < v.ttl/4 {
+		return
+	}
+	v.lastSweep = now
 	for k, m := range v.minted {
 		if now.Sub(m.at) > v.ttl {
-			delete(v.minted, k)
+			v.forget(k, m)
 		}
 	}
-	v.minted[c] = &mintedChallenge{at: now}
-	return c[:], nil
+}
+
+// forget removes a minted challenge and releases its device slot if it was
+// still counted as outstanding.
+func (v *Verifier) forget(k [ChallengeSize]byte, m *mintedChallenge) {
+	if !m.spent {
+		v.release(m.device)
+	}
+	delete(v.minted, k)
+}
+
+func (v *Verifier) release(device string) {
+	if v.perDevice[device] <= 1 {
+		delete(v.perDevice, device)
+		return
+	}
+	v.perDevice[device]--
 }
 
 // Outstanding reports how many minted challenges are unspent and unexpired.
@@ -223,8 +304,9 @@ func (v *Verifier) Outstanding() int {
 //
 //  1. structure and version (ErrMalformed, ErrUnsupportedVersion): nothing
 //     is spent for a malformed assertion;
-//  2. challenge: unknown, replayed, expired. The challenge is spent here, on
-//     first presentation, before anything else is decided;
+//  2. challenge: unknown (never minted, or minted for another device),
+//     replayed, expired. The challenge is spent here, on first presentation,
+//     before anything else is decided;
 //  3. presence key present (ErrNoPresenceKey) and P-256
 //     (ErrUnsupportedPresenceKey);
 //  4. device, tool, target bindings;
@@ -249,7 +331,7 @@ func (v *Verifier) Verify(a *Assertion, exp Expectation) (*Verified, error) {
 	}
 
 	now := v.now()
-	if err := v.spend(a.Challenge, now); err != nil {
+	if err := v.spend(a.Challenge, exp.DeviceID, now); err != nil {
 		return nil, err
 	}
 
@@ -311,9 +393,11 @@ func (v *Verifier) Verify(a *Assertion, exp Expectation) (*Verified, error) {
 	}, nil
 }
 
-// spend marks a challenge as presented. Unknown, already spent, and expired
-// challenges are each their own rejection.
-func (v *Verifier) spend(challenge []byte, now time.Time) error {
+// spend marks a challenge as presented. Unknown (including minted for another
+// device), already spent, and expired challenges are each their own
+// rejection. A challenge minted for another device is spent too: it was
+// presented.
+func (v *Verifier) spend(challenge []byte, deviceID string, now time.Time) error {
 	var k [ChallengeSize]byte
 	copy(k[:], challenge)
 	v.mu.Lock()
@@ -326,10 +410,14 @@ func (v *Verifier) spend(challenge []byte, now time.Time) error {
 		return ErrChallengeReplayed
 	}
 	if now.Sub(m.at) > v.ttl {
-		delete(v.minted, k)
+		v.forget(k, m)
 		return ErrChallengeExpired
 	}
 	m.spent = true
+	v.release(m.device)
+	if m.device != deviceID {
+		return fmt.Errorf("%w: minted for another device", ErrUnknownChallenge)
+	}
 	return nil
 }
 

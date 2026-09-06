@@ -18,6 +18,10 @@ const (
 	// sees them. It trades staleness of the morning list against losing
 	// items to a missed morning.
 	DefaultParkTTL = 24 * time.Hour
+	// MaxPendingPerAgent is the most pending parked requests one agent may
+	// hold. A morning list longer than this is not something a human reads
+	// anyway; past it, the agent's behavior is the finding.
+	MaxPendingPerAgent = 256
 	// DefaultApprovalTTL is how long an approval waits to be consumed by the
 	// agent's next heartbeat: one hour, comfortably more than any launchd
 	// heartbeat interval, and short enough that an approval the agent never
@@ -80,9 +84,14 @@ var (
 	// ErrIrreversibleInBatch: batch approval is for reversible items only.
 	// An irreversible item waits for presence bound to itself.
 	ErrIrreversibleInBatch = errors.New("presence: irreversible request cannot be batch-approved")
-	// ErrPreSigned: the approving assertion was verified before the request
-	// was parked. Nothing is approved in advance.
+	// ErrPreSigned: the approving assertion was verified strictly before the
+	// request was parked (equal issuer-clock instants pass). Nothing is
+	// approved in advance.
 	ErrPreSigned = errors.New("presence: approval predates the parked request")
+	// ErrTooManyParked: the agent already has MaxPendingPerAgent pending
+	// requests. Parking is bounded per agent so a runaway or hijacked agent
+	// cannot grow issuer memory for 24 hours at a time.
+	ErrTooManyParked = errors.New("presence: too many pending parked requests for agent")
 )
 
 // ParkedRequest is an out-of-grant request waiting for a present human. It is
@@ -93,7 +102,9 @@ type ParkedRequest struct {
 	ID string
 	// Agent that made the request.
 	Agent string
-	// GrantID the agent was operating under when the request fell outside it.
+	// GrantID the agent was operating under when the request fell outside it,
+	// as the issuer supplied it from the caller's credential provenance. The
+	// Lot records it for the audit line and does not consult the Registry.
 	GrantID string
 	// Reversibility decides whether it may be batch-approved.
 	Reversibility Reversibility
@@ -191,6 +202,16 @@ func (l *Lot) Park(agent, grantID string, rev Reversibility, description string,
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	pending := 0
+	for _, it := range l.items {
+		l.refresh(it, now)
+		if it.Agent == agent && it.State == ParkedPending {
+			pending++
+		}
+	}
+	if pending >= MaxPendingPerAgent {
+		return "", fmt.Errorf("%w: %s", ErrTooManyParked, agent)
+	}
 	l.items[id] = item
 	return id, nil
 }
@@ -233,8 +254,10 @@ func (l *Lot) Pending(rev Reversibility) []ParkedRequest {
 
 // Approve approves one pending request with presence. v must be bound to the
 // request's own hash (never pre-signed, never a touch for something else)
-// and verified no earlier than the request was parked. Works for either
-// reversibility; an irreversible request has no other path.
+// and verified not before the request was parked, and it is consumed: one
+// touch approves one request, even if two parked requests carry the same
+// hash. Works for either reversibility; an irreversible request has no other
+// path.
 func (l *Lot) Approve(id string, v *Verified) error {
 	if !v.Valid() {
 		return ErrPresenceRequired
@@ -256,13 +279,16 @@ func (l *Lot) Approve(id string, v *Verified) error {
 	if v.VerifiedAt.Before(item.ParkedAt) {
 		return ErrPreSigned
 	}
+	if err := v.consume(); err != nil {
+		return err
+	}
 	l.approve(item, v, now)
 	return nil
 }
 
 // ApproveBatch approves a set of pending reversible requests with one touch.
-// v must be bound to BatchHash(ids) and verified no earlier than the newest
-// item in the batch. Any irreversible id refuses the whole batch
+// v must be bound to BatchHash(ids), verified not before the newest item in
+// the batch, and is consumed by the batch as a whole. Any irreversible id refuses the whole batch
 // (ErrIrreversibleInBatch); any unknown or non-pending id refuses it too, so
 // a batch is all or nothing.
 func (l *Lot) ApproveBatch(ids []string, v *Verified) error {
@@ -296,6 +322,9 @@ func (l *Lot) ApproveBatch(ids []string, v *Verified) error {
 			return fmt.Errorf("%w: %s", ErrPreSigned, id)
 		}
 		items = append(items, item)
+	}
+	if err := v.consume(); err != nil {
+		return err
 	}
 	for _, item := range items {
 		l.approve(item, v, now)

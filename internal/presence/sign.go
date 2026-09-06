@@ -73,7 +73,7 @@ func Sign(ctx context.Context, key platform.Key, in SigningInput) (*Assertion, e
 		Tool:        in.Tool,
 		Target:      in.Target,
 		DeviceID:    in.DeviceID,
-		RequestCode: RequestCode(in.RequestHash),
+		RequestCode: RequestCode(in.Challenge, in.RequestHash),
 	}
 	sig, err := key.Sign(ctx, bytes, prompt)
 	if err != nil {

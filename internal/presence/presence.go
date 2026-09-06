@@ -80,11 +80,18 @@ const MaxWindow = time.Hour
 // sessions, evaluated on the issuer, never persisted; a restart means every
 // tool prompts once. There is no global switch and never a longer window.
 type Window struct {
-	// Tool or profile the window applies to, e.g. "claude" or "aws:prod".
+	// Tool is the catalog tool name the window applies to, e.g. "claude" or
+	// "aws". A touch must have been given for this tool; a Verified for "gh"
+	// cannot open the claude window.
 	Tool string
+	// Target narrows the window to one target of the tool, e.g. an aws
+	// profile name. Empty means the window covers the tool regardless of
+	// target. When set, a touch must have been given for exactly this target.
+	Target string
 	// Group names the session this window draws from. Windows with the same
 	// Group share one touch (gh and git share fifteen minutes). Empty means
-	// the window is its own group.
+	// the window is its own group. A member is honored only up to its own
+	// Duration, whichever member was touched.
 	Group string
 	// Duration the presence session is honored for after a touch. Must be
 	// positive and at most MaxWindow.
@@ -96,12 +103,20 @@ type Window struct {
 }
 
 // SessionKey is the key a touch on this window is recorded under: the Group if
-// set, otherwise the Tool.
+// set, otherwise Tool, or Tool:Target when Target is set.
 func (w Window) SessionKey() string {
 	if w.Group != "" {
 		return w.Group
 	}
+	if w.Target != "" {
+		return w.Tool + ":" + w.Target
+	}
 	return w.Tool
+}
+
+// validDuration reports whether the window is in (0, MaxWindow].
+func (w Window) validDuration() bool {
+	return w.Duration > 0 && w.Duration <= MaxWindow
 }
 
 // Shipped window durations from "Presence windows".
@@ -133,7 +148,7 @@ func DefaultWindows() []Window {
 // fifteen-minute window, or LevelAlways when the profile's role name contains
 // admin or prod.
 func AWSProfileWindow(profile, roleName string) Window {
-	w := Window{Tool: "aws:" + profile, Duration: AWSWindow, Level: LevelWindow}
+	w := Window{Tool: "aws", Target: profile, Duration: AWSWindow, Level: LevelWindow}
 	if RoleRequiresAlways(roleName) {
 		w.Level = LevelAlways
 	}

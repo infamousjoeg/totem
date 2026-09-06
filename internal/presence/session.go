@@ -26,11 +26,13 @@ var (
 type Session struct {
 	// DeviceID the touch happened on.
 	DeviceID string
-	// Key is the window's SessionKey (tool, profile, or shared group).
+	// Key is the window's SessionKey (tool, tool:target, or shared group).
 	Key string
 	// TouchedAt is the verified presence time.
 	TouchedAt time.Time
-	// ExpiresAt is TouchedAt plus the window duration.
+	// ExpiresAt is TouchedAt plus the duration of the window that was
+	// touched. A grouped window with a shorter duration is honored only up to
+	// its own duration; see Evaluate.
 	ExpiresAt time.Time
 }
 
@@ -88,6 +90,11 @@ func NewSessionStore(now func() time.Time) *SessionStore {
 // request hash, the held session cannot satisfy it, and, being request-bound,
 // the resulting touch cannot open or refresh a window. escalate has no effect
 // on LevelAlways or LevelStepUp, which are already stricter.
+//
+// A session is honored for the SHORTER of the touched window's duration and
+// w.Duration, so a grouped window never rides a longer sibling's touch: the
+// shortest duration in a group is what each member actually gets. An invalid
+// w.Duration is never satisfied.
 func (s *SessionStore) Evaluate(deviceID string, w Window, escalate bool) Decision {
 	d := Decision{Binding: BindingNone}
 	switch {
@@ -97,6 +104,9 @@ func (s *SessionStore) Evaluate(deviceID string, w Window, escalate bool) Decisi
 		return d
 	case w.Level == LevelAlways || escalate:
 		d.Binding = BindingRequired
+		return d
+	}
+	if !w.validDuration() {
 		return d
 	}
 	now := s.now()
@@ -111,6 +121,10 @@ func (s *SessionStore) Evaluate(deviceID string, w Window, escalate bool) Decisi
 		delete(s.sessions, k)
 		return d
 	}
+	if own := sess.TouchedAt.Add(w.Duration); !now.Before(own) {
+		// Held by a longer sibling in the group; not for this window.
+		return d
+	}
 	d.Satisfied = true
 	d.Session = sess
 	d.Age = now.Sub(sess.TouchedAt)
@@ -120,12 +134,14 @@ func (s *SessionStore) Evaluate(deviceID string, w Window, escalate bool) Decisi
 // Touch records a verified presence on window w for deviceID and returns the
 // session opened. It refuses an invalid or over-long window, an always or
 // step-up window (neither holds a session), a request-bound assertion, a
-// hand-built Verified, or a Verified from another device.
+// hand-built or already-used Verified, a Verified from another device, or a
+// Verified the human gave for a different tool or target than the window's.
+// On success the Verified is consumed: it opens exactly one window.
 func (s *SessionStore) Touch(deviceID string, w Window, v *Verified) (Session, error) {
 	if !v.Valid() {
 		return Session{}, ErrPresenceRequired
 	}
-	if w.Duration <= 0 || w.Duration > MaxWindow {
+	if !w.validDuration() {
 		return Session{}, fmt.Errorf("%w: %s", ErrInvalidWindow, w.Duration)
 	}
 	if w.Level == LevelAlways || w.Level == LevelStepUp {
@@ -136,6 +152,15 @@ func (s *SessionStore) Touch(deviceID string, w Window, v *Verified) (Session, e
 	}
 	if v.DeviceID != deviceID {
 		return Session{}, ErrDeviceMismatch
+	}
+	if v.Tool != w.Tool {
+		return Session{}, ErrToolMismatch
+	}
+	if w.Target != "" && v.Target != w.Target {
+		return Session{}, ErrTargetMismatch
+	}
+	if err := v.consume(); err != nil {
+		return Session{}, err
 	}
 	sess := Session{
 		DeviceID:  deviceID,

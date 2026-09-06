@@ -19,6 +19,12 @@ const (
 	// RenewalNotice is how far before expiry the renewal notification goes
 	// out: three days.
 	RenewalNotice = 3 * 24 * time.Hour
+	// MaxGrantDuration is the longest a human can sign a grant for: ninety
+	// days, three renewal cycles. The spec gives a thirty-day default and
+	// says renewal requires presence; a grant that never needs renewing would
+	// make that sentence meaningless, and the CLI rendering the grant should
+	// not be the only thing between a human and a fifty-year signature.
+	MaxGrantDuration = 90 * 24 * time.Hour
 )
 
 // TrivialMoneyUSD is the hard floor for delegated money: outward money
@@ -45,8 +51,13 @@ var (
 	// credentials stop.
 	ErrGrantExpired = errors.New("presence: grant expired")
 	// ErrGrantInvalid: the grant is structurally unusable (no agent, expiry
-	// not in the future, lineage on a root).
+	// not in the future or beyond MaxGrantDuration, lineage on a root).
 	ErrGrantInvalid = errors.New("presence: grant invalid")
+	// ErrNotHolder: a session may be opened only on the grant the caller's
+	// credential names, or a descendant of it. Opening an ancestor from a
+	// sub-grant credential would be the out-of-session route around
+	// monotonic narrowing.
+	ErrNotHolder = errors.New("presence: caller's grant does not cover the requested grant")
 	// ErrGrantHashMismatch: the sponsoring assertion is not bound to this
 	// grant's hash; the human signed something else.
 	ErrGrantHashMismatch = errors.New("presence: sponsoring assertion not bound to this grant")
@@ -100,21 +111,35 @@ const (
 )
 
 // Decide classifies one outward transaction of amountUSD given what the grant
-// has already spent today.
+// has already spent today. m is normalized first, so a NaN or negative
+// ceiling reads as zero and cannot lift the floor; a NaN, negative, or
+// infinite amount or running total is MoneyOverCeiling. A zero Money (no
+// per-transaction ceiling) permits no movement at all, including a $0
+// authorization hold.
 func (m Money) Decide(amountUSD, spentTodayUSD float64) MoneyVerdict {
-	switch {
-	case amountUSD < 0 || math.IsNaN(amountUSD) || math.IsInf(amountUSD, 0):
+	m = m.normalize()
+	if !finiteNonNegative(amountUSD) || !finiteNonNegative(spentTodayUSD) {
 		return MoneyOverCeiling
-	case amountUSD == 0:
-		return MoneyDelegated
+	}
+	threshold := TrivialMoneyUSD
+	if m.StepUpAboveUSD < threshold {
+		threshold = m.StepUpAboveUSD
+	}
+	switch {
+	case m.PerTransactionUSD == 0:
+		return MoneyOverCeiling
 	case amountUSD > m.PerTransactionUSD:
 		return MoneyOverCeiling
 	case spentTodayUSD+amountUSD > m.PerDayUSD:
 		return MoneyOverCeiling
-	case amountUSD > math.Min(m.StepUpAboveUSD, TrivialMoneyUSD):
+	case amountUSD > threshold:
 		return MoneyStepUp
 	}
 	return MoneyDelegated
+}
+
+func finiteNonNegative(f float64) bool {
+	return f >= 0 && !math.IsInf(f, 0)
 }
 
 // Within reports whether m is no wider than parent on every axis. A lower
@@ -133,9 +158,15 @@ func (m Money) normalize() Money {
 	}
 }
 
+// nonNegative maps NaN, negatives, and -0 to 0 so normalized scopes hash
+// canonically; +Inf is clamped to the largest finite value so it still
+// compares as a ceiling.
 func nonNegative(f float64) float64 {
-	if f < 0 || math.IsNaN(f) {
+	if f <= 0 || math.IsNaN(f) {
 		return 0
+	}
+	if math.IsInf(f, 1) {
+		return math.MaxFloat64
 	}
 	return f
 }
@@ -379,7 +410,7 @@ type AgentSession struct {
 	// ActiveGrantID is the grant credentials are currently minted under.
 	ActiveGrantID string
 	// NarrowedAt is the last time the session narrowed; zero if never. A
-	// widening assertion verified before it cannot widen.
+	// widening assertion verified before it (strictly) cannot widen.
 	NarrowedAt time.Time
 }
 
@@ -440,11 +471,16 @@ func (r *Registry) Sponsor(g Grant, v *Verified) (*Grant, error) {
 		return nil, fmt.Errorf("%w: no agent", ErrGrantInvalid)
 	case !g.Until.After(now):
 		return nil, fmt.Errorf("%w: expiry not in the future", ErrGrantInvalid)
+	case g.Until.Sub(now) > MaxGrantDuration:
+		return nil, fmt.Errorf("%w: expiry more than %s out", ErrGrantInvalid, MaxGrantDuration)
 	case len(g.Lineage) != 0 || g.ID != "":
 		return nil, fmt.Errorf("%w: a sponsored grant is a root", ErrGrantInvalid)
 	}
 	if !equalBytes(v.RequestHash, g.Hash()) {
 		return nil, ErrGrantHashMismatch
+	}
+	if err := v.consume(); err != nil {
+		return nil, err
 	}
 	id, err := r.newID()
 	if err != nil {
@@ -507,14 +543,27 @@ func (r *Registry) Revoke(id string) {
 	r.revoked[id] = r.now()
 }
 
-// Open starts an agent session on an active grant. The session's active
-// grant is that grant until it narrows.
-func (r *Registry) Open(grantID string) (*AgentSession, error) {
+// Open starts an agent session on an active grant. presentedGrantID is the
+// grant named by the credential the caller attested with; the issuer MUST
+// take it from that credential's provenance and never from the request body.
+// grantID must be the presented grant itself or one of its descendants
+// (ErrNotHolder otherwise), so a caller wrapped in a sub-grant cannot open a
+// fresh session on an ancestor and walk around monotonic narrowing without
+// presence. The common case passes the same id twice. The session's active
+// grant is grantID until it narrows.
+func (r *Registry) Open(presentedGrantID, grantID string) (*AgentSession, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	g, err := r.active(grantID, r.now())
+	now := r.now()
+	if _, err := r.active(presentedGrantID, now); err != nil {
+		return nil, err
+	}
+	g, err := r.active(grantID, now)
 	if err != nil {
 		return nil, err
+	}
+	if g.ID != presentedGrantID && !slices.Contains(g.Lineage, presentedGrantID) {
+		return nil, ErrNotHolder
 	}
 	id, err := r.newID()
 	if err != nil {
@@ -602,8 +651,9 @@ func (r *Registry) Narrow(sessionID string, scope Scope, until time.Time) (*Gran
 
 // Widen returns the session to an ancestor of its active grant. It always
 // requires v, a Verified bound to WidenHash(sessionID, toGrantID) and
-// verified no earlier than the narrowing: fresh presence, for exactly this
-// widen, every time. The target must be in the active grant's lineage
+// verified not before the narrowing (equal instants pass; both stamps are
+// issuer clocks): fresh presence, for exactly this widen, every time, and the
+// Verified is consumed. The target must be in the active grant's lineage
 // (ErrNotAncestor) and still active. Nothing is re-derived; the ancestor
 // simply becomes active again.
 func (r *Registry) Widen(sessionID, toGrantID string, v *Verified) (*Grant, error) {
@@ -633,6 +683,9 @@ func (r *Registry) Widen(sessionID, toGrantID string, v *Verified) (*Grant, erro
 	}
 	if v.VerifiedAt.Before(s.NarrowedAt) {
 		return nil, fmt.Errorf("%w: assertion predates the narrowing", ErrRewidenRequiresPresence)
+	}
+	if err := v.consume(); err != nil {
+		return nil, err
 	}
 	s.ActiveGrantID = target.ID
 	return copyGrant(target), nil
