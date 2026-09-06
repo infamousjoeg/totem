@@ -4,6 +4,7 @@ package attest
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"os"
 	"os/exec"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/infamousjoeg/totem/internal/spiffe"
 )
 
 type spiffeCatalog = catalogEntryAlias
@@ -436,5 +439,109 @@ func TestPlatformShellIsPlatformInKernel(t *testing.T) {
 	}
 	if k.teamID != "" {
 		t.Errorf("platform shell has team id %q", k.teamID)
+	}
+}
+
+// --- anchors -----------------------------------------------------------------
+
+// zshClient is a zsh one-liner that connects to the socket itself, so the
+// connecting process is the genuine /bin/zsh platform binary.
+const zshClient = `zmodload zsh/net/socket && zsocket ` + socketArg + ` && print -nu $REPLY hi && read -u $REPLY -k 2`
+
+func platformRowAttestor(t *testing.T, anchor spiffe.Anchor, team string) *attestor {
+	t.Helper()
+	a, err := newAttestor(darwinSystem{}, []spiffe.CatalogEntry{{
+		Anchor:        anchor,
+		Name:          "zsh",
+		TeamID:        team,
+		SigningID:     "com.apple.zsh",
+		ExpectedPaths: []string{"/bin/zsh"},
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+func TestApplePlatformAnchorAcceptsRealShell(t *testing.T) {
+	needFixtures(t)
+	a := platformRowAttestor(t, spiffe.AnchorApplePlatform, "")
+	id, err := attestArgv(t, a, "/bin/zsh", "-c", zshClient)
+	if err != nil {
+		t.Fatalf("attest /bin/zsh under an apple-platform row: %v", err)
+	}
+	if id.Tool != "zsh" || id.SigningID != "com.apple.zsh" || id.TeamID != "" || id.ShellHops != 0 {
+		t.Errorf("id = %+v", id)
+	}
+	if !id.PathProtected {
+		t.Error("/bin/zsh not reported path-protected")
+	}
+	if id.Entry.Anchor != spiffe.AnchorApplePlatform {
+		t.Errorf("entry anchor = %q", id.Entry.Anchor)
+	}
+}
+
+func TestDeveloperIDAnchorRefusesPlatformBinary(t *testing.T) {
+	needFixtures(t)
+	// A developer-id row for /bin/zsh cannot be satisfied: no Team ID, no
+	// Developer ID marker. An empty Anchor must read as developer-id.
+	a := platformRowAttestor(t, "", "Q6L2SF6YDW")
+	_, err := attestArgv(t, a, "/bin/zsh", "-c", zshClient)
+	if !errors.Is(err, ErrSignatureMismatch) || !strings.Contains(err.Error(), "Team ID") {
+		t.Fatalf("err = %v, want ErrSignatureMismatch on Team ID", err)
+	}
+}
+
+func TestApplePlatformAnchorRefusesVendorBinary(t *testing.T) {
+	needFixtures(t)
+	a, err := newAttestor(darwinSystem{}, []spiffe.CatalogEntry{{
+		Anchor:        spiffe.AnchorApplePlatform,
+		Name:          fixtureTool,
+		SigningID:     fixtureIdent,
+		ExpectedPaths: []string{fixtures.catalog},
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.roots = append(fixtures.ca.roots(), appleRoots()...)
+	_, err = attestArgv(t, a, fixtures.good, "client", socketArg)
+	if !errors.Is(err, ErrSignatureMismatch) || !strings.Contains(err.Error(), "platform") {
+		t.Fatalf("err = %v, want ErrSignatureMismatch naming the platform check", err)
+	}
+}
+
+func TestIsAppleCodeSigningChain(t *testing.T) {
+	f, err := os.Open("/bin/zsh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	st, _ := f.Stat()
+	sig, err := verifyMachO(f, st.Size(), sliceSelector{}, appleRoots())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isAppleCodeSigningChain(sig.Chain) {
+		t.Error("/bin/zsh chain not recognised as Apple's code-signing chain")
+	}
+	home, _ := os.UserHomeDir()
+	if m, _ := filepath.Glob(filepath.Join(home, ".local/share/claude/versions/*")); len(m) > 0 {
+		cf, err := os.Open(m[len(m)-1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cf.Close()
+		cst, _ := cf.Stat()
+		csig, err := verifyMachO(cf, cst.Size(), sliceSelector{}, appleRoots())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if isAppleCodeSigningChain(csig.Chain) {
+			t.Error("a Developer ID chain was accepted as Apple's platform chain")
+		}
+	}
+	ca := newTestCA(t)
+	if isAppleCodeSigningChain([]*x509.Certificate{ca.leaf, ca.inter, ca.root}) {
+		t.Error("test chain accepted as Apple's")
 	}
 }

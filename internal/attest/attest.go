@@ -144,4 +144,15 @@ var (
 	// chain and the kernel cdhash cross-check take over as the control there;
 	// an ad-hoc or unsigned binary has neither and is refused.
 	ErrUnsignedAtWritablePath = errors.New("attest: unsigned binary at a user-writable path")
+	// ErrChainChanged is returned by Recheck (see Rechecker) when the
+	// connecting process is still the one that was attested but the walk from
+	// it no longer reaches the same catalog tool: typically the shell hop or
+	// the tool exited and the helper was reparented. It is a lifecycle event,
+	// not a refusal of an untrusted caller, and it is typed separately so an
+	// audit line can tell the two apart. The underlying reason is wrapped.
+	ErrChainChanged = errors.New("attest: parent chain changed since attestation")
 )
+
+// Every typed error this package returns is declared in the block above. A
+// caller mapping rejections to statuses can treat that block as the complete
+// surface; a new error belongs there, not in an implementation file.

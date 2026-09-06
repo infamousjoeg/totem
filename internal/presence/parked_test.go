@@ -316,7 +316,7 @@ func TestParkedErrorsAreDistinct(t *testing.T) {
 	errs := []error{
 		ErrParkedNotFound, ErrParkedInvalid, ErrParkedNotPending, ErrParkedNotApproved,
 		ErrParkedExpired, ErrParkedConsumed, ErrIrreversibleInBatch, ErrPreSigned, ErrTooManyParked,
-		ErrNotHolder, ErrPresenceConsumed,
+		ErrNotHolder, ErrPresenceConsumed, ErrScopeInvalid,
 		ErrGrantNotFound, ErrGrantRevoked, ErrGrantExpired, ErrGrantInvalid, ErrGrantHashMismatch,
 		ErrNotNarrower, ErrExpiryWidens, ErrSessionNotFound, ErrNotAncestor, ErrRewidenRequiresPresence,
 		ErrInvalidWindow, ErrLevelHasNoSession, ErrBoundAssertionCannotOpenWindow,

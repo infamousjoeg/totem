@@ -111,14 +111,14 @@ const (
 )
 
 // Decide classifies one outward transaction of amountUSD given what the grant
-// has already spent today. m is normalized first, so a NaN or negative
-// ceiling reads as zero and cannot lift the floor; a NaN, negative, or
-// infinite amount or running total is MoneyOverCeiling. A zero Money (no
-// per-transaction ceiling) permits no movement at all, including a $0
-// authorization hold.
+// has already spent today. Every float is checked here, on its own, without
+// relying on anything having been normalized upstream: a NaN, infinite, or
+// negative ceiling makes m invalid and permits nothing; a NaN, infinite, or
+// negative amount or running total is invalid input and is MoneyOverCeiling.
+// A zero Money (no per-transaction ceiling) permits no movement at all,
+// including a $0 authorization hold.
 func (m Money) Decide(amountUSD, spentTodayUSD float64) MoneyVerdict {
-	m = m.normalize()
-	if !finiteNonNegative(amountUSD) || !finiteNonNegative(spentTodayUSD) {
+	if !m.valid() || !finiteNonNegative(amountUSD) || !finiteNonNegative(spentTodayUSD) {
 		return MoneyOverCeiling
 	}
 	threshold := TrivialMoneyUSD
@@ -138,13 +138,41 @@ func (m Money) Decide(amountUSD, spentTodayUSD float64) MoneyVerdict {
 	return MoneyDelegated
 }
 
+// finiteNonNegative is the one predicate every money float must pass. NaN
+// fails the comparison, so it needs no special case.
 func finiteNonNegative(f float64) bool {
 	return f >= 0 && !math.IsInf(f, 0)
 }
 
+// valid reports whether every ceiling is finite and non-negative.
+func (m Money) valid() bool {
+	return finiteNonNegative(m.PerTransactionUSD) && finiteNonNegative(m.PerDayUSD) && finiteNonNegative(m.StepUpAboveUSD)
+}
+
+// ErrScopeInvalid: a scope carries a NaN, infinite, or negative number.
+// Refused at every entry point rather than clamped, so a malformed ceiling
+// can never be read as a permissive one.
+var ErrScopeInvalid = errors.New("presence: scope has a non-finite or negative number")
+
+// Validate returns ErrScopeInvalid if any number in the scope is NaN,
+// infinite, or negative.
+func (s Scope) Validate() error {
+	if !s.Money.valid() {
+		return fmt.Errorf("%w: money %+v", ErrScopeInvalid, s.Money)
+	}
+	if !finiteNonNegative(s.SpendCapUSD) {
+		return fmt.Errorf("%w: spend cap %v", ErrScopeInvalid, s.SpendCapUSD)
+	}
+	return nil
+}
+
 // Within reports whether m is no wider than parent on every axis. A lower
-// step-up threshold is narrower, since it sends more to presence.
+// step-up threshold is narrower, since it sends more to presence. An invalid
+// m is never within anything.
 func (m Money) Within(parent Money) bool {
+	if !m.valid() {
+		return false
+	}
 	return m.PerTransactionUSD <= parent.PerTransactionUSD &&
 		m.PerDayUSD <= parent.PerDayUSD &&
 		m.StepUpAboveUSD <= parent.StepUpAboveUSD
@@ -152,21 +180,17 @@ func (m Money) Within(parent Money) bool {
 
 func (m Money) normalize() Money {
 	return Money{
-		PerTransactionUSD: nonNegative(m.PerTransactionUSD),
-		PerDayUSD:         nonNegative(m.PerDayUSD),
-		StepUpAboveUSD:    nonNegative(m.StepUpAboveUSD),
+		PerTransactionUSD: canonFloat(m.PerTransactionUSD),
+		PerDayUSD:         canonFloat(m.PerDayUSD),
+		StepUpAboveUSD:    canonFloat(m.StepUpAboveUSD),
 	}
 }
 
-// nonNegative maps NaN, negatives, and -0 to 0 so normalized scopes hash
-// canonically; +Inf is clamped to the largest finite value so it still
-// compares as a ceiling.
-func nonNegative(f float64) float64 {
-	if f <= 0 || math.IsNaN(f) {
+// canonFloat maps -0 to +0 so equal scopes hash equal. It does not clamp:
+// invalid numbers are rejected by Validate, never silently repaired.
+func canonFloat(f float64) float64 {
+	if f == 0 {
 		return 0
-	}
-	if math.IsInf(f, 1) {
-		return math.MaxFloat64
 	}
 	return f
 }
@@ -201,9 +225,9 @@ type Scope struct {
 	Money Money
 }
 
-// Normalize returns a copy with sorted, de-duplicated sets, non-negative
-// numbers, and SpendCapUSD zeroed when ClaudeProxy is off, so equal scopes
-// compare and hash equal.
+// Normalize returns a copy with sorted, de-duplicated sets, -0 mapped to 0,
+// and SpendCapUSD zeroed when ClaudeProxy is off, so equal scopes compare and
+// hash equal. It does not repair invalid numbers; see Validate.
 func (s Scope) Normalize() Scope {
 	n := Scope{
 		AWSProfiles:  normalizeSet(s.AWSProfiles),
@@ -213,7 +237,7 @@ func (s Scope) Normalize() Scope {
 		Money:        s.Money.normalize(),
 	}
 	if s.ClaudeProxy {
-		n.SpendCapUSD = nonNegative(s.SpendCapUSD)
+		n.SpendCapUSD = canonFloat(s.SpendCapUSD)
 	}
 	return n
 }
@@ -230,8 +254,12 @@ func normalizeSet(in []string) []string {
 
 // Within reports whether s confers no capability parent does not: every set
 // is a subset, ClaudeProxy is not newly on, the spend cap and every money
-// ceiling are no higher. This is the monotonic-narrowing predicate.
+// ceiling are no higher. This is the monotonic-narrowing predicate. An
+// invalid s (Validate fails) is never within anything.
 func (s Scope) Within(parent Scope) bool {
+	if s.Validate() != nil {
+		return false
+	}
 	s, parent = s.Normalize(), parent.Normalize()
 	if !subset(s.AWSProfiles, parent.AWSProfiles) ||
 		!subset(s.GitHubScopes, parent.GitHubScopes) ||
@@ -476,14 +504,17 @@ func (r *Registry) Sponsor(g Grant, v *Verified) (*Grant, error) {
 	case len(g.Lineage) != 0 || g.ID != "":
 		return nil, fmt.Errorf("%w: a sponsored grant is a root", ErrGrantInvalid)
 	}
+	if err := g.Scope.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrGrantInvalid, err)
+	}
 	if !equalBytes(v.RequestHash, g.Hash()) {
 		return nil, ErrGrantHashMismatch
 	}
-	if err := v.consume(); err != nil {
-		return nil, err
-	}
 	id, err := r.newID()
 	if err != nil {
+		return nil, err
+	}
+	if err := v.consume(); err != nil {
 		return nil, err
 	}
 	root := &Grant{
@@ -618,6 +649,9 @@ func (r *Registry) Narrow(sessionID string, scope Scope, until time.Time) (*Gran
 	}
 	parent, err := r.active(s.ActiveGrantID, now)
 	if err != nil {
+		return nil, err
+	}
+	if err := scope.Validate(); err != nil {
 		return nil, err
 	}
 	if !scope.Within(parent.Scope) {

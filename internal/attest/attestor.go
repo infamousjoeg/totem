@@ -142,10 +142,22 @@ var defaultSystem system
 // errProcessGone means a pid in the walk no longer exists.
 var errProcessGone = errors.New("process no longer exists")
 
+// pattern is one expanded expected path.
+type pattern struct {
+	glob string
+	// home is true when the pattern came from a ~ prefix expanded against
+	// the AGENT's home directory. Such a pattern is only meaningful when the
+	// peer runs as the agent's uid; for any other uid it is not consulted,
+	// because matching another user's tool against this user's home would
+	// be silently wrong. Rows meant for a dedicated-uid agent use absolute
+	// paths.
+	home bool
+}
+
 // catalogRow is a catalog entry with its expected paths expanded.
 type catalogRow struct {
 	entry    spiffe.CatalogEntry
-	patterns []string
+	patterns []pattern
 }
 
 // attestor implements Attestor and Rechecker.
@@ -170,13 +182,14 @@ func newAttestor(sys system, catalog []spiffe.CatalogEntry, pins map[string]stri
 		}
 		row := catalogRow{entry: e}
 		for _, p := range e.ExpectedPaths {
+			isHome := strings.HasPrefix(p, "~/")
 			pat := expandPath(p, home)
-			row.patterns = append(row.patterns, pat)
+			row.patterns = append(row.patterns, pattern{glob: pat, home: isHome})
 			// The kernel reports real paths; a pattern whose fixed prefix
 			// goes through a symlink (/tmp, /var, a symlinked home) is also
 			// matched in its resolved form.
 			if resolved := resolvePatternPrefix(pat); resolved != pat {
-				row.patterns = append(row.patterns, resolved)
+				row.patterns = append(row.patterns, pattern{glob: resolved, home: isHome})
 			}
 		}
 		a.catalog = append(a.catalog, row)
@@ -217,12 +230,33 @@ func validateEntry(e spiffe.CatalogEntry) error {
 	if e.SigningID == "" {
 		return fmt.Errorf("attest: catalog entry %q has no signing identifier (decision 22)", e.Name)
 	}
+	switch anchorOf(e) {
+	case spiffe.AnchorDeveloperID:
+		if e.TeamID == "" {
+			return fmt.Errorf("attest: catalog entry %q is anchored on a Developer ID but has no Team ID", e.Name)
+		}
+	case spiffe.AnchorApplePlatform:
+		if e.TeamID != "" {
+			return fmt.Errorf("attest: catalog entry %q is anchored on an Apple platform signature but names Team ID %q; platform binaries carry none", e.Name, e.TeamID)
+		}
+	default:
+		return fmt.Errorf("attest: catalog entry %q has unknown anchor %q", e.Name, e.Anchor)
+	}
 	for _, p := range e.ExpectedPaths {
 		if !strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "~/") {
 			return fmt.Errorf("attest: catalog entry %q expected path %q is not absolute", e.Name, p)
 		}
 	}
 	return nil
+}
+
+// anchorOf reads a row's anchor with the contract's default: empty means
+// AnchorDeveloperID, the narrower one, so an old row cannot widen.
+func anchorOf(e spiffe.CatalogEntry) spiffe.Anchor {
+	if e.Anchor == "" {
+		return spiffe.AnchorDeveloperID
+	}
+	return e.Anchor
 }
 
 // expandPath resolves a leading ~ against home and cleans the pattern.
@@ -252,17 +286,26 @@ func resolvePatternPrefix(pat string) string {
 	return resolved + rest
 }
 
-// matchCatalog returns the row whose expected paths glob-match path.
-func (a *attestor) matchCatalog(path string) *catalogRow {
+// matchCatalog returns the row whose expected paths glob-match path for a
+// peer running as peerUID. Patterns expanded from ~ are consulted only when
+// the peer is the agent's own uid (see pattern.home); the second result says
+// how many were left out, so the refusal can say why.
+func (a *attestor) matchCatalog(path string, peerUID uint32) (*catalogRow, int) {
 	path = filepath.Clean(path)
+	skipped := 0
+	sameUser := peerUID == a.sys.uid()
 	for i := range a.catalog {
 		for _, pat := range a.catalog[i].patterns {
-			if ok, err := filepath.Match(pat, path); err == nil && ok {
-				return &a.catalog[i]
+			if pat.home && !sameUser {
+				skipped++
+				continue
+			}
+			if ok, err := filepath.Match(pat.glob, path); err == nil && ok {
+				return &a.catalog[i], skipped
 			}
 		}
 	}
-	return nil
+	return nil, skipped
 }
 
 // AttestPeer implements Attestor. The sequence is: read the peer's pid and
@@ -295,10 +338,16 @@ func (a *attestor) Recheck(ctx context.Context, id *Identity) error {
 	}
 	again, err := a.attest(ctx, peerCred{pid: id.Peer.PID, uid: id.Peer.UID, gid: id.Peer.GID})
 	if err != nil {
-		return err
+		if errors.Is(err, ErrPIDReused) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		// The connecting process is unchanged, so a walk that no longer
+		// reaches the tool means something above it moved: a shell hop or
+		// the tool itself exited. Keep the underlying reason visible.
+		return fmt.Errorf("%w: %w", ErrChainChanged, err)
 	}
 	if again.Tool != id.Tool {
-		return fmt.Errorf("%w: tool changed from %q to %q", ErrSignatureMismatch, id.Tool, again.Tool)
+		return fmt.Errorf("%w: tool changed from %q to %q", ErrChainChanged, id.Tool, again.Tool)
 	}
 	if again.BinaryHash != id.BinaryHash {
 		return fmt.Errorf("%w: binary hash changed from %s to %s", ErrSignatureMismatch, id.BinaryHash, again.BinaryHash)
@@ -328,6 +377,9 @@ type inspection struct {
 	// refusal is set when the binary sits at a catalog path but fails its
 	// checks; it is the ErrSignatureMismatch to return.
 	refusal error
+	// note carries a reason a catalog match was not attempted, for the
+	// ErrNotInCatalog message.
+	note string
 }
 
 func (a *attestor) attest(ctx context.Context, pc peerCred) (*Identity, error) {
@@ -391,6 +443,9 @@ func (a *attestor) attest(ctx context.Context, pc peerCred) (*Identity, error) {
 		default:
 			if insp.refusal != nil {
 				return nil, insp.refusal
+			}
+			if insp.note != "" {
+				return nil, fmt.Errorf("%w: %s (%s)", ErrNotInCatalog, cur.exePath, insp.note)
 			}
 			return nil, fmt.Errorf("%w: %s", ErrNotInCatalog, cur.exePath)
 		}
@@ -456,6 +511,11 @@ func (a *attestor) inspect(p *process) (*inspection, error) {
 	if !st.Mode().IsRegular() {
 		return nil, fmt.Errorf("%w: %s is not a regular file", ErrNotInCatalog, p.exePath)
 	}
+	// The hash and the page-hash pass below read the whole binary on every
+	// attestation, about 0.1 s for a 200 MB Claude Code build. That is per
+	// connection, not per RPC, and it is deliberately NOT cached: a cache
+	// keyed on path or size or mtime is exactly the staleness an attacker
+	// who can write to that path would exploit. Do not add one.
 	insp.hash, err = hashReader(f)
 	if err != nil {
 		return nil, fmt.Errorf("%w: hashing %s: %v", ErrNotInCatalog, p.exePath, err)
@@ -473,7 +533,8 @@ func (a *attestor) inspect(p *process) (*inspection, error) {
 		}
 	}
 
-	if row := a.matchCatalog(p.exePath); row != nil {
+	row, skippedHome := a.matchCatalog(p.exePath, p.uid)
+	if row != nil {
 		insp.row = row
 		if err := a.checkCatalogBinary(row, insp, sigErr); err != nil {
 			insp.refusal = err
@@ -481,6 +542,9 @@ func (a *attestor) inspect(p *process) (*inspection, error) {
 		}
 		insp.kind = kindCatalog
 		return insp, nil
+	}
+	if skippedHome > 0 {
+		insp.note = fmt.Sprintf("%d catalog path(s) under ~ not consulted: peer uid %d is not the agent uid %d, and ~ only expands for the agent's own user", skippedHome, p.uid, a.sys.uid())
 	}
 	if a.selfPath != "" && p.exePath == a.selfPath && insp.hash == a.selfHash {
 		insp.kind = kindSelf
@@ -523,10 +587,11 @@ func (a *attestor) checkCatalogBinary(row *catalogRow, insp *inspection, sigErr 
 		return fmt.Errorf("%w: %s: kernel code-signing status %#x is not valid", ErrSignatureMismatch, e.Name, insp.kcs.flags)
 	}
 	sig := insp.sig
-	vendorSigned := sigErr == nil && !sig.Adhoc && len(sig.Chain) > 0
-	if !vendorSigned {
-		// Nothing chains to a vendor. The only thing left that can hold is a
-		// pin at a path the user cannot rewrite.
+	chained := sigErr == nil && !sig.Adhoc && len(sig.Chain) > 0
+	if !chained {
+		// Nothing chains to a trusted root. Both anchors require a chain, so
+		// this is a refusal either way; at a writable path it is the one
+		// with its own name.
 		if !insp.protectedPath {
 			if sigErr != nil {
 				return fmt.Errorf("%w: %s: %v", ErrUnsignedAtWritablePath, e.Name, sigErr)
@@ -536,32 +601,39 @@ func (a *attestor) checkCatalogBinary(row *catalogRow, insp *inspection, sigErr 
 		if sigErr != nil {
 			return fmt.Errorf("%w: %s: %v", ErrSignatureMismatch, e.Name, sigErr)
 		}
-		if e.TeamID != "" {
-			return fmt.Errorf("%w: %s is ad-hoc signed but the catalog requires Team ID %s", ErrSignatureMismatch, e.Name, e.TeamID)
-		}
-		if !pinned {
-			return fmt.Errorf("%w: %s is ad-hoc signed and has no pinned hash", ErrSignatureMismatch, e.Name)
-		}
-		if sig.Identifier != e.SigningID {
-			return fmt.Errorf("%w: %s signing identifier %q, catalog expects %q", ErrSignatureMismatch, e.Name, sig.Identifier, e.SigningID)
-		}
-		return nil
+		return fmt.Errorf("%w: %s is ad-hoc signed but the catalog anchors it on %s", ErrSignatureMismatch, e.Name, anchorOf(e))
 	}
 	if sig.Identifier != e.SigningID {
 		return fmt.Errorf("%w: %s signing identifier %q, catalog expects %q", ErrSignatureMismatch, e.Name, sig.Identifier, e.SigningID)
 	}
-	if e.TeamID == "" {
-		return fmt.Errorf("%w: catalog entry %s has no Team ID to match a vendor-signed binary against", ErrSignatureMismatch, e.Name)
-	}
-	if sig.TeamID != e.TeamID {
-		return fmt.Errorf("%w: %s Team ID %q, catalog expects %q", ErrSignatureMismatch, e.Name, sig.TeamID, e.TeamID)
-	}
 	leaf := sig.leaf()
-	if ou := subjectOU(leaf.Subject); ou != e.TeamID {
-		return fmt.Errorf("%w: %s signing certificate OU %q is not Team ID %q", ErrSignatureMismatch, e.Name, ou, e.TeamID)
-	}
-	if !hasExtension(leaf, oidAppleDeveloperIDApplication) {
-		return fmt.Errorf("%w: %s signing certificate is not a Developer ID Application certificate", ErrSignatureMismatch, e.Name)
+	switch anchorOf(e) {
+	case spiffe.AnchorDeveloperID:
+		if sig.TeamID != e.TeamID {
+			return fmt.Errorf("%w: %s Team ID %q, catalog expects %q", ErrSignatureMismatch, e.Name, sig.TeamID, e.TeamID)
+		}
+		if ou := subjectOU(leaf.Subject); ou != e.TeamID {
+			return fmt.Errorf("%w: %s signing certificate OU %q is not Team ID %q", ErrSignatureMismatch, e.Name, ou, e.TeamID)
+		}
+		if !hasExtension(leaf, oidAppleDeveloperIDApplication) {
+			return fmt.Errorf("%w: %s signing certificate is not a Developer ID Application certificate", ErrSignatureMismatch, e.Name)
+		}
+	case spiffe.AnchorApplePlatform:
+		// Three independent judgements must agree that this is Apple's own
+		// code: the CodeDirectory says platform, the kernel says platform,
+		// and the chain runs through Apple's code-signing CA to Apple's root.
+		if sig.Platform == 0 {
+			return fmt.Errorf("%w: %s CodeDirectory platform byte is zero; not an Apple platform binary", ErrSignatureMismatch, e.Name)
+		}
+		if !insp.kcs.isPlatformBinary() {
+			return fmt.Errorf("%w: %s: kernel does not flag the process as a platform binary (status %#x)", ErrSignatureMismatch, e.Name, insp.kcs.flags)
+		}
+		if sig.TeamID != "" {
+			return fmt.Errorf("%w: %s carries Team ID %q; platform binaries carry none", ErrSignatureMismatch, e.Name, sig.TeamID)
+		}
+		if !isAppleCodeSigningChain(sig.Chain) {
+			return fmt.Errorf("%w: %s signature does not chain through Apple's code-signing CA to Apple Root CA", ErrSignatureMismatch, e.Name)
+		}
 	}
 	// The kernel's own reading of the running code must agree with the
 	// signature we verified on disk; the cdhash match already guarantees

@@ -157,9 +157,13 @@ func (v *Verified) Valid() bool { return v != nil && v.ok }
 // Used reports whether a consumer has already accepted v.
 func (v *Verified) Used() bool { return v != nil && v.used.Load() }
 
-// consume marks v used. It is called by every consumer after all its other
-// checks pass, so a refused use does not burn the proof, and exactly one
-// consumer ever succeeds.
+// consume marks v used. RULE: it is the LAST thing that can fail in every
+// consumer. Every check, lookup, and fallible allocation (including id
+// generation) comes before it, and every mutation comes after it, so a
+// refused use never burns the proof, a burnt proof always has its effect
+// recorded, and exactly one of two racing consumers mutates anything (the
+// atomic swap decides; the loser returns ErrPresenceConsumed having written
+// nothing). When adding a step to a consumer, put it above this call.
 func (v *Verified) consume() error {
 	if !v.Valid() {
 		return ErrPresenceRequired

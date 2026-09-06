@@ -88,6 +88,16 @@ func TestSponsor(t *testing.T) {
 			h.Until = clk.At(MaxGrantDuration + time.Second)
 			return h
 		}, verified("mac-studio", clk.Now(), func() []byte { h := g; h.Until = clk.At(MaxGrantDuration + time.Second); return h.Hash() }()), ErrGrantInvalid},
+		{"NaN money", func() Grant {
+			h := g
+			h.Scope.Money.PerDayUSD = math.NaN()
+			return h
+		}, verified("mac-studio", clk.Now(), func() []byte { h := g; h.Scope.Money.PerDayUSD = math.NaN(); return h.Hash() }()), ErrGrantInvalid},
+		{"negative spend cap", func() Grant {
+			h := g
+			h.Scope.SpendCapUSD = -1
+			return h
+		}, verified("mac-studio", clk.Now(), func() []byte { h := g; h.Scope.SpendCapUSD = -1; return h.Hash() }()), ErrGrantInvalid},
 		{"exactly MaxGrantDuration", func() Grant {
 			h := g
 			h.Until = clk.At(MaxGrantDuration)
@@ -216,6 +226,24 @@ func TestNarrowRefusesAddedCapability(t *testing.T) {
 			_, err := reg.Narrow(s.ID, sc, time.Time{})
 			mustErr(t, err, ErrNotNarrower)
 		})
+	}
+	// Non-finite or negative numbers are refused as invalid before Within
+	// is even asked; they are never read as "narrower".
+	for _, f := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), -0.01} {
+		for _, mut := range []func(*Scope, float64){
+			func(s *Scope, v float64) { s.Money.PerTransactionUSD = v },
+			func(s *Scope, v float64) { s.Money.PerDayUSD = v },
+			func(s *Scope, v float64) { s.Money.StepUpAboveUSD = v },
+			func(s *Scope, v float64) { s.SpendCapUSD = v },
+		} {
+			sc := Scope{ClaudeProxy: true}
+			mut(&sc, f)
+			if sc.Within(base) {
+				t.Fatalf("invalid scope %+v passed Within", sc)
+			}
+			_, err := reg.Narrow(s.ID, sc, time.Time{})
+			mustErr(t, err, ErrScopeInvalid)
+		}
 	}
 	// Claude proxy on when parent has it off.
 	off := base
@@ -458,9 +486,29 @@ func TestNarrowingMonotonicProperty(t *testing.T) {
 		add(func(s *Scope) { s.Money.StepUpAboveUSD = p.Money.StepUpAboveUSD + 0.01 })
 		return out
 	}
+	// poisonings enumerates every single-number way to make c invalid:
+	// NaN, +Inf, -Inf, or a negative, in any money field or the spend cap.
+	// None may pass Within or Narrow, whatever the parent.
+	poison := []float64{math.NaN(), math.Inf(1), math.Inf(-1), -rng.Float64() - 0.001}
+	poisonings := func(c Scope) []Scope {
+		var out []Scope
+		for _, v := range poison {
+			for _, mut := range []func(*Scope, float64){
+				func(s *Scope, v float64) { s.Money.PerTransactionUSD = v },
+				func(s *Scope, v float64) { s.Money.PerDayUSD = v },
+				func(s *Scope, v float64) { s.Money.StepUpAboveUSD = v },
+				func(s *Scope, v float64) { s.ClaudeProxy = true; s.SpendCapUSD = v },
+			} {
+				w := c
+				mut(&w, v)
+				out = append(out, w)
+			}
+		}
+		return out
+	}
 
 	const iterations = 500
-	checked, widened := 0, 0
+	checked, widened, poisoned := 0, 0, 0
 	for i := range iterations {
 		clk := newClock()
 		reg := NewRegistry(clk.Now)
@@ -503,6 +551,34 @@ func TestNarrowingMonotonicProperty(t *testing.T) {
 				}
 				widened++
 			}
+			// Every poisoning of the child is refused as invalid, and
+			// Money.Decide on a poisoned ceiling permits nothing.
+			for _, w := range poisonings(child) {
+				if w.Within(cur) {
+					t.Fatalf("iter %d: poisoned scope passed Within: %+v", i, w)
+				}
+				if _, err := reg.Narrow(s.ID, w, time.Time{}); !errors.Is(err, ErrScopeInvalid) {
+					t.Fatalf("iter %d: registry accepted a poisoned scope: %v", i, err)
+				}
+				if w.Money.valid() {
+					continue
+				}
+				for _, amt := range []float64{0, 0.01, rng.Float64() * 100} {
+					if v := w.Money.Decide(amt, 0); v != MoneyOverCeiling {
+						t.Fatalf("iter %d: poisoned money %+v decided %s for %v", i, w.Money, v, amt)
+					}
+				}
+				poisoned++
+			}
+			// A valid child still refuses invalid inputs to Decide.
+			for _, bad := range poison {
+				if v := child.Money.Decide(bad, 0); v != MoneyOverCeiling {
+					t.Fatalf("iter %d: amount %v decided %s", i, bad, v)
+				}
+				if v := child.Money.Decide(1, bad); v != MoneyOverCeiling {
+					t.Fatalf("iter %d: running total %v decided %s", i, bad, v)
+				}
+			}
 			cur = child
 		}
 		// The active grant's scope is Within the root's after the chain.
@@ -517,8 +593,8 @@ func TestNarrowingMonotonicProperty(t *testing.T) {
 			t.Fatalf("iter %d: lineage depth %d, want %d", i, len(active.Lineage), depth)
 		}
 	}
-	if checked < iterations || widened < iterations*3 {
-		t.Fatalf("property test under-exercised: %d narrowings, %d widenings", checked, widened)
+	if checked < iterations || widened < iterations*3 || poisoned < iterations*12 {
+		t.Fatalf("property test under-exercised: %d narrowings, %d widenings, %d poisonings", checked, widened, poisoned)
 	}
 }
 
@@ -598,7 +674,7 @@ func TestScopeNormalize(t *testing.T) {
 		GitHubScopes: []string{"z", "z"},
 		ClaudeProxy:  false,
 		SpendCapUSD:  99,
-		Money:        Money{PerTransactionUSD: -1, PerDayUSD: math.NaN(), StepUpAboveUSD: 3},
+		Money:        Money{PerTransactionUSD: math.Copysign(0, -1), PerDayUSD: 0, StepUpAboveUSD: 3},
 	}
 	n := s.Normalize()
 	if !reflect.DeepEqual(n.AWSProfiles, []string{"a", "b"}) || !reflect.DeepEqual(n.GitHubScopes, []string{"z"}) || n.Capabilities != nil {
@@ -654,15 +730,18 @@ func TestMoneyDecide(t *testing.T) {
 		{"inf", m, math.Inf(1), 0, MoneyOverCeiling},
 		{"zero money permits nothing", Money{}, 0.01, 0, MoneyOverCeiling},
 		{"zero money refuses a $0 hold", Money{}, 0, 0, MoneyOverCeiling},
-		{"NaN step-up cannot lift the floor (M3)", Money{PerTransactionUSD: 1e6, PerDayUSD: 1e6, StepUpAboveUSD: math.NaN()}, 50000, 0, MoneyStepUp},
-		{"NaN step-up reads as zero: even $1 steps up", Money{PerTransactionUSD: 1e6, PerDayUSD: 1e6, StepUpAboveUSD: math.NaN()}, 1, 0, MoneyStepUp},
+		{"NaN step-up is invalid, permits nothing (M3)", Money{PerTransactionUSD: 1e6, PerDayUSD: 1e6, StepUpAboveUSD: math.NaN()}, 50000, 0, MoneyOverCeiling},
+		{"NaN step-up is invalid even for $1", Money{PerTransactionUSD: 1e6, PerDayUSD: 1e6, StepUpAboveUSD: math.NaN()}, 1, 0, MoneyOverCeiling},
 		{"NaN per-transaction permits nothing", Money{PerTransactionUSD: math.NaN(), PerDayUSD: 100, StepUpAboveUSD: 5}, 1, 0, MoneyOverCeiling},
 		{"NaN per-day permits nothing", Money{PerTransactionUSD: 50, PerDayUSD: math.NaN(), StepUpAboveUSD: 5}, 1, 0, MoneyOverCeiling},
 		{"NaN spent today", m, 1, math.NaN(), MoneyOverCeiling},
 		{"negative spent today", m, 1, -1e12, MoneyOverCeiling},
 		{"inf spent today", m, 1, math.Inf(1), MoneyOverCeiling},
-		{"inf ceilings still floor at trivial", Money{PerTransactionUSD: math.Inf(1), PerDayUSD: math.Inf(1), StepUpAboveUSD: math.Inf(1)}, 6, 0, MoneyStepUp},
-		{"inf ceilings, trivial amount delegated", Money{PerTransactionUSD: math.Inf(1), PerDayUSD: math.Inf(1), StepUpAboveUSD: math.Inf(1)}, 4, 0, MoneyDelegated},
+		{"inf per-transaction is invalid, permits nothing", Money{PerTransactionUSD: math.Inf(1), PerDayUSD: 100, StepUpAboveUSD: 5}, 1, 0, MoneyOverCeiling},
+		{"inf step-up is invalid, permits nothing", Money{PerTransactionUSD: 50, PerDayUSD: 100, StepUpAboveUSD: math.Inf(1)}, 1, 0, MoneyOverCeiling},
+		{"negative step-up is invalid, permits nothing", Money{PerTransactionUSD: 50, PerDayUSD: 100, StepUpAboveUSD: -1}, 1, 0, MoneyOverCeiling},
+		{"negative per-day is invalid, permits nothing", Money{PerTransactionUSD: 50, PerDayUSD: -100, StepUpAboveUSD: 5}, 1, 0, MoneyOverCeiling},
+		{"negative zero ceilings are zero", Money{PerTransactionUSD: math.Copysign(0, -1), PerDayUSD: 100, StepUpAboveUSD: 5}, 1, 0, MoneyOverCeiling},
 		{"huge step-up cannot beat the floor", Money{PerTransactionUSD: 1e6, PerDayUSD: 1e6, StepUpAboveUSD: 1e6}, TrivialMoneyUSD + 0.01, 0, MoneyStepUp},
 	}
 	for _, tc := range cases {

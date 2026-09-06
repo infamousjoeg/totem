@@ -607,8 +607,11 @@ func verifySlice(sr *io.SectionReader, size int64, roots []*x509.Certificate) (*
 	sig.Chain = res.chain
 	sig.SignedAt = res.signedAt
 	// The Team ID is the certificate's claim, made under a verified chain;
-	// the CodeDirectory string is only allowed to agree with it. The kernel
-	// enforces the same agreement for Apple-chained signatures.
+	// the CodeDirectory string is only allowed to agree with it. The
+	// certificate is the thing that chains to the root, so it is the
+	// source; the CD string is what the kernel cross-checks against the
+	// chain at exec (and kills the process on disagreement), so it is the
+	// consistency check.
 	sig.TeamID = subjectOU(res.chain[0].Subject)
 	if best.teamID != "" && best.teamID != sig.TeamID {
 		return nil, fmt.Errorf("attest: CodeDirectory team id %q does not match the signing certificate OU %q", best.teamID, sig.TeamID)

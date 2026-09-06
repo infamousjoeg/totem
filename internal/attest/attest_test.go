@@ -374,16 +374,16 @@ func TestNewDefaultsToShippedCatalog(t *testing.T) {
 		t.Errorf("catalog = %+v", a.catalog)
 	}
 	home, _ := os.UserHomeDir()
-	if !strings.HasPrefix(a.catalog[0].patterns[0], home) {
-		t.Errorf("~ not expanded: %s", a.catalog[0].patterns[0])
+	if !strings.HasPrefix(a.catalog[0].patterns[0].glob, home) || !a.catalog[0].patterns[0].home {
+		t.Errorf("~ not expanded: %+v", a.catalog[0].patterns[0])
 	}
-	if row := a.matchCatalog(filepath.Join(home, ".local/share/claude/versions/2.1.261")); row == nil || row.entry.Name != "claude" {
+	if row, _ := a.matchCatalog(filepath.Join(home, ".local/share/claude/versions/2.1.261"), 501); row == nil || row.entry.Name != "claude" {
 		t.Error("shipped claude glob does not match a versions/ path")
 	}
-	if a.matchCatalog(filepath.Join(home, ".local/share/claude/versions/2.1.261/nested")) != nil {
+	if row, _ := a.matchCatalog(filepath.Join(home, ".local/share/claude/versions/2.1.261/nested"), 501); row != nil {
 		t.Error("glob * crossed a path separator")
 	}
-	if a.matchCatalog("/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe") == nil {
+	if row, _ := a.matchCatalog("/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe", 999); row == nil {
 		t.Error("homebrew path does not match")
 	}
 }
@@ -463,5 +463,88 @@ func TestIsInterpreter(t *testing.T) {
 	}
 	if !isInterpreter("/x/whatever", &kernelCodeSign{present: true, identity: "org.python.python"}) {
 		t.Error("python signing identity not recognised")
+	}
+}
+
+func TestFakeHomePatternsOnlyForAgentUID(t *testing.T) {
+	home, _ := os.UserHomeDir()
+	catalog := []spiffe.CatalogEntry{{
+		Name: "tool", TeamID: "TESTTEAM01", SigningID: "com.example.tool",
+		ExpectedPaths: []string{"~/tools/*"},
+	}}
+	exe := filepath.Join(home, "tools", "tool")
+	f := newFake(t, []fakeProc{{pid: 100, exe: exe}})
+	pins := pinFor(t, f, 100)
+	a, err := newAttestor(f, catalog, pins)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same uid as the agent (the fake's uid() is 501): ~ expands and matches.
+	if _, err := a.attest(context.Background(), peerCred{pid: 100, uid: 501}); err != nil {
+		t.Fatalf("same-uid peer: %v", err)
+	}
+	// A different uid: the ~ pattern is not consulted at all, and the
+	// refusal says so.
+	f.procs[100].uid = 502
+	_, err = a.attest(context.Background(), peerCred{pid: 100, uid: 502})
+	if !errors.Is(err, ErrNotInCatalog) || !strings.Contains(err.Error(), "under ~ not consulted") {
+		t.Fatalf("other-uid peer: %v, want ErrNotInCatalog naming the skipped ~ paths", err)
+	}
+}
+
+func TestFakeRecheckChainChanged(t *testing.T) {
+	f := newFake(t, []fakeProc{
+		{pid: 100, exe: "/opt/totem/totem"},
+		{pid: 90, exe: "/bin/sh", file: "/bin/sh"},
+		{pid: 80, exe: "/opt/tools/tool"},
+	})
+	a := fakeAttestor(t, f, pinFor(t, f, 80))
+	a.selfPath = "/opt/totem/totem"
+	a.selfHash, _ = hashFile(f.files[100])
+	id, err := a.attest(context.Background(), peerCred{pid: 100, uid: 501})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Recheck(context.Background(), id); err != nil {
+		t.Fatalf("Recheck with nothing changed: %v", err)
+	}
+	// The shell exits; the helper is reparented to init.
+	delete(f.procs, 90)
+	f.procs[100].ppid = 1
+	f.procs[100].parentUniqueID = 0
+	err = a.Recheck(context.Background(), id)
+	if !errors.Is(err, ErrChainChanged) {
+		t.Fatalf("Recheck after the shell exited = %v, want ErrChainChanged", err)
+	}
+	if errors.Is(err, ErrPIDReused) {
+		t.Error("a lifecycle change must not read as pid reuse")
+	}
+	// The connecting process itself being replaced is still pid reuse.
+	f.procs[100].startTime = f.procs[100].startTime.Add(time.Second)
+	if err := a.Recheck(context.Background(), id); !errors.Is(err, ErrPIDReused) {
+		t.Fatalf("Recheck after replacement = %v, want ErrPIDReused", err)
+	}
+}
+
+func TestAnchorValidation(t *testing.T) {
+	f := newFake(t, nil)
+	ok := []spiffe.CatalogEntry{
+		{Name: "a", TeamID: "T", SigningID: "s", ExpectedPaths: []string{"/a"}},
+		{Anchor: spiffe.AnchorDeveloperID, Name: "b", TeamID: "T", SigningID: "s", ExpectedPaths: []string{"/b"}},
+		{Anchor: spiffe.AnchorApplePlatform, Name: "c", SigningID: "com.apple.git", ExpectedPaths: []string{"/usr/bin/git"}},
+	}
+	if _, err := newAttestor(f, ok, nil); err != nil {
+		t.Fatalf("valid rows refused: %v", err)
+	}
+	bad := []spiffe.CatalogEntry{
+		{Name: "no-team-devid", SigningID: "s", ExpectedPaths: []string{"/a"}},
+		{Anchor: spiffe.AnchorDeveloperID, Name: "no-team-explicit", SigningID: "s", ExpectedPaths: []string{"/a"}},
+		{Anchor: spiffe.AnchorApplePlatform, Name: "platform-with-team", TeamID: "T", SigningID: "s", ExpectedPaths: []string{"/a"}},
+		{Anchor: "anchor-apple", Name: "unknown-anchor", SigningID: "s", ExpectedPaths: []string{"/a"}},
+	}
+	for _, e := range bad {
+		if _, err := newAttestor(f, []spiffe.CatalogEntry{e}, nil); err == nil {
+			t.Errorf("%s: accepted", e.Name)
+		}
 	}
 }

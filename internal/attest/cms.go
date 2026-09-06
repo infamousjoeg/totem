@@ -56,7 +56,42 @@ var (
 	// requirement for Developer ID checks, and what this package requires on
 	// the leaf of a vendor-signed catalog binary.
 	oidAppleDeveloperIDApplication = asn1.ObjectIdentifier{1, 2, 840, 113635, 100, 6, 1, 13}
+	// oidAppleCodeSigningCA marks Apple's own "Apple Code Signing
+	// Certification Authority" intermediate, the issuer of the "Software
+	// Signing" leaves on macOS platform binaries (observed on macOS 26).
+	oidAppleCodeSigningCA = asn1.ObjectIdentifier{1, 2, 840, 113635, 100, 6, 2, 20}
+	// oidAppleSoftwareSigning marks the "macOS Software Signing" leaf itself.
+	oidAppleSoftwareSigning = asn1.ObjectIdentifier{1, 2, 840, 113635, 100, 6, 22}
 )
+
+// isAppleCodeSigningChain reports whether a verified chain is Apple's own
+// platform chain: anchored at the embedded Apple Root CA, and passing through
+// Apple's code-signing CA (by marker extension) or ending in a leaf that
+// carries Apple's software-signing marker. Chain names are not consulted.
+func isAppleCodeSigningChain(chain []*x509.Certificate) bool {
+	if len(chain) < 2 {
+		return false
+	}
+	root := chain[len(chain)-1]
+	anchored := false
+	for _, r := range appleRoots() {
+		if bytes.Equal(r.Raw, root.Raw) {
+			anchored = true
+		}
+	}
+	if !anchored {
+		return false
+	}
+	if hasExtension(chain[0], oidAppleSoftwareSigning) {
+		return true
+	}
+	for _, c := range chain[1 : len(chain)-1] {
+		if hasExtension(c, oidAppleCodeSigningCA) {
+			return true
+		}
+	}
+	return false
+}
 
 // ASN.1 shapes from RFC 5652, only as much as a code signature needs.
 type cmsContentInfo struct {
