@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -71,6 +72,27 @@ var ErrBackupChainBroken = errors.New("store: the backup's hash chain does not v
 // ErrPassphraseTooShort means the Summon-resolved backup passphrase is shorter
 // than MinPassphraseBytes.
 var ErrPassphraseTooShort = errors.New("store: backup passphrase is shorter than the minimum")
+
+// ErrBackupIsOlder means the backup's chain head is BEHIND the live chain's, so
+// restoring it would roll the issuer back to an earlier state.
+//
+// This is refused because a rollback is the one attack the hash chain cannot
+// see. Every record in an older chain was legitimately admin-signed, so it
+// verifies perfectly; what is missing is the records that came after, and among
+// those are revocations. Policy rebuilds authority by replaying the chain and
+// keeps no separate record of what was revoked, so a chain rolled back past a
+// revocation is a revoked device, admin or grant that works again. That would
+// defeat the durable revocation the README promises on its first screen.
+var ErrBackupIsOlder = errors.New("store: the backup is older than the live chain; restoring it would roll back revocations")
+
+// ErrBackupDiverged means the backup is not an ancestor of the live chain: at
+// the sequence where the two should agree, they carry different hashes.
+//
+// A backup and the database it is restored over should share history. One that
+// does not is a different chain, which is a stronger signal than a plain
+// rollback: something has been rewritten, or two issuers have been writing
+// under one identity.
+var ErrBackupDiverged = errors.New("store: the backup is not an ancestor of the live chain")
 
 // manifest is the plaintext-inside-the-encryption description of a backup. It
 // exists so a restore can refuse for a stated reason instead of failing partway
@@ -186,22 +208,47 @@ func (d *DB) Backup(ctx context.Context, dst string, passphrase []byte) error {
 //     running restore has usually just lost a machine, and a restore that dies
 //     halfway because it cannot reach the provider is worse than one that
 //     refuses at the start (store.go, Backup).
+//
 //   - A passphrase shorter than MinPassphraseBytes, or one that does not
 //     decrypt the file: ErrPassphraseTooShort or ErrBackupMalformed, before the
 //     live database is touched.
+//
 //   - A backup written by a newer issuer: ErrSchemaAhead. Migrations are
 //     forward-only, so there is no in-place downgrade to attempt.
+//
 //   - A backup whose database does not match the hash in its own manifest, or
 //     whose hash chain does not verify: ErrBackupMalformed or
 //     ErrBackupChainBroken.
+//
 //   - A backup whose data key generation the configured provider cannot open:
 //     ErrDataKeyMismatch. This is checked against the extracted copy, so the
 //     live database is still intact when it fires.
 //
+//   - A backup that would move the chain BACKWARDS, or that is not the live
+//     chain's own history: ErrBackupIsOlder or ErrBackupDiverged.
+//
 // Only after all of those pass is the live file replaced, by rename, in one
-// step. Restoring an older backup is survivable by design: a device enrolled
-// after the backup is simply absent afterwards, so it fails cleanly and
-// re-enrolls rather than being silently accepted.
+// step.
+//
+// On restoring an older backup, carefully, because the obvious reassurance is
+// only half true. A device ENROLLED after the backup is simply absent
+// afterwards, so it fails cleanly and re-enrolls: that direction fails closed
+// and is survivable by design (docs/totem-design-decisions.md #9). But a device,
+// admin or grant REVOKED after the backup is also absent afterwards, and that
+// direction fails OPEN: the revocation is undone and the subject works again.
+// Policy replays the chain to rebuild authority and keeps no separate record of
+// what was revoked, so nothing downstream notices.
+//
+// The hash chain cannot catch this. Every record in an older chain was
+// legitimately admin-signed and verifies perfectly; the tampering is in what is
+// MISSING, and a chain can only attest to what it contains. So the refusal is
+// here instead, comparing the backup's chain head against the live one, which
+// is the only place both are in hand at once.
+//
+// This closes the restore vector. It does not close the other half of the same
+// weakness: an attacker with write access to the file who truncates the chain
+// AND rewrites the recorded tip leaves no evidence inside the file at all. That
+// needs a witness of Head the attacker does not control, kept off the box.
 func (d *DB) Restore(ctx context.Context, src string, passphrase []byte) error {
 	// Refuse before touching anything. This is the first statement in the
 	// function on purpose.
@@ -270,13 +317,18 @@ func (d *DB) Restore(ctx context.Context, src string, passphrase []byte) error {
 		_ = staging.Close()
 		return fmt.Errorf("%w: first bad sequence is %d", ErrBackupChainBroken, badSeq)
 	}
+	// Swap. Everything that could refuse has already refused, except the one
+	// question that can only be asked against the live database: is this backup
+	// actually a later or equal state of the same chain?
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.checkNotARollback(ctx, m, staging); err != nil {
+		_ = staging.Close()
+		return err
+	}
 	if err := staging.Close(); err != nil {
 		return err
 	}
-
-	// Swap. Everything that could refuse has already refused.
-	d.mu.Lock()
-	defer d.mu.Unlock()
 	if err := d.sql.Close(); err != nil {
 		d.closed = true
 		return fmt.Errorf("store: closing the live database before the swap: %w", err)
@@ -413,6 +465,79 @@ func writeTarFile(tw *tar.Writer, name string, size int64, modTime string, r io.
 		return fmt.Errorf("store: %s changed size while being archived (%d, expected %d)", name, n, size)
 	}
 	return nil
+}
+
+// checkNotARollback refuses a restore that would move the chain backwards, or
+// onto a chain that is not the live one's own history.
+//
+// It runs under the store's lock and re-reads the live head there, so a record
+// appended while the backup was being decrypted cannot slip past the check.
+//
+// The ordinary case, restoring onto a fresh box after losing a machine, has a
+// live head of zero and passes without comment. The refusal only fires when the
+// database being replaced is ALREADY AHEAD of the backup, which is precisely
+// the case where records would be lost, and an operator who genuinely wants
+// that can restore into a fresh directory instead, which is the safer procedure
+// anyway.
+func (d *DB) checkNotARollback(ctx context.Context, m manifest, staging *DB) error {
+	liveSeq, liveHash, err := readHead(ctx, d.sql)
+	if err != nil {
+		return err
+	}
+	if liveSeq == 0 {
+		// An empty chain has nothing to roll back, so this is the fresh box the
+		// restore path exists for.
+		//
+		// It is ALSO exactly what an attacker produces by deleting the database
+		// before restoring an old backup, and this check cannot tell the two
+		// apart. That is not an oversight to fix here: no check the issuer runs
+		// against its own files can distinguish them, because the host holds
+		// everything those files are made of. Catching it needs a value the
+		// host cannot retract because it has already left the box, which is why
+		// the witness is the fleet, and why it lands with the versioned agent
+		// protocol rather than here (docs/totem-design.md, "Issuer (broker
+		// box)").
+		//
+		// So: this branch closes the restore vector, not the rollback problem.
+		return nil
+	}
+	backupHash, err := hex.DecodeString(m.ChainHeadHash)
+	if err != nil {
+		return fmt.Errorf("%w: chain head hash in the manifest: %v", ErrBackupMalformed, err)
+	}
+
+	switch {
+	case m.ChainHeadSeq < liveSeq:
+		return fmt.Errorf("%w: the backup ends at sequence %d, the live chain is at %d, so %d record(s) "+
+			"would be discarded; any revocation among them would be undone. Restore into a fresh directory "+
+			"if this rollback is deliberate",
+			ErrBackupIsOlder, m.ChainHeadSeq, liveSeq, liveSeq-m.ChainHeadSeq)
+
+	case m.ChainHeadSeq == liveSeq:
+		if !bytes.Equal(backupHash, liveHash) {
+			return fmt.Errorf("%w: both chains end at sequence %d but with different hashes", ErrBackupDiverged, liveSeq)
+		}
+		return nil
+
+	default:
+		// The backup is ahead. That is a legitimate restore, but only if the
+		// live chain is genuinely its ancestor: the backup must carry the live
+		// head's own hash at the live head's sequence.
+		var atLive []byte
+		err := staging.sql.QueryRowContext(ctx, `SELECT hash FROM chain WHERE seq = ?`, liveSeq).Scan(&atLive)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: the backup has no record at sequence %d, where the live chain ends",
+				ErrBackupDiverged, liveSeq)
+		}
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(atLive, liveHash) {
+			return fmt.Errorf("%w: at sequence %d the backup carries a different hash than the live chain",
+				ErrBackupDiverged, liveSeq)
+		}
+		return nil
+	}
 }
 
 // snapshot writes a consistent copy of the database to dst and returns the

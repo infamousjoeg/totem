@@ -3,10 +3,12 @@ package store
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -88,10 +90,17 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 
 // TestRestoreOfAnOlderBackupFailsCleanly is the survivability the spec promises:
 // "Restore from an older backup is survivable: devices enrolled after the backup
-// fail cleanly and re-enroll" (docs/totem-design-decisions.md #9). The store's
-// half of that promise is that the later device is simply absent, so the caller
-// gets ErrNotFound and can tell it to enroll again, rather than a stale row that
-// silently still works.
+// fail cleanly and re-enroll" (docs/totem-design-decisions.md #9).
+//
+// It restores onto a FRESH box, which is both the real procedure after losing a
+// machine and the only place an older backup is accepted: restoring one in
+// place is refused, because the same missing records that make a later
+// enrollment vanish would make a later REVOCATION vanish too. See
+// TestRestoreRefusesToUndoARevocation for that half.
+//
+// The store's share of the promise is that the later device is simply ABSENT,
+// so a caller gets ErrNotFound and can tell it to enroll again, rather than a
+// stale row that silently still works.
 func TestRestoreOfAnOlderBackupFailsCleanly(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -101,7 +110,6 @@ func TestRestoreOfAnOlderBackupFailsCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = d.Close() }()
 
 	mustPut(t, d, CollectionEnrollments, "device-before", []byte("enrolled early"))
 	if _, err := d.Append(ctx, Record{Kind: KindPolicy, Payload: []byte("approve device-before")}); err != nil {
@@ -117,23 +125,32 @@ func TestRestoreOfAnOlderBackupFailsCleanly(t *testing.T) {
 	if _, err := d.Append(ctx, Record{Kind: KindPolicy, Payload: []byte("approve device-after")}); err != nil {
 		t.Fatal(err)
 	}
-
-	if err := d.Restore(ctx, archive, testPassphrase); err != nil {
-		t.Fatalf("Restore: %v", err)
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
 	}
 
-	if got := mustGet(t, d, CollectionEnrollments, "device-before"); string(got) != "enrolled early" {
+	// The machine is lost. A new box, and the backup is all there is.
+	box, err := Open(ctx, t.TempDir()+"/state.db", Options{Resolver: newFakeResolver(key)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = box.Close() }()
+	if err := box.Restore(ctx, archive, testPassphrase); err != nil {
+		t.Fatalf("Restore onto a fresh box: %v", err)
+	}
+
+	if got := mustGet(t, box, CollectionEnrollments, "device-before"); string(got) != "enrolled early" {
 		t.Fatalf("the earlier device did not survive the restore: %q", got)
 	}
-	_, err = d.Get(ctx, CollectionEnrollments, "device-after")
+	_, err = box.Get(ctx, CollectionEnrollments, "device-after")
 	wantErrIs(t, err, ErrNotFound, "a device enrolled after the backup")
 
 	// And the chain is the backup's chain, intact, with no trace of the later
 	// records grafted on.
-	if ok, bad, err := d.Verify(ctx); !ok || err != nil {
+	if ok, bad, err := box.Verify(ctx); !ok || err != nil {
 		t.Fatalf("Verify after restoring an older backup: ok=%v bad=%d err=%v", ok, bad, err)
 	}
-	if seq, _, err := d.Head(ctx); err != nil || seq != 1 {
+	if seq, _, err := box.Head(ctx); err != nil || seq != 1 {
 		t.Fatalf("restored head = %d, want 1", seq)
 	}
 }
@@ -534,4 +551,259 @@ func writeArchive(t *testing.T, dir string, content []byte) string {
 		t.Fatal(err)
 	}
 	return p
+}
+
+// TestRestoreRefusesToUndoARevocation is the security property, not the
+// mechanism: the reviewer's scenario, run end to end.
+//
+// A device is revoked AFTER a backup is taken. Restoring that backup would
+// remove the revocation record, and because policy rebuilds authority by
+// replaying the chain and keeps no separate record of what was revoked, the
+// device would be live again. The chain cannot object: every record in the
+// older chain is legitimately signed. The store refuses instead.
+func TestRestoreRefusesToUndoARevocation(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	key := testKey(0x11)
+
+	d, err := Open(ctx, dir+"/state.db", Options{Resolver: newFakeResolver(key)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+
+	// A device is enrolled and approved.
+	mustPut(t, d, CollectionEnrollments, "device-01", []byte(`{"admin":true}`))
+	if _, err := d.Append(ctx, Record{Kind: KindPolicy, Payload: []byte(`{"action":"approve","device":"device-01"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	archive := dir + "/before-the-revoke.enc"
+	if err := d.Backup(ctx, archive, testPassphrase); err != nil {
+		t.Fatal(err)
+	}
+
+	// Then it is revoked. This is the record an attacker wants gone.
+	if _, err := d.Append(ctx, Record{Kind: KindPolicy, Payload: []byte(`{"action":"revoke","device":"device-01"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Delete(ctx, CollectionEnrollments, "device-01"); err != nil {
+		t.Fatal(err)
+	}
+	headSeq, headHash, err := d.Head(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = d.Restore(ctx, archive, testPassphrase)
+	wantErrIs(t, err, ErrBackupIsOlder, "restoring a backup taken before a revocation")
+	if !strings.Contains(err.Error(), "revocation") {
+		t.Errorf("the refusal should say what is at stake: %v", err)
+	}
+
+	// The revocation still stands and the live chain is untouched.
+	if _, gerr := d.Get(ctx, CollectionEnrollments, "device-01"); !errors.Is(gerr, ErrNotFound) {
+		t.Fatal("the revoked device came back")
+	}
+	seq, hash, err := d.Head(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seq != headSeq || !bytes.Equal(hash, headHash) {
+		t.Fatalf("the live chain moved: %d/%x, want %d/%x", seq, hash, headSeq, headHash)
+	}
+	if ok, _, verr := d.Verify(ctx); !ok || verr != nil {
+		t.Fatalf("the live chain was damaged by a refused restore: %v", verr)
+	}
+}
+
+// TestRestoreRollbackGate walks the four relationships a backup can have with
+// the database it is restored over.
+func TestRestoreRollbackGate(t *testing.T) {
+	ctx := context.Background()
+	key := testKey(0x11)
+
+	cases := []struct {
+		name string
+		// setup returns the archive to restore and the live store to restore onto.
+		setup func(t *testing.T, dir string) (*DB, string)
+		want  error
+	}{
+		{
+			name: "onto a fresh box, the case restore exists for",
+			setup: func(t *testing.T, dir string) (*DB, string) {
+				src, err := Open(ctx, dir+"/src.db", Options{Resolver: newFakeResolver(key)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				seedChain(t, src, 10)
+				mustPut(t, src, CollectionEnrollments, "device-01", []byte("x"))
+				archive := dir + "/a.enc"
+				if err := src.Backup(ctx, archive, testPassphrase); err != nil {
+					t.Fatal(err)
+				}
+				_ = src.Close()
+				fresh, err := Open(ctx, dir+"/fresh.db", Options{Resolver: newFakeResolver(key)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return fresh, archive
+			},
+			want: nil,
+		},
+		{
+			name: "onto the exact state it was taken from",
+			setup: func(t *testing.T, dir string) (*DB, string) {
+				d, err := Open(ctx, dir+"/state.db", Options{Resolver: newFakeResolver(key)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				seedChain(t, d, 10)
+				archive := dir + "/a.enc"
+				if err := d.Backup(ctx, archive, testPassphrase); err != nil {
+					t.Fatal(err)
+				}
+				return d, archive
+			},
+			want: nil,
+		},
+		{
+			name: "older than the live chain",
+			setup: func(t *testing.T, dir string) (*DB, string) {
+				d, err := Open(ctx, dir+"/state.db", Options{Resolver: newFakeResolver(key)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				seedChain(t, d, 10)
+				archive := dir + "/a.enc"
+				if err := d.Backup(ctx, archive, testPassphrase); err != nil {
+					t.Fatal(err)
+				}
+				seedChain(t, d, 5) // the chain moves on
+				return d, archive
+			},
+			want: ErrBackupIsOlder,
+		},
+		{
+			name: "same length, different history",
+			setup: func(t *testing.T, dir string) (*DB, string) {
+				// Two independent chains of equal length: a fork, which is a
+				// stronger signal than a plain rollback.
+				a, err := Open(ctx, dir+"/a.db", Options{Resolver: newFakeResolver(key)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				seedChain(t, a, 10)
+				archive := dir + "/a.enc"
+				if err := a.Backup(ctx, archive, testPassphrase); err != nil {
+					t.Fatal(err)
+				}
+				_ = a.Close()
+
+				b, err := Open(ctx, dir+"/b.db", Options{Resolver: newFakeResolver(key)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				for i := 0; i < 10; i++ {
+					if _, err := b.Append(ctx, Record{Kind: KindExchange, Payload: []byte("a different history")}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return b, archive
+			},
+			want: ErrBackupDiverged,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			live, archive := c.setup(t, dir)
+			defer func() { _ = live.Close() }()
+
+			beforeSeq, beforeHash, err := live.Head(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			err = live.Restore(ctx, archive, testPassphrase)
+			if c.want == nil {
+				if err != nil {
+					t.Fatalf("Restore: %v", err)
+				}
+				if ok, _, verr := live.Verify(ctx); !ok || verr != nil {
+					t.Fatalf("Verify after restore: %v", verr)
+				}
+				return
+			}
+
+			wantErrIs(t, err, c.want, "Restore")
+			seq, hash, herr := live.Head(ctx)
+			if herr != nil {
+				t.Fatal(herr)
+			}
+			if seq != beforeSeq || !bytes.Equal(hash, beforeHash) {
+				t.Fatalf("a refused restore moved the live chain to %d, was %d", seq, beforeSeq)
+			}
+		})
+	}
+}
+
+// TestTheEscapeHatchTheRefusalNamesActuallyWorks follows the refusal's own
+// instructions. ErrBackupIsOlder tells an operator to restore into a fresh
+// directory if the rollback is deliberate; a refusal that names a procedure
+// nobody has run is a support incident waiting to happen, so this runs it.
+func TestTheEscapeHatchTheRefusalNamesActuallyWorks(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	key := testKey(0x11)
+
+	live, err := Open(ctx, dir+"/state.db", Options{Resolver: newFakeResolver(key)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = live.Close() }()
+
+	mustPut(t, live, CollectionEnrollments, "device-01", []byte("from the backup"))
+	seedChain(t, live, 4)
+	archive := dir + "/older.enc"
+	if err := live.Backup(ctx, archive, testPassphrase); err != nil {
+		t.Fatal(err)
+	}
+	seedChain(t, live, 6) // the live chain moves past the backup
+
+	// In place: refused, and the message names the way out.
+	err = live.Restore(ctx, archive, testPassphrase)
+	wantErrIs(t, err, ErrBackupIsOlder, "an in-place rollback")
+	if !strings.Contains(err.Error(), "fresh directory") {
+		t.Fatalf("the refusal should name the escape hatch: %v", err)
+	}
+
+	// Now do exactly what it says. This is the whole point of the test: the
+	// deliberate rollback is possible, it just cannot happen by accident or in
+	// silence.
+	fresh, err := Open(ctx, t.TempDir()+"/state.db", Options{Resolver: newFakeResolver(key)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = fresh.Close() }()
+	if err := fresh.Restore(ctx, archive, testPassphrase); err != nil {
+		t.Fatalf("the procedure the refusal names does not work: %v", err)
+	}
+
+	if got := mustGet(t, fresh, CollectionEnrollments, "device-01"); string(got) != "from the backup" {
+		t.Fatalf("the rolled-back state is not usable: %q", got)
+	}
+	if ok, bad, verr := fresh.Verify(ctx); !ok || verr != nil {
+		t.Fatalf("Verify after the deliberate rollback: ok=%v bad=%d err=%v", ok, bad, verr)
+	}
+	if seq, _, herr := fresh.Head(ctx); herr != nil || seq != 4 {
+		t.Fatalf("rolled-back head = %d, want 4", seq)
+	}
+	// And it is a live store, not a museum piece.
+	if _, aerr := fresh.Append(ctx, Record{Kind: KindIssuance, Payload: []byte("after the rollback")}); aerr != nil {
+		t.Fatalf("Append after the deliberate rollback: %v", aerr)
+	}
+	if ok, _, verr := fresh.Verify(ctx); !ok || verr != nil {
+		t.Fatalf("Verify after appending: %v", verr)
+	}
 }
