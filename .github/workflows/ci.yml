@@ -59,6 +59,27 @@ jobs:
       - name: test with the race detector
         run: go test -race -count=1 ./...
 
+  restore-gate:
+    # The ten-minute restore is a RELEASE GATE, so it is measured at release
+    # scale rather than at the size the everyday suite can afford. This job
+    # fails if a 395 MB issuer database stops restoring inside ten minutes.
+    # Current headroom is roughly 300x; if that collapses it collapses here,
+    # and not on an operator's box after they have already lost a machine.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: restore two million chain records inside the gate
+        env:
+          TOTEM_RESTORE_GATE_RECORDS: "2000000"
+        # -v is deliberate. Without it the measurement is discarded and the job
+        # proves only that the gate was not breached, never what the margin was,
+        # which is the number that tells you it is about to be.
+        run: go test -count=1 -timeout 30m -run TestRestoreOnAFreshBoxMeetsTheTenMinuteGate -v ./internal/store/
+
   release-gate:
     # Proves the gate still bites. This job SUCCEEDS when the release build is
     # REFUSED, because the OID arc is still a placeholder. When a real IANA
