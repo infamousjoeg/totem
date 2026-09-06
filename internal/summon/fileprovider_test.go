@@ -438,3 +438,127 @@ func TestFileProviderNeedsADirectory(t *testing.T) {
 		t.Fatalf("readFileSecret with no directory = %v, want ErrFileProviderRefused", err)
 	}
 }
+
+// A reference may have several segments, so there can be directories between
+// the file provider's root and the secret. The root and its ancestors are
+// covered by checkTree; the immediate parent was always covered here.
+// Everything in between was covered by neither, which was an inconsistency
+// with the binary provider, whose whole path is walked. Found in review.
+func TestFileProviderChecksDirectoriesBetweenTheRootAndTheSecret(t *testing.T) {
+	dir := sandbox(t)
+	cfg := fileConfig(t, dir, map[string]Secret{"k": Rotating("aws/prod/key")})
+	writeSecret(t, cfg.File.Dir, "aws/prod/key", "value", 0o600)
+
+	// Neither the configured root nor the secret's immediate parent: the one
+	// in between, which nothing used to look at.
+	intermediate := filepath.Join(cfg.File.Dir, "aws")
+	if err := os.Chmod(intermediate, 0o775); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := newForTest(cfg, os.Geteuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = s.Start(context.Background())
+	if !errors.Is(err, ErrFileProviderRefused) {
+		t.Fatalf("Start with a group-writable directory between the root and the secret = %v, want ErrFileProviderRefused", err)
+	}
+	if !strings.Contains(err.Error(), intermediate) {
+		t.Fatalf("the error must name %s, got %q", intermediate, err)
+	}
+}
+
+// Outermost first: told the innermost directory is writable, an operator fixes
+// that one and leaves the directory that actually let it happen.
+func TestFileProviderNamesTheOutermostWritableDirectory(t *testing.T) {
+	dir := sandbox(t)
+	cfg := fileConfig(t, dir, map[string]Secret{"k": Rotating("aws/prod/key")})
+	p := writeSecret(t, cfg.File.Dir, "aws/prod/key", "value", 0o600)
+
+	outer := filepath.Join(cfg.File.Dir, "aws")
+	inner := filepath.Join(cfg.File.Dir, "aws", "prod")
+	for _, d := range []string{outer, inner} {
+		if err := os.Chmod(d, 0o775); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := checkSecretFile(cfg.File.Dir, p, os.Geteuid())
+	if err == nil || !strings.Contains(err.Error(), outer) {
+		t.Fatalf("want the error to name the outermost offender %s, got %v", outer, err)
+	}
+	if strings.Contains(err.Error(), inner) {
+		t.Fatalf("the error should not send the operator at the inner directory: %v", err)
+	}
+}
+
+// A symlink standing in for a directory on the way to a secret is refused
+// rather than followed.
+func TestFileProviderRefusesASymlinkedIntermediateDirectory(t *testing.T) {
+	dir := sandbox(t)
+	cfg := fileConfig(t, dir, map[string]Secret{"k": Rotating("aws/prod/key")})
+	writeSecret(t, cfg.File.Dir, "aws/prod/key", "value", 0o600)
+
+	// Replace the intermediate with a symlink pointing at an identical tree.
+	elsewhere := filepath.Join(dir, "elsewhere")
+	if err := os.MkdirAll(filepath.Join(elsewhere, "prod"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(elsewhere, "prod", "key"), []byte("substituted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	intermediate := filepath.Join(cfg.File.Dir, "aws")
+	if err := os.RemoveAll(intermediate); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, intermediate); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := newForTest(cfg, os.Geteuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = s.Start(context.Background())
+	if !errors.Is(err, ErrFileProviderRefused) {
+		t.Fatalf("Start with a symlinked intermediate = %v, want ErrFileProviderRefused", err)
+	}
+	if !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("the error must say why: %v", err)
+	}
+}
+
+// The two path walks are a matched pair, and the pairing lives in comments,
+// which nothing enforces. This test enforces the part that matters: whatever
+// checkTree refuses on a directory, checkSecretDirs must refuse too. The one
+// permitted difference runs in the other direction, so a rule tightened in
+// harden.go and forgotten here shows up as a failure rather than as a quiet
+// asymmetry a reviewer has to notice.
+func TestTheTwoPathWalksRefuseTheSameDirectories(t *testing.T) {
+	modes := []os.FileMode{0o755, 0o700, 0o775, 0o757, 0o777, 0o750}
+	for _, mode := range modes {
+		t.Run(mode.String(), func(t *testing.T) {
+			dir := sandbox(t)
+			root := filepath.Join(dir, "secrets")
+			mid := filepath.Join(root, "aws")
+			if err := os.MkdirAll(filepath.Join(mid, "prod"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			p := filepath.Join(mid, "prod", "key")
+			if err := os.WriteFile(p, []byte("v"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(mid, mode); err != nil {
+				t.Fatal(err)
+			}
+
+			treeRefused := checkTree(mid, os.Geteuid()) != nil
+			secretRefused := checkSecretDirs(root, p, os.Geteuid()) != nil
+			if treeRefused != secretRefused {
+				t.Fatalf("mode %v: checkTree refused=%v but checkSecretDirs refused=%v; "+
+					"the two walks have drifted apart, which is how the unwalked middle happened the first time",
+					mode, treeRefused, secretRefused)
+			}
+		})
+	}
+}

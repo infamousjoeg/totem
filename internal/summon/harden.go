@@ -28,6 +28,14 @@ const rootUID = 0
 // an attacker who can write the provider's directory free to swap the binary
 // after the issuer is running, which is the whole attack this exists to stop.
 //
+// This is one of TWO path walks in this package and they are a matched pair:
+// checkSecretDirs in fileprovider.go walks the built-in file provider's
+// directories under the same rules. They exist separately because they start
+// from different places, not because they may drift. If you tighten the rule
+// here, tighten it there, and read that function's comment first: it records
+// the single place the two deliberately differ and why, so that "restoring
+// parity" does not quietly loosen the stricter one.
+//
 // The walk is from the filesystem root down to p, checking each component with
 // Lstat so a symlink is seen as a symlink rather than silently followed. A
 // symlink component is allowed only if the link itself passes the ownership

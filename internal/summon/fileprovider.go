@@ -163,6 +163,22 @@ func checkSecretFile(root, p string, trustedUID int) error {
 // The walk is outermost-first so the error names the outermost offending
 // directory: told that the innermost one is writable, an operator fixes that
 // one and leaves the directory that actually let it happen.
+//
+// This and checkTree in harden.go are a MATCHED PAIR and must stay that way.
+// checkTree walks the config file and the provider binary from the filesystem
+// root down; this walks the file provider's own directories from its root down
+// to the secret. Same rules, same refusal, same message shape. A change to one
+// belongs in the other, and the whole reason this function exists is that the
+// two were NOT matched: the middle of a multi-segment reference was walked by
+// neither.
+//
+// ONE DELIBERATE DIFFERENCE, recorded so nobody "restores parity" by removing
+// it: checkTree permits a symlink component when the link itself is root-owned,
+// because /etc is a symlink on macOS and the config legitimately lives under
+// it. There is no equivalent case inside a secrets directory, so here a
+// symlinked directory is refused outright rather than resolved. That makes
+// this walk strictly stricter, never looser, which is the only direction the
+// difference is allowed to run.
 func checkSecretDirs(root, p string, trustedUID int) error {
 	root = filepath.Clean(root)
 	var dirs []string
