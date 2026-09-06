@@ -196,12 +196,13 @@ type EnrollRequest struct {
 	// approving "this device is joining <name>", not an address.
 	//
 	// THE ISSUER MUST NOT VERIFY AGAINST THIS FIELD. It verifies against its
-	// own trust domain and this value is diagnostic only: when the two differ,
-	// it turns an opaque "assertion did not verify" into "this device thinks
-	// we are called X and we are called Y", which is a typo in an enroll
-	// command rather than a mystery. Using it for verification would let a
-	// device pick the name it is checked against, which is the whole thing the
-	// binding exists to prevent.
+	// own configured trust domain, which is what presence.Verifier.Enroll
+	// takes as its trustDomain argument. This value is diagnostic ONLY: pair
+	// it with presence.ErrTargetMismatch to turn an opaque "assertion did not
+	// verify" into "this device thinks we are called X and we are called Y",
+	// which is a typo in an enroll command rather than a mystery. Using it for
+	// verification would let a device pick the name it is checked against,
+	// which is the whole thing the binding exists to prevent.
 	SignedTarget string `json:"signed_target"`
 	// EncodingVersion is the presence encoding version the signatures were
 	// made under.
