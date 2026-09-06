@@ -47,6 +47,30 @@ func packageFiles(t *testing.T) map[string]string {
 	return out
 }
 
+// rawPackageSource is every non-test file concatenated, comments INTACT. It is
+// for the rules whose subject is what a comment says.
+func rawPackageSource(t *testing.T) string {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Clean(name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.Write(data)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
 // packageSource is every non-test file concatenated, comments stripped.
 func packageSource(t *testing.T) string {
 	t.Helper()
@@ -222,5 +246,59 @@ func TestTheAssertedNameIsNeverComparedHere(t *testing.T) {
 	if loc := compare.FindString(src); loc != "" {
 		t.Errorf("the asserted name is compared in this package (%q). internal/policy detects the mismatch; "+
 			"this package only renders it.", strings.TrimSpace(loc))
+	}
+}
+
+// TestChainHeadIsStatedAndNeverChecked guards an instruction that is easy to
+// mistake for an omission.
+//
+// The head line detects an operator error or a clumsy rollback. It does not
+// close the truncation hole, because an attacker who holds the host holds the
+// log emitter and can decline to emit or emit a lie. The obvious "improvement"
+// is to record the head locally and refuse to start when it goes backwards.
+// That must not be built: a witness the host writes for itself is not a
+// witness, since the same host that truncated the chain can rewrite the file
+// recording where it used to end. It would produce exactly the false
+// confidence the honest line is written to avoid, and it would look like a
+// closed property to the next reader.
+//
+// So this asserts the absence: no comparison, no stored previous head, no
+// refusal. The real fix is the fleet witness in the versioned agent protocol.
+func TestChainHeadIsStatedAndNeverChecked(t *testing.T) {
+	t.Parallel()
+	src := packageFiles(t)["chainhead.go"]
+	if src == "" {
+		t.Fatal("chainhead.go is gone; the head line is what puts a value the host cannot retract off the box")
+	}
+
+	for _, forbidden := range []struct{ pattern, why string }{
+		{"os.ReadFile", "reading a previously recorded head from local disk"},
+		{"os.WriteFile", "recording the head locally as a witness against itself"},
+		{"store.Store.Get", "stashing the head in the same store it describes"},
+		{".Get(", "stashing the head in the same store it describes"},
+		{".Put(", "recording the head locally as a witness against itself"},
+	} {
+		if strings.Contains(src, forbidden.pattern) {
+			t.Errorf("chainhead.go contains %q (%s). A witness the host writes for itself is not a witness: "+
+				"the host that truncated the chain can rewrite the record of where it ended.",
+				forbidden.pattern, forbidden.why)
+		}
+	}
+	// No comparison of one head against another, and no refusal built on one.
+	compare := regexp.MustCompile(`(seq|hash)\s*(==|!=|<|>)\s*\w|\w\s*(==|!=|<|>)\s*(seq|hash)\b`)
+	if loc := compare.FindString(src); loc != "" {
+		t.Errorf("chainhead.go compares a head against something (%q). It states the value and lets it leave "+
+			"the box; deciding anything from it locally is the false confidence this avoids.", strings.TrimSpace(loc))
+	}
+	// And the comment has to say what it is NOT, or a future reader finds this
+	// line and concludes the property is covered. Read RAW here: packageFiles
+	// strips comments, which is right for every other rule in this file and
+	// exactly wrong for one whose subject is the comment.
+	whole := rawPackageSource(t)
+	for _, required := range []string{"does NOT close", "fleet"} {
+		if !strings.Contains(whole, required) {
+			t.Errorf("the audit comment no longer says %q. The limits of this line are the reason it is safe "+
+				"to have; a reader who takes it for a lock is worse off than one who has nothing.", required)
+		}
 	}
 }

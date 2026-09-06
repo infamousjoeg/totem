@@ -52,6 +52,34 @@ const (
 	// makes a stolen-code incident reconstructable, and it is safe to log
 	// because it identifies the device rather than authorising anything.
 	EventBootstrapRedeemed = "issuer.bootstrap_redeemed"
+	// EventChainHead states the durable hash chain's tip: the last record's
+	// sequence and hash, at issuer open and again after a restore.
+	//
+	// WHAT IT IS FOR. docs/totem-design.md: a compromised host can TRUNCATE.
+	// The chain proves its own consistency and nothing more, so removing
+	// records from the end and rewriting the recorded tip leaves a prefix that
+	// is internally valid, with no broken link and no gap in the ordinals. That
+	// reverts whatever those records did, and the case that matters is
+	// un-revoking: cutting back past a revoke-admin restores access a human
+	// took away. Detecting it needs a value the attacker does not control,
+	// which means this one, already off the box. The log stream ships via
+	// syslog or OTLP, so emitting the head here makes that copy for free.
+	//
+	// WHAT IT IS NOT, and this is the important half. It does NOT close the
+	// rollback hole. An attacker who holds the host holds the log emitter too:
+	// they can decline to emit this line, or emit a head they like, freshly
+	// consistent with the chain they just rewrote. So this catches an OPERATOR
+	// ERROR or a clumsy rollback, where a head goes backwards between two lines
+	// that were both shipped honestly, and it catches a competent attacker not
+	// at all.
+	//
+	// The real fix is ruled and is not this: the witness is the fleet. Agents
+	// remember the highest (seq, hash) the issuer showed them and require it to
+	// prove that record is still in the chain it is serving now, which is a
+	// value the host cannot retract because it has already left. That lands
+	// with the versioned agent protocol. Do not read this line as the property
+	// being covered; it is a smoke alarm, not a lock.
+	EventChainHead = "chain.head"
 	// EventRefused is a request the front door turned away before it reached
 	// the policy engine: an unrecognised credential, an incompatible agent, a
 	// malformed body.
@@ -90,6 +118,13 @@ type Event struct {
 	Outcome string
 	// Reason is the machine token for a refusal, from internal/errors.
 	Reason string
+	// ChainSeq and ChainHash carry the durable chain's tip on an
+	// EventChainHead line. Both are public by construction: shipping the hash
+	// off the box is the entire point of emitting it, and the sequence is an
+	// ordinal. ChainSeq is a pointer so that "sequence zero, nothing appended
+	// yet" is distinguishable from "this line is not about the chain".
+	ChainSeq  *int64
+	ChainHash string
 }
 
 // Record is one written line: the event, its position, and the chain.
@@ -108,6 +143,8 @@ type Record struct {
 	AgentVersion string    `json:"agent_version,omitempty"`
 	Outcome      string    `json:"outcome,omitempty"`
 	Reason       string    `json:"reason,omitempty"`
+	ChainSeq     *int64    `json:"chain_seq,omitempty"`
+	ChainHash    string    `json:"chain_hash,omitempty"`
 	PrevHash     string    `json:"prev"`
 	Hash         string    `json:"hash"`
 }
@@ -156,6 +193,8 @@ func (l *AuditLog) Log(e Event) (Record, error) {
 		AgentVersion: e.AgentVersion,
 		Outcome:      e.Outcome,
 		Reason:       e.Reason,
+		ChainSeq:     e.ChainSeq,
+		ChainHash:    e.ChainHash,
 		PrevHash:     hex.EncodeToString(l.prev),
 	}
 	// Presence age is a pointer so "zero seconds" and "no presence involved"
@@ -215,6 +254,12 @@ func chainHash(prev []byte, r Record) []byte {
 	write([]byte(r.AgentVersion))
 	write([]byte(r.Outcome))
 	write([]byte(r.Reason))
+	if r.ChainSeq == nil {
+		write(nil)
+	} else {
+		write([]byte(strconv.FormatInt(*r.ChainSeq, 10)))
+	}
+	write([]byte(r.ChainHash))
 	return h.Sum(nil)
 }
 

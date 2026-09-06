@@ -2,6 +2,8 @@ package server
 
 import (
 	"bytes"
+	"context"
+	"encoding/hex"
 	"encoding/json"
 	"reflect"
 	"strings"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/infamousjoeg/totem/internal/ca"
 	"github.com/infamousjoeg/totem/internal/presence"
+	"github.com/infamousjoeg/totem/internal/store"
 )
 
 func decodeRecords(t *testing.T, s string) []Record {
@@ -163,6 +166,11 @@ func TestEventHasNoFreeFormField(t *testing.T) {
 		"Kind": true, "SpiffeID": true, "Device": true, "ToolAnchor": true,
 		"Target": true, "Presence": true, "PresenceAge": true, "GrantID": true,
 		"Signer": true, "AgentVersion": true, "Outcome": true, "Reason": true,
+		// Added deliberately for EventChainHead. Both are public by
+		// construction: shipping the hash off the box is the point of emitting
+		// it, and the sequence is an ordinal. This test is what made that a
+		// considered edit rather than a casual one.
+		"ChainSeq": true, "ChainHash": true,
 	}
 	e := Event{}
 	tp := reflect.TypeOf(e)
@@ -174,5 +182,116 @@ func TestEventHasNoFreeFormField(t *testing.T) {
 	}
 	if tp.NumField() != len(want) {
 		t.Errorf("Event has %d fields, expected %d", tp.NumField(), len(want))
+	}
+}
+
+// TestChainHeadIsStatedWithItsSequenceAndHash. The line exists so a value the
+// host cannot later retract has already left the box; it is worth nothing if
+// either half is missing or unlabelled.
+func TestChainHeadIsStatedWithItsSequenceAndHash(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, _ := realStore(t)
+	var buf bytes.Buffer
+	log := NewAuditLog(&buf, nil)
+
+	// Empty chain first: "the chain is empty" and "the head was not reported"
+	// must not look alike to whatever reads the shipped stream.
+	if err := LogChainHead(ctx, log, db, ChainHeadAtOpen); err != nil {
+		t.Fatal(err)
+	}
+	records := decodeRecords(t, buf.String())
+	if len(records) != 1 {
+		t.Fatalf("got %d records, want 1", len(records))
+	}
+	if records[0].Kind != EventChainHead {
+		t.Errorf("kind %q, want %q", records[0].Kind, EventChainHead)
+	}
+	if records[0].ChainSeq == nil {
+		t.Fatal("an empty chain reported no sequence at all, so a reader cannot tell it from a line that is not about the chain")
+	}
+	if records[0].Outcome != string(ChainHeadAtOpen) {
+		t.Errorf("outcome %q; a reader comparing two heads needs to know whether a move was a restore or a restart", records[0].Outcome)
+	}
+
+	// Now append something and confirm the head moves and is carried whole.
+	if _, err := db.Append(ctx, store.Record{Kind: "svid.issued", At: time.Unix(0, 0), Payload: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	wantSeq, wantHash, err := db.Head(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := LogChainHead(ctx, log, db, ChainHeadAfterRestore); err != nil {
+		t.Fatal(err)
+	}
+	records = decodeRecords(t, buf.String())
+	head := records[len(records)-1]
+	if head.ChainSeq == nil || *head.ChainSeq != wantSeq {
+		t.Errorf("sequence %v, want %d", head.ChainSeq, wantSeq)
+	}
+	if head.ChainHash != hex.EncodeToString(wantHash) {
+		t.Errorf("hash %q, want %q", head.ChainHash, hex.EncodeToString(wantHash))
+	}
+	if head.ChainHash == "" {
+		t.Fatal("the head carries no hash, which is the only half an off-box reader cannot recompute")
+	}
+	if head.Outcome != string(ChainHeadAfterRestore) {
+		t.Errorf("outcome %q, want %q", head.Outcome, ChainHeadAfterRestore)
+	}
+	if ok, bad := VerifyChain(records); !ok {
+		t.Fatalf("the stdout chain broke at seq %d", bad)
+	}
+}
+
+// TestChainHeadFieldsAreCoveredByTheRecordHash. The stdout stream is itself
+// hash-chained, so a field that is written but not hashed is a field an editor
+// of the shipped log can change without breaking a link.
+func TestChainHeadFieldsAreCoveredByTheRecordHash(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, _ := realStore(t)
+	var buf bytes.Buffer
+	if err := LogChainHead(ctx, NewAuditLog(&buf, nil), db, ChainHeadAtOpen); err != nil {
+		t.Fatal(err)
+	}
+	records := decodeRecords(t, buf.String())
+	if ok, _ := VerifyChain(records); !ok {
+		t.Fatal("a freshly written head line does not verify")
+	}
+
+	// Rewrite the head an attacker would want to rewrite.
+	tampered := append([]Record(nil), records...)
+	tampered[0].ChainHash = "deadbeef"
+	if ok, bad := VerifyChain(tampered); ok {
+		t.Fatal("the chain hash on a head line can be edited without breaking the record's own hash")
+	} else if bad != 0 {
+		t.Errorf("first bad seq %d, want 0", bad)
+	}
+
+	tampered = append([]Record(nil), records...)
+	moved := int64(9999)
+	tampered[0].ChainSeq = &moved
+	if ok, _ := VerifyChain(tampered); ok {
+		t.Fatal("the sequence on a head line can be edited without breaking the record's own hash")
+	}
+}
+
+// TestLogChainHeadReportsAFailureToReadTheHead. Being unable to answer "where
+// does my chain end" at open is a real fault in the state file, and swallowing
+// it would mean the one line whose absence matters going missing quietly.
+func TestLogChainHeadReportsAFailureToReadTheHead(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, _ := realStore(t)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := LogChainHead(ctx, NewAuditLog(&buf, nil), db, ChainHeadAtOpen); err == nil {
+		t.Fatal("a store that cannot report its head produced no error")
+	}
+	if buf.Len() != 0 {
+		t.Errorf("a head line was written despite the head being unreadable: %q", buf.String())
 	}
 }

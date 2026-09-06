@@ -39,6 +39,23 @@ func cmdServe(ctx context.Context, args []string) error {
 		rt.cfg.Listen = *listen
 	}
 
+	// State the durable chain's tip, once, before serving. docs/totem-design.md
+	// on truncation: the chain proves its own consistency and nothing more, so
+	// detecting a rollback needs a value the attacker does not control, which
+	// means this one, already off the box. The log stream leaves via syslog or
+	// OTLP, so emitting it here makes that copy for free.
+	//
+	// It is emitted HERE rather than in openRuntime because stdout is the audit
+	// stream for this command and this command only; the one-shot commands
+	// print for a person on stdout, and interleaving a JSON record with that is
+	// how a shipped stream acquires lines nothing can parse.
+	//
+	// This does not close the rollback hole and must not be read as doing so.
+	// See internal/server.EventChainHead.
+	if err := server.LogChainHead(ctx, rt.audit, rt.db, server.ChainHeadAtOpen); err != nil {
+		return err
+	}
+
 	srv, err := newServer(rt)
 	if err != nil {
 		return err
