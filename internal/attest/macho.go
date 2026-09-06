@@ -74,11 +74,22 @@ type codeSignature struct {
 	// Identifier is the signing identifier from the CodeDirectory, for example
 	// com.anthropic.claude-code.
 	Identifier string
-	// TeamID is the Apple Developer Team Identifier, taken from the OU of
-	// the chain-verified signing certificate. The CodeDirectory's own team
-	// field, when present, must agree with it. Empty for ad-hoc signatures
-	// and for Apple platform binaries, whose leaf has no OU.
+	// TeamID is the Apple Developer Team Identifier of a third-party
+	// vendor: the OU of the chain-verified signing certificate when, and
+	// only when, that certificate is a Developer ID Application leaf. That is
+	// the only certificate type where Apple defines the OU to be the Team ID.
+	// Empty for ad-hoc signatures and for Apple platform binaries: Apple's
+	// own "Software Signing" leaves carry a descriptive OU ("Apple Software")
+	// and put Apple's team (59GAB85EFG) in the CodeDirectory instead, so the
+	// OU of a non-Developer-ID leaf is not a Team ID and is not reported as
+	// one.
 	TeamID string
+	// CDTeamID is the CodeDirectory's own team field, verbatim, whatever the
+	// signer. It is what the kernel reports through csops(CS_OPS_TEAMID),
+	// so it is the value the kernel cross-check compares against.
+	CDTeamID string
+	// SubjectOU is the verified leaf's OU, verbatim, for audit lines.
+	SubjectOU string
 	// CDHash is the 20-byte cdhash of the chosen CodeDirectory, exactly as the
 	// kernel reports it through csops(CS_OPS_CDHASH).
 	CDHash []byte
@@ -86,8 +97,14 @@ type codeSignature struct {
 	HashType uint8
 	// Flags is the CodeDirectory flags word.
 	Flags uint32
-	// Platform is the CodeDirectory platform identifier; non-zero only for
-	// Apple platform binaries.
+	// Platform is the CodeDirectory platform identifier, recorded for audit
+	// lines and NEVER load-bearing: it is a byte the binary asserts about
+	// itself, so an attacker writes whatever they like there. Apple's build
+	// system sets it non-zero on OS-volume binaries and leaves it zero on
+	// Command Line Tools binaries, so it is not even a reliable description
+	// of genuine Apple code. No decision in this package rests on it; the
+	// kernel's CS_PLATFORM_BINARY flag and the verified chain are what say
+	// "Apple's own code".
 	Platform uint8
 	// Adhoc is true when there is no CMS signature. Nothing about Identifier
 	// or TeamID is trustworthy on an ad-hoc signature.
@@ -684,17 +701,39 @@ func verifyLoaded(ls *loadedSlice, roots []*x509.Certificate) (*codeSignature, e
 	}
 	sig.Chain = res.chain
 	sig.SignedAt = res.signedAt
-	// The Team ID is the certificate's claim, made under a verified chain;
-	// the CodeDirectory string is only allowed to agree with it. The
-	// certificate is the thing that chains to the root, so it is the
-	// source; the CD string is what the kernel cross-checks against the
-	// chain at exec (and kills the process on disagreement), so it is the
-	// consistency check.
-	sig.TeamID = subjectOU(res.chain[0].Subject)
-	if best.teamID != "" && best.teamID != sig.TeamID {
-		return nil, fmt.Errorf("attest: CodeDirectory team id %q does not match the signing certificate OU %q", best.teamID, sig.TeamID)
+	sig.CDTeamID = best.teamID
+	team, ou, err := vendorTeamID(res.chain[0], best.teamID)
+	if err != nil {
+		return nil, err
 	}
+	sig.TeamID, sig.SubjectOU = team, ou
 	return sig, nil
+}
+
+// vendorTeamID derives the vendor Team ID from a chain-verified leaf. The
+// certificate is the thing that chains to the root, so it is the source; but
+// only a Developer ID Application leaf (marker 1.2.840.113635.100.6.1.13)
+// defines its OU as the Team ID, and for that leaf the CodeDirectory's team
+// string is only allowed to agree with it (the kernel enforces the same
+// agreement at exec and kills the process on disagreement).
+//
+// Apple's own platform leaves are a different convention and yield no
+// vendor Team ID: the older "Software Signing" leaf (2020, OU "Apple
+// Software", CodeDirectory team 59GAB85EFG; on Command Line Tools binaries
+// and the July-2026 macos-26 CI image's /bin/zsh) and the newer "macOS
+// Software Signing" leaf (2026, no OU, no CodeDirectory team; macOS 26.6's
+// /bin/zsh). Both are pinned under testdata/ and the OU-vs-CD agreement rule
+// does not apply to them. An OU that is not a Team ID must never be
+// reported as one.
+func vendorTeamID(leaf *x509.Certificate, cdTeam string) (teamID, ou string, err error) {
+	ou = subjectOU(leaf.Subject)
+	if !hasExtension(leaf, oidAppleDeveloperIDApplication) {
+		return "", ou, nil
+	}
+	if cdTeam != "" && cdTeam != ou {
+		return "", ou, fmt.Errorf("attest: CodeDirectory team id %q does not match the Developer ID certificate OU %q", cdTeam, ou)
+	}
+	return ou, ou, nil
 }
 
 // digestFor maps a CodeDirectory hash type to the crypto.Hash the CMS layer

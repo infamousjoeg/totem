@@ -261,7 +261,7 @@ func TestShellCopiedOutOfBinIsNotAHop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if insp.sig == nil || insp.sig.Platform == 0 || !insp.kcs.isPlatformBinary() {
+	if insp.sig == nil || !isAppleCodeSigningChain(insp.sig.Chain) || !insp.kcs.isPlatformBinary() {
 		t.Fatalf("test premise broken: copy did not verify as a platform binary (sig %+v, sigErr %v, kernel identity %q)", insp.sig, insp.sigErr, insp.kcs.identity)
 	}
 	if insp.kind == kindShell {
@@ -483,12 +483,14 @@ func TestApplePlatformAnchorAcceptsRealShell(t *testing.T) {
 
 func TestDeveloperIDAnchorRefusesPlatformBinary(t *testing.T) {
 	needFixtures(t)
-	// A developer-id row for /bin/zsh cannot be satisfied: no Team ID, no
-	// Developer ID marker. An empty Anchor must read as developer-id.
+	// A developer-id row for /bin/zsh cannot be satisfied: its leaf is
+	// Apple's software-signing certificate, not a Developer ID Application
+	// certificate, so it has no vendor Team ID at all. An empty Anchor must
+	// read as developer-id, and the refusal must name the marker.
 	a := platformRowAttestor(t, "", "Q6L2SF6YDW")
 	_, err := attestArgv(t, a, "/bin/zsh", "-c", zshClient)
-	if !errors.Is(err, ErrSignatureMismatch) || !strings.Contains(err.Error(), "Team ID") {
-		t.Fatalf("err = %v, want ErrSignatureMismatch on Team ID", err)
+	if !errors.Is(err, ErrSignatureMismatch) || !strings.Contains(err.Error(), "Developer ID Application") {
+		t.Fatalf("err = %v, want ErrSignatureMismatch naming the Developer ID marker", err)
 	}
 }
 
@@ -617,5 +619,65 @@ func TestSignatureErrorSurvivesCDHashSelection(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "cdhash") {
 		t.Fatalf("refused at slice selection, not at signature verification: %v", err)
+	}
+}
+
+// TestApplePlatformAnchorAcceptsLiveCLTGit inspects a LIVE Command Line Tools
+// git process under the exact row step 5 will ship, using the real kernel
+// facts for it (CS_PLATFORM_BINARY set, and csops reporting NO team even
+// though the CodeDirectory carries 59GAB85EFG).
+func TestApplePlatformAnchorAcceptsLiveCLTGit(t *testing.T) {
+	needFixtures(t)
+	if _, err := os.Stat(cltGit); err != nil {
+		t.Skipf("no Command Line Tools git; would assert a live %s process is a catalog hit under an apple-platform row and that the kernel reports no team for it", cltGit)
+	}
+	a, err := newAttestor(darwinSystem{}, []spiffe.CatalogEntry{{
+		Anchor:        spiffe.AnchorApplePlatform,
+		Name:          "git",
+		SigningID:     "com.apple.git",
+		ExpectedPaths: []string{cltGit},
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := t.TempDir()
+	if out, err := exec.Command(cltGit, "-C", repo, "init", "-q").CombinedOutput(); err != nil {
+		t.Skipf("git init failed (%v: %s); cannot hold a live git process", err, out)
+	}
+	cmd := exec.Command(cltGit, "-C", repo, "cat-file", "--batch")
+	stdin, err := cmd.StdinPipe() // git blocks reading requests until stdin closes
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { stdin.Close(); cmd.Wait() }()
+	time.Sleep(300 * time.Millisecond)
+	p, err := darwinSystem{}.process(int32(cmd.Process.Pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.exePath != cltGit {
+		t.Skipf("live process is %s, not %s (git re-exec'd); premise unavailable", p.exePath, cltGit)
+	}
+	insp, err := a.inspect(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if insp.kcs.teamID != "" {
+		t.Logf("note: kernel now reports team %q for a platform binary", insp.kcs.teamID)
+	}
+	if !insp.kcs.isPlatformBinary() {
+		t.Fatalf("kernel does not flag CLT git platform (status %#x)", insp.kcs.flags)
+	}
+	if insp.kind != kindCatalog {
+		t.Fatalf("kind = %d, refusal = %v, sigErr = %v; want catalog hit", insp.kind, insp.refusal, insp.sigErr)
+	}
+	if insp.sig.TeamID != "" || insp.sig.CDTeamID != "59GAB85EFG" {
+		t.Errorf("TeamID %q CDTeamID %q", insp.sig.TeamID, insp.sig.CDTeamID)
+	}
+	if !insp.protectedPath {
+		t.Error("CLT git path not reported protected (root-owned /Library/Developer)")
 	}
 }

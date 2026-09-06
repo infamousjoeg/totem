@@ -36,12 +36,21 @@ func TestPlatformShellSignatureVerifies(t *testing.T) {
 	if sig.Identifier != "com.apple.zsh" {
 		t.Errorf("identifier = %q, want com.apple.zsh", sig.Identifier)
 	}
-	if sig.Platform == 0 {
-		t.Error("CodeDirectory platform field is zero for a platform binary")
-	}
+	// The CodeDirectory platform byte is self-asserted and never load-bearing;
+	// it is non-zero on OS-volume binaries today and zero on Command Line
+	// Tools binaries. Logged, not asserted.
+	t.Logf("/bin/zsh: CD platform byte %d", sig.Platform)
+	// Apple ships two platform-signing conventions: no OU and no CD team
+	// (macOS 26.6 /bin/zsh) or OU "Apple Software" with CD team 59GAB85EFG
+	// (Command Line Tools, the macos-26 CI image). Neither is a vendor Team
+	// ID; TeamID must be empty for both, and the raw fields are recorded.
 	if sig.TeamID != "" {
-		t.Errorf("platform binary has Team ID %q", sig.TeamID)
+		t.Errorf("platform binary reported vendor Team ID %q (OU %q, CD team %q)", sig.TeamID, sig.SubjectOU, sig.CDTeamID)
 	}
+	if sig.CDTeamID != "" && sig.CDTeamID != "59GAB85EFG" {
+		t.Errorf("unexpected CodeDirectory team %q on a platform binary", sig.CDTeamID)
+	}
+	t.Logf("/bin/zsh: OU %q, CD team %q", sig.SubjectOU, sig.CDTeamID)
 	if n := len(sig.Chain); n < 2 {
 		t.Fatalf("chain has %d certificates, want at least leaf and root", n)
 	}
@@ -177,5 +186,43 @@ func TestKernelCDHashSelectsBeforeVerification(t *testing.T) {
 	_, err = verifyMachO(r, int64(len(data)), sliceSelector{kernelCDHash: good.CDHash}, appleRoots())
 	if err == nil || !strings.Contains(err.Error(), "code page") {
 		t.Fatalf("matching kernel cdhash on a tampered slice: %v, want page check failure", err)
+	}
+}
+
+// cltGit is the Command Line Tools git, the first Apple platform binary a
+// catalog row will name (step 5). It is signed with Apple's OTHER platform
+// convention: leaf OU "Apple Software", CodeDirectory team 59GAB85EFG, and
+// is the binary an earlier Team ID rule wrongly refused.
+const cltGit = "/Library/Developer/CommandLineTools/usr/bin/git"
+
+func TestCLTGitVerifiesAsApplePlatform(t *testing.T) {
+	f, err := os.Open(cltGit)
+	if err != nil {
+		t.Skipf("no Command Line Tools git at %s; would assert it verifies as an Apple platform binary with vendor TeamID \"\", CD team 59GAB85EFG, OU \"Apple Software\", identifier com.apple.git", cltGit)
+	}
+	defer f.Close()
+	st, _ := f.Stat()
+	sig, err := verifyMachO(f, st.Size(), sliceSelector{}, appleRoots())
+	if err != nil {
+		t.Fatalf("verifyMachO(%s): %v", cltGit, err)
+	}
+	if sig.Identifier != "com.apple.git" || sig.Adhoc {
+		t.Errorf("sig = ident %q adhoc %v", sig.Identifier, sig.Adhoc)
+	}
+	// The CodeDirectory platform byte is a build attribute of OS-volume
+	// binaries; Command Line Tools binaries ship with 0. Recorded, not
+	// required: the kernel flag and the chain are the anchor.
+	t.Logf("%s: CD platform byte %d", cltGit, sig.Platform)
+	if sig.TeamID != "" {
+		t.Errorf("vendor TeamID %q reported for Apple's own code", sig.TeamID)
+	}
+	if sig.CDTeamID != "59GAB85EFG" || sig.SubjectOU != "Apple Software" {
+		t.Errorf("CD team %q, OU %q; want 59GAB85EFG / Apple Software", sig.CDTeamID, sig.SubjectOU)
+	}
+	if !isAppleCodeSigningChain(sig.Chain) {
+		t.Error("not recognised as Apple's code-signing chain")
+	}
+	if !hasExtension(sig.Chain[0], oidAppleSoftwareSigning) {
+		t.Error("leaf lacks the software-signing marker")
 	}
 }

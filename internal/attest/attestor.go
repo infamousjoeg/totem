@@ -635,27 +635,38 @@ func (a *attestor) checkCatalogBinary(row *catalogRow, insp *inspection, sigErr 
 	leaf := sig.leaf()
 	switch anchorOf(e) {
 	case spiffe.AnchorDeveloperID:
+		// The marker comes first because it is what makes the leaf OU a
+		// Team ID at all; without it TeamID is empty by construction and a
+		// Team ID mismatch would be the symptom, not the reason.
+		if !hasExtension(leaf, oidAppleDeveloperIDApplication) {
+			return fmt.Errorf("%w: %s signing certificate is not a Developer ID Application certificate", ErrSignatureMismatch, e.Name)
+		}
 		if sig.TeamID != e.TeamID {
 			return fmt.Errorf("%w: %s Team ID %q, catalog expects %q", ErrSignatureMismatch, e.Name, sig.TeamID, e.TeamID)
 		}
 		if ou := subjectOU(leaf.Subject); ou != e.TeamID {
 			return fmt.Errorf("%w: %s signing certificate OU %q is not Team ID %q", ErrSignatureMismatch, e.Name, ou, e.TeamID)
 		}
-		if !hasExtension(leaf, oidAppleDeveloperIDApplication) {
-			return fmt.Errorf("%w: %s signing certificate is not a Developer ID Application certificate", ErrSignatureMismatch, e.Name)
-		}
 	case spiffe.AnchorApplePlatform:
-		// Three independent judgements must agree that this is Apple's own
-		// code: the CodeDirectory says platform, the kernel says platform,
-		// and the chain runs through Apple's code-signing CA to Apple's root.
-		if sig.Platform == 0 {
-			return fmt.Errorf("%w: %s CodeDirectory platform byte is zero; not an Apple platform binary", ErrSignatureMismatch, e.Name)
-		}
+		// Exactly two independent judgements must agree that this is Apple's
+		// own code, and this list is COMPLETE: (1) the kernel flags the running
+		// process CS_PLATFORM_BINARY, its own trust decision made at exec from
+		// Apple's chain; (2) our verification finds the chain anchored
+		// byte-equal at the embedded Apple Root CA and passing through Apple's
+		// code-signing CA or a software-signing leaf (by marker extension).
+		// Plus the signing identifier, checked above for every anchor.
+		//
+		// Two earlier conditions were removed because real Apple binaries
+		// falsified them and neither added security: an empty Team ID
+		// (Command Line Tools git carries 59GAB85EFG in its CodeDirectory and
+		// the macos-26 CI image's /bin/zsh has leaf OU "Apple Software"), and
+		// a non-zero CodeDirectory platform byte (set by Apple's build system
+		// only for OS-volume binaries; Command Line Tools git has 0 and the
+		// kernel still flags it platform). A third-party chain cannot satisfy
+		// (1) or (2) whatever its Team ID or platform byte says. Do not add a
+		// condition on the same intuition.
 		if !insp.kcs.isPlatformBinary() {
 			return fmt.Errorf("%w: %s: kernel does not flag the process as a platform binary (status %#x)", ErrSignatureMismatch, e.Name, insp.kcs.flags)
-		}
-		if sig.TeamID != "" {
-			return fmt.Errorf("%w: %s carries Team ID %q; platform binaries carry none", ErrSignatureMismatch, e.Name, sig.TeamID)
 		}
 		if !isAppleCodeSigningChain(sig.Chain) {
 			return fmt.Errorf("%w: %s signature does not chain through Apple's code-signing CA to Apple Root CA", ErrSignatureMismatch, e.Name)
@@ -667,8 +678,19 @@ func (a *attestor) checkCatalogBinary(row *catalogRow, insp *inspection, sigErr 
 	if insp.kcs.identity != "" && insp.kcs.identity != sig.Identifier {
 		return fmt.Errorf("%w: kernel identity %q, on-disk %q", ErrSignatureMismatch, insp.kcs.identity, sig.Identifier)
 	}
-	if insp.kcs.teamID != "" && insp.kcs.teamID != sig.TeamID {
-		return fmt.Errorf("%w: kernel Team ID %q, on-disk %q", ErrSignatureMismatch, insp.kcs.teamID, sig.TeamID)
+	// The kernel reads the CodeDirectory's team field, so compare like with
+	// like: its value against the on-disk CodeDirectory field, not against
+	// the certificate-derived vendor Team ID. Two observed kernel behaviours
+	// shape this: for a platform binary the kernel reports NO team even when
+	// the CodeDirectory carries one (Command Line Tools git: CD 59GAB85EFG,
+	// csops ENOENT), and for a Developer ID binary it reports exactly the CD
+	// value. So: a reported team must match the CD; an unreported team is
+	// fine for a platform binary and wrong for anything else with a CD team.
+	switch {
+	case insp.kcs.teamID != "" && insp.kcs.teamID != sig.CDTeamID:
+		return fmt.Errorf("%w: kernel Team ID %q, on-disk CodeDirectory %q", ErrSignatureMismatch, insp.kcs.teamID, sig.CDTeamID)
+	case insp.kcs.teamID == "" && sig.CDTeamID != "" && !insp.kcs.isPlatformBinary():
+		return fmt.Errorf("%w: on-disk CodeDirectory names Team ID %q but the kernel reports none for a non-platform process", ErrSignatureMismatch, sig.CDTeamID)
 	}
 	return nil
 }
@@ -728,7 +750,17 @@ func (a *attestor) isOSShell(p *process, insp *inspection) bool {
 		if !shellIdentifiers[insp.kcs.identity] {
 			return false
 		}
-		if insp.sig == nil || insp.sig.Adhoc || insp.sig.Platform == 0 {
+		// Every gate here is kernel-attested (platform flag, identity) or
+		// filesystem-attested (directory, protected path) or chain-verified
+		// (a non-ad-hoc signature whose identifier agrees with the kernel's).
+		// The CodeDirectory platform byte is deliberately NOT consulted: it
+		// is self-asserted by the binary, so an attacker sets it to whatever
+		// they like and it proves nothing on any build. It happens to be
+		// non-zero on every OS-volume shell today (Apple's build system sets
+		// it there) and zero on Apple's Command Line Tools binaries, which is
+		// a fact about Apple's build system, not a security property. Same
+		// removal, same reason, as in the apple-platform anchor.
+		if insp.sig == nil || insp.sig.Adhoc {
 			return false
 		}
 		return insp.sig.Identifier == insp.kcs.identity

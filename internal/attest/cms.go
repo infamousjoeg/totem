@@ -68,6 +68,20 @@ var (
 // platform chain: anchored at the embedded Apple Root CA, and passing through
 // Apple's code-signing CA (by marker extension) or ending in a leaf that
 // carries Apple's software-signing marker. Chain names are not consulted.
+//
+// Which branch holds the weight, on the real chains pinned under testdata/:
+// BOTH known Apple platform leaves carry the software-signing marker 6.22
+// (the 2020 "Software Signing" leaf on Command Line Tools binaries and the
+// July-2026 macos-26 CI image; the 2026 "macOS Software Signing" leaf on
+// macOS 26.6), so the leaf branch is what accepts every known input today.
+// The CA branch is reachable but not sole for anything: the 2017 "Apple Code
+// Signing Certification Authority" intermediate (the /bin/zsh chain) carries
+// 6.2.20, while the 2011 intermediate of the same name (the Command Line
+// Tools chain, expiring 2026-10-24 with its leaf) carries no Apple marker at
+// all. TestAppleChainMarkerWitnesses pins those facts. If Apple ships a leaf
+// without 6.22 under the 2017 CA the second branch carries it; under a CA
+// without 6.2.20 nothing does, and that is a new certificate to look at, not
+// a case to guess at.
 func isAppleCodeSigningChain(chain []*x509.Certificate) bool {
 	if len(chain) < 2 {
 		return false
