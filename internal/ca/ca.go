@@ -589,6 +589,10 @@ const (
 // the first release: changing an OID after relying parties match on it is a
 // breaking change for every deployment at once. Every OID lives in this one
 // block so that change is a single edit.
+//
+// This is not left to a comment somebody has to read at the right moment. See
+// OIDArcProvisional and release_gate.go: while the arc is a placeholder, a
+// release build does not compile.
 var (
 	// OIDProtectionLevel carries spiffe.ProtectionLevel as a UTF8String.
 	OIDProtectionLevel = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 62733, 1, 1}
@@ -602,6 +606,25 @@ var (
 	// UTF8String. Absent when presence is not delegated.
 	OIDGrantID = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 62733, 1, 4}
 )
+
+// OIDArcProvisional is non-empty for exactly as long as the OID arc above is a
+// placeholder rather than a registered IANA Private Enterprise Number.
+//
+// It is a string rather than a bool because it doubles as the explanation a
+// developer sees, and because release_gate.go turns its LENGTH into a
+// compile-time refusal: under `-tags release`, a non-empty value gives an array
+// a negative length and the build fails.
+//
+// A comment saying PROVISIONAL is a note somebody has to read at the right
+// moment, and "the right moment" here is the one release where getting it wrong
+// is unrecoverable: once relying-party trust policies match on an OID, changing
+// it breaks every deployment simultaneously. So the placeholder cannot ship
+// silently, which is the actual requirement.
+//
+// TO RELEASE: register a PEN, replace 62733 in the block above with it, and set
+// this to "" in the same commit. Those two edits belong together and the gate
+// exists to make sure they happen together.
+const OIDArcProvisional = "the x509 extension OID arc is still placeholder PEN 62733, not a registered IANA assignment"
 
 // IssuerPath is the path of the issuer's own identity: spiffe://<td>/issuer.
 // It has no device segment and no tool segment, which is what makes it
