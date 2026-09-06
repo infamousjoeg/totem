@@ -68,6 +68,22 @@ type Identity struct {
 	// ShellHops is how many OS-signed shell processes the walk crossed. The
 	// spec allows exactly one; more is a refusal, not a warning.
 	ShellHops int
+	// PathProtected records whether the binary and every parent directory were
+	// non-user-writable.
+	//
+	// It is false for a normal Claude Code install and that is not a bug: both
+	// shipped catalog paths (~/.local/share/claude/versions/* and the Homebrew
+	// prefix) are owned by the console user on a real Mac, because the Homebrew
+	// prefix is user-owned by design. A strict path check would therefore
+	// refuse every genuine install, so path protection is NOT the control for
+	// catalog binaries. The control is the chain-verified vendor signature plus
+	// the kernel cdhash cross-check; see ErrUnsignedAtWritablePath.
+	//
+	// It is still recorded because it is a real difference in assurance, it
+	// belongs in the audit line, and issuer policy may later require presence
+	// for tools that ran from a writable path. Never silently upgrade a false
+	// to a true.
+	PathProtected bool
 }
 
 // Attestor resolves a connection to a tool identity.
@@ -83,11 +99,24 @@ type Attestor interface {
 	AttestPeer(ctx context.Context, conn *net.UnixConn) (*Identity, error)
 }
 
-// New returns the Attestor for this machine, loaded against catalog. Passing a
-// nil catalog uses spiffe.Catalog.
+// New returns the Attestor for this machine, loaded against catalog and pins.
+// Passing a nil catalog uses spiffe.Catalog.
+//
+// pins maps a catalog tool name to the hex SHA-256 the binary was pinned to at
+// `totem init`. Pin-on-init is the default anchor: a pinned tool whose hash no
+// longer matches is a refusal, not a warning. A nil or absent pin means the
+// chain-verified Team ID plus signing identifier is the anchor instead, and the
+// observed hash is recorded rather than enforced.
+//
+// pins is a required parameter rather than a second constructor or a setter,
+// because a caller that never supplies pins would otherwise get the weaker
+// anchor silently. Passing nil must be a visible decision at the call site.
+//
+// On Linux there is no code signature to fall back on, so a catalog match
+// REQUIRES a pin; without one the tool gets no identity.
 //
 // Implemented by the attest teammate. Declared here so callers can compile.
-var New func(catalog []spiffe.CatalogEntry) (Attestor, error)
+var New func(catalog []spiffe.CatalogEntry, pins map[string]string) (Attestor, error)
 
 // Errors are typed so the Workload API can answer a rejected caller legibly
 // (the spec's rejection-UX rule) instead of returning a bare permission error.
@@ -108,4 +137,11 @@ var (
 	// ErrInterpreterWrapped means the caller is a script under an interpreter,
 	// which cannot be attested and gets no identity by design.
 	ErrInterpreterWrapped = errors.New("attest: interpreter-wrapped callers get no identity")
+	// ErrUnsignedAtWritablePath means the binary sits at a user-writable path
+	// and does not carry a fully chain-verified vendor signature, so nothing
+	// stops the user (or malware running as them) from replacing it. Catalog
+	// binaries are allowed to live at writable paths only because the signature
+	// chain and the kernel cdhash cross-check take over as the control there;
+	// an ad-hoc or unsigned binary has neither and is refused.
+	ErrUnsignedAtWritablePath = errors.New("attest: unsigned binary at a user-writable path")
 )
