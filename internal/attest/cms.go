@@ -184,8 +184,10 @@ func verifyCMS(cms []byte, cd []byte, roots []*x509.Certificate) (*cmsResult, er
 		return nil, cmsErr("content type %v is not SignedData", ci.ContentType)
 	}
 	var sd cmsSignedData
-	if rest, err := asn1.Unmarshal(ci.Content.Bytes, &sd); err != nil || len(rest) != 0 {
+	if rest, err := asn1.Unmarshal(ci.Content.Bytes, &sd); err != nil {
 		return nil, cmsErr("parsing SignedData: %v", err)
+	} else if len(rest) != 0 {
+		return nil, cmsErr("trailing data after SignedData")
 	}
 	if len(sd.SignerInfos) != 1 {
 		return nil, cmsErr("expected exactly one signer, found %d", len(sd.SignerInfos))
@@ -229,11 +231,15 @@ func verifyCMS(cms []byte, cd []byte, roots []*x509.Certificate) (*cmsResult, er
 	if !bytes.Equal(mdBytes, sum(digestHash, cd)) {
 		return nil, cmsErr("messageDigest does not match the CodeDirectory")
 	}
-	if ct, ok := attrs[oidAttrContentType.String()]; ok {
-		var oid asn1.ObjectIdentifier
-		if _, err := asn1.Unmarshal(ct, &oid); err != nil || !oid.Equal(oidData) {
-			return nil, cmsErr("contentType attribute is not id-data")
-		}
+	// RFC 5652 §11.1: when signed attributes are present, contentType MUST
+	// be among them and MUST equal the encapsulated content type.
+	ct, ok := attrs[oidAttrContentType.String()]
+	if !ok {
+		return nil, cmsErr("no contentType attribute")
+	}
+	var ctOID asn1.ObjectIdentifier
+	if _, err := asn1.Unmarshal(ct, &ctOID); err != nil || !ctOID.Equal(oidData) {
+		return nil, cmsErr("contentType attribute is not id-data")
 	}
 	if st, ok := attrs[oidAttrSigningTime.String()]; ok {
 		var t time.Time
@@ -272,6 +278,9 @@ func verifyCMS(cms []byte, cd []byte, roots []*x509.Certificate) (*cmsResult, er
 	}
 	chain, err := buildChain(signer, certs, roots, at)
 	if err != nil {
+		return nil, err
+	}
+	if err := checkPathLen(chain); err != nil {
 		return nil, err
 	}
 	res.chain = chain
@@ -496,6 +505,27 @@ func buildChain(leaf *x509.Certificate, certs, roots []*x509.Certificate, at tim
 		cur = parent
 	}
 	return nil, cmsErr("certificate chain too long")
+}
+
+// checkPathLen enforces RFC 5280 pathLenConstraint over a built chain (leaf
+// first, root last): a CA with a constraint may have at most that many CA
+// certificates below it, not counting the leaf.
+func checkPathLen(chain []*x509.Certificate) error {
+	for i := 1; i < len(chain); i++ {
+		ca := chain[i]
+		if !ca.BasicConstraintsValid {
+			continue
+		}
+		constrained := ca.MaxPathLen > 0 || (ca.MaxPathLen == 0 && ca.MaxPathLenZero)
+		if !constrained {
+			continue
+		}
+		below := i - 1 // CA certificates between this one and the leaf
+		if below > ca.MaxPathLen {
+			return cmsErr("certificate %q allows %d subordinate CA(s) but %d were used", ca.Subject.CommonName, ca.MaxPathLen, below)
+		}
+	}
+	return nil
 }
 
 func checkValidity(c *x509.Certificate, at time.Time) error {

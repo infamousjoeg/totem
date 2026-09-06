@@ -3,6 +3,7 @@ package attest
 import (
 	"crypto/x509"
 	"encoding/pem"
+	"sync"
 )
 
 // appleRootCAPEM is Apple Root CA (the 2006 G1 root, serial 2, SHA-256
@@ -43,16 +44,25 @@ UKqK1drk/NAJBzewdXUh
 -----END CERTIFICATE-----
 `
 
-// appleRoots returns the trust anchors for code-signature chains. It panics
-// on a malformed constant, which can only be a build error.
+var (
+	appleRootsOnce   sync.Once
+	appleRootsParsed []*x509.Certificate
+)
+
+// appleRoots returns the trust anchors for code-signature chains, parsed
+// once. It panics on a malformed constant, which can only be a build error.
+// Callers must not modify the returned slice or certificates.
 func appleRoots() []*x509.Certificate {
-	block, _ := pem.Decode([]byte(appleRootCAPEM))
-	if block == nil {
-		panic("attest: embedded Apple Root CA is not PEM")
-	}
-	c, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		panic("attest: embedded Apple Root CA does not parse: " + err.Error())
-	}
-	return []*x509.Certificate{c}
+	appleRootsOnce.Do(func() {
+		block, _ := pem.Decode([]byte(appleRootCAPEM))
+		if block == nil {
+			panic("attest: embedded Apple Root CA is not PEM")
+		}
+		c, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			panic("attest: embedded Apple Root CA does not parse: " + err.Error())
+		}
+		appleRootsParsed = []*x509.Certificate{c}
+	})
+	return appleRootsParsed
 }

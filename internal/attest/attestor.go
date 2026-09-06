@@ -28,6 +28,12 @@ import (
 // three; anything past six is not a shape the spec describes.
 const maxWalkDepth = 6
 
+// maxBinarySize bounds the executable the attestor will hash and parse. The
+// largest catalog binary today (Claude Code) is about 230 MB; a 1 GiB cap
+// keeps a crafted file at a writable path from turning one connection into
+// unbounded I/O on the shared agent.
+const maxBinarySize = 1 << 30
+
 func init() {
 	// New is the contract's constructor: the Attestor for this machine, loaded
 	// against catalog (nil means spiffe.Catalog) and the hashes `totem init`
@@ -510,6 +516,11 @@ func (a *attestor) inspect(p *process) (*inspection, error) {
 	}
 	if !st.Mode().IsRegular() {
 		return nil, fmt.Errorf("%w: %s is not a regular file", ErrNotInCatalog, p.exePath)
+	}
+	// The file is attacker-writable on a real install, so its size is the
+	// attacker's too. Bound the work before reading a byte of it.
+	if st.Size() > maxBinarySize {
+		return nil, fmt.Errorf("%w: %s is %d bytes, over the %d byte bound", ErrNotInCatalog, p.exePath, st.Size(), maxBinarySize)
 	}
 	// The hash and the page-hash pass below read the whole binary on every
 	// attestation, about 0.1 s for a 200 MB Claude Code build. That is per

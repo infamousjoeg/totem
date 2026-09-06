@@ -59,6 +59,13 @@ const (
 	// cdHashLen is the length of a cdhash as the kernel reports it: the
 	// leading 20 bytes of the CodeDirectory's hash, whatever the hash type.
 	cdHashLen = 20
+
+	// minPageShift and maxPageShift bound CodeDirectory.pageSize: 4 KiB
+	// (what codesign and Go's linker emit) up to 64 KiB, comfortably past
+	// the 16 KiB the arm64 kernel uses and nowhere near an allocation that
+	// matters.
+	minPageShift = 12
+	maxPageShift = 16
 )
 
 // codeSignature is everything the attestor needs from an embedded signature,
@@ -313,6 +320,13 @@ func parseCodeDirectory(b []byte) (*codeDirectory, error) {
 	if cd.hashSize == 0 {
 		return nil, errors.New("attest: CodeDirectory hash size is zero")
 	}
+	// pageSize is log2 of the page; the kernel accepts 12 (4 KiB) through
+	// its own page shift, 14 on arm64. It sizes a buffer in verifyPages, so
+	// an unbounded value read from an attacker's file would be an
+	// allocation of the attacker's choosing. Bound it here, at parse time.
+	if cd.pageSize < minPageShift || cd.pageSize > maxPageShift {
+		return nil, fmt.Errorf("attest: CodeDirectory page shift %d outside %d..%d", cd.pageSize, minPageShift, maxPageShift)
+	}
 	need := uint64(cd.hashOffset) + uint64(cd.nCodeSlots)*uint64(cd.hashSize)
 	if uint64(cd.hashOffset) < uint64(cd.nSpecialSlots)*uint64(cd.hashSize) || need > uint64(len(b)) {
 		return nil, errors.New("attest: CodeDirectory hash slots out of range")
@@ -430,64 +444,104 @@ type sliceSelector struct {
 	kernelCDHash []byte
 }
 
+// maxSignatureBlob bounds LC_CODE_SIGNATURE.datasize. A 1 GiB binary at
+// 4 KiB pages needs 8 MiB of SHA-256 slots; nothing legitimate is near this.
+const maxSignatureBlob = 64 << 20
+
+// loadedSlice is one slice's signature after the cheap, bounded parse and
+// before any of the expensive checks. Everything here costs O(signature
+// blob) and allocates nothing sized by attacker-chosen fields.
+type loadedSlice struct {
+	sr      *io.SectionReader
+	off     int64
+	cpu     macho.Cpu
+	dataOff uint32
+	sb      *superBlob
+	best    *codeDirectory
+	primary *codeDirectory
+	cdHash  []byte
+}
+
 // verifyMachO parses the file at r, selects the slice, checks the file
 // against its CodeDirectory, and verifies the CMS signature against roots.
 // It returns a fully-checked codeSignature or an error. There is no partial
 // success: an unverifiable signature is an error, never a weaker result.
+//
+// Order matters for robustness, not just correctness: the file at the path
+// is attacker-writable on a real install, and the kernel cdhash is what
+// rejects a swapped file. So every slice is first parsed cheaply and its
+// cdhash computed, the running slice is SELECTED by that cdhash, and only
+// then are the page hashes and the CMS signature of that one slice verified.
+// A swapped or crafted file is refused before any of its content drives
+// allocation or parsing beyond the bounded signature blob.
 func verifyMachO(r io.ReaderAt, size int64, sel sliceSelector, roots []*x509.Certificate) (*codeSignature, error) {
 	type slice struct {
 		off  int64
 		size int64
 		cpu  macho.Cpu
-		sub  uint32
 	}
 	var slices []slice
 	if ff, err := macho.NewFatFile(r); err == nil {
 		for _, a := range ff.Arches {
-			slices = append(slices, slice{int64(a.Offset), int64(a.Size), a.Cpu, a.SubCpu})
+			slices = append(slices, slice{int64(a.Offset), int64(a.Size), a.Cpu})
 		}
 	} else {
 		f, err := macho.NewFile(r)
 		if err != nil {
 			return nil, fmt.Errorf("attest: not a mach-o: %w", err)
 		}
-		slices = append(slices, slice{0, size, f.Cpu, f.SubCpu})
+		slices = append(slices, slice{0, size, f.Cpu})
 	}
 
-	var candidates []*codeSignature
+	var loaded []*loadedSlice
 	var lastErr error
 	for _, s := range slices {
 		sr := io.NewSectionReader(r, s.off, s.size)
-		sig, err := verifySlice(sr, s.size, roots)
+		ls, err := loadSlice(sr, s.size)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		sig.CPU = s.cpu
-		sig.Slice = s.off
-		candidates = append(candidates, sig)
+		ls.off, ls.cpu = s.off, s.cpu
+		loaded = append(loaded, ls)
 	}
+
+	var chosen *loadedSlice
 	if sel.kernelCDHash != nil {
-		for _, c := range candidates {
-			if bytes.Equal(c.CDHash, sel.kernelCDHash) {
-				return c, nil
+		for _, ls := range loaded {
+			if bytes.Equal(ls.cdHash, sel.kernelCDHash) {
+				chosen = ls
+				break
 			}
 		}
-		if lastErr != nil {
-			return nil, fmt.Errorf("%w (no slice matches the kernel cdhash; last error: %v)", errSliceNotFound, lastErr)
+		if chosen == nil {
+			if lastErr != nil {
+				return nil, fmt.Errorf("%w (no slice matches the kernel cdhash; last error: %v)", errSliceNotFound, lastErr)
+			}
+			return nil, fmt.Errorf("%w: no slice's cdhash matches the kernel's", errSliceNotFound)
 		}
-		return nil, fmt.Errorf("%w: no slice's cdhash matches the kernel's", errSliceNotFound)
-	}
-	want := hostCPU()
-	for _, c := range candidates {
-		if c.CPU == want {
-			return c, nil
+	} else {
+		want := hostCPU()
+		for _, ls := range loaded {
+			if ls.cpu == want {
+				chosen = ls
+				break
+			}
+		}
+		if chosen == nil {
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, errSliceNotFound
 		}
 	}
-	if lastErr != nil {
-		return nil, lastErr
+	sig, err := verifyLoaded(chosen, roots)
+	if err != nil {
+		return nil, err
 	}
-	return nil, errSliceNotFound
+	sig.CPU = chosen.cpu
+	sig.Slice = chosen.off
+	return sig, nil
 }
 
 func hostCPU() macho.Cpu {
@@ -500,8 +554,11 @@ func hostCPU() macho.Cpu {
 	return 0
 }
 
-// verifySlice does the work for one Mach-O slice.
-func verifySlice(sr *io.SectionReader, size int64, roots []*x509.Certificate) (*codeSignature, error) {
+// loadSlice locates and parses one slice's signature and computes its
+// cdhash. This is the bounded, pre-selection part: it reads the load
+// commands and at most maxSignatureBlob bytes, and every allocation is sized
+// by the blob's own length fields, which are checked against that bound.
+func loadSlice(sr *io.SectionReader, size int64) (*loadedSlice, error) {
 	f, err := macho.NewFile(sr)
 	if err != nil {
 		return nil, fmt.Errorf("attest: parsing slice: %w", err)
@@ -526,6 +583,9 @@ func verifySlice(sr *io.SectionReader, size int64, roots []*x509.Certificate) (*
 	}
 	if int64(dataOff)+int64(dataSize) > size {
 		return nil, errors.New("attest: code signature extends past end of slice")
+	}
+	if dataSize > maxSignatureBlob {
+		return nil, fmt.Errorf("attest: code signature of %d bytes exceeds the %d byte bound", dataSize, maxSignatureBlob)
 	}
 	blob := make([]byte, dataSize)
 	if _, err := sr.ReadAt(blob, int64(dataOff)); err != nil {
@@ -554,24 +614,31 @@ func verifySlice(sr *io.SectionReader, size int64, roots []*x509.Certificate) (*
 	if primary == nil {
 		return nil, errors.New("attest: code signature has no primary CodeDirectory")
 	}
+	full, err := best.cdHash()
+	if err != nil {
+		return nil, err
+	}
+	return &loadedSlice{sr: sr, dataOff: dataOff, sb: sb, best: best, primary: primary, cdHash: full[:cdHashLen]}, nil
+}
+
+// verifyLoaded runs the expensive checks on the selected slice: every code
+// page, every sealed special slot, and the CMS signature and chain.
+func verifyLoaded(ls *loadedSlice, roots []*x509.Certificate) (*codeSignature, error) {
+	best, primary, sb := ls.best, ls.primary, ls.sb
 	// The CodeDirectory must cover exactly the bytes before the signature:
 	// anything less leaves unsigned code in the file.
-	if best.codeLimit != uint64(dataOff) {
-		return nil, fmt.Errorf("attest: CodeDirectory covers %d bytes but the signature starts at %d", best.codeLimit, dataOff)
+	if best.codeLimit != uint64(ls.dataOff) {
+		return nil, fmt.Errorf("attest: CodeDirectory covers %d bytes but the signature starts at %d", best.codeLimit, ls.dataOff)
 	}
-	if err := best.verifyPages(sr); err != nil {
+	if err := best.verifyPages(ls.sr); err != nil {
 		return nil, err
 	}
 	if err := best.verifySpecialSlots(sb); err != nil {
 		return nil, err
 	}
-	full, err := best.cdHash()
-	if err != nil {
-		return nil, err
-	}
 	sig := &codeSignature{
 		Identifier: best.identifier,
-		CDHash:     full[:cdHashLen],
+		CDHash:     ls.cdHash,
 		HashType:   best.hashType,
 		Flags:      best.flags,
 		Platform:   best.platform,

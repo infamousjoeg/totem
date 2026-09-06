@@ -238,7 +238,7 @@ func TestShellHopMustEndAtCatalogTool(t *testing.T) {
 func TestShellCopiedOutOfBinIsNotAHop(t *testing.T) {
 	needFixtures(t)
 	a := fixtureAttestor(t, nil, nil)
-	cmd := exec.Command("/bin/zsh", "-c", "sleep 3")
+	cmd := exec.Command("/bin/zsh", "-c", "sleep 3; true")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -421,7 +421,7 @@ func TestPeerCredentialsFromKernel(t *testing.T) {
 }
 
 func TestPlatformShellIsPlatformInKernel(t *testing.T) {
-	cmd := exec.Command("/bin/sh", "-c", "sleep 2")
+	cmd := exec.Command("/bin/sh", "-c", "sleep 2; true")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}

@@ -7,6 +7,11 @@ package attest
 // before parsing is both necessary and the correct thing to verify against.
 // Only structure is rewritten: tags and primitive contents are copied
 // verbatim.
+//
+// The input is attacker-controlled bytes from a file at a user-writable path,
+// so the walk is bounded: nesting deeper than maxBERDepth is refused (Apple's
+// real signatures nest under ten levels), which also bounds the re-encoding
+// work to maxBERDepth copies of the input.
 
 import (
 	"errors"
@@ -14,11 +19,19 @@ import (
 
 var errBER = errors.New("attest: malformed BER")
 
+// errBERTooDeep is the refusal for nesting past maxBERDepth.
+var errBERTooDeep = errors.New("attest: BER nesting exceeds the depth bound")
+
+// maxBERDepth bounds constructed-element nesting. A CMS SignedData for a
+// code signature is about eight levels deep; 32 leaves room without letting
+// a crafted blob drive recursion or quadratic re-encoding.
+const maxBERDepth = 32
+
 // berToDER re-encodes b so every element has a definite length and every
 // constructed string is merged into one primitive. It returns b unchanged
 // when it is already DER.
 func berToDER(b []byte) ([]byte, error) {
-	out, rest, err := berElement(b)
+	out, rest, err := berElement(b, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -33,8 +46,11 @@ func berToDER(b []byte) ([]byte, error) {
 }
 
 // berElement encodes one element from the front of b and returns the DER
-// form and the remaining input.
-func berElement(b []byte) (der []byte, rest []byte, err error) {
+// form and the remaining input. depth is the current nesting level.
+func berElement(b []byte, depth int) (der []byte, rest []byte, err error) {
+	if depth > maxBERDepth {
+		return nil, nil, errBERTooDeep
+	}
 	if len(b) < 2 {
 		return nil, nil, errBER
 	}
@@ -119,7 +135,7 @@ func berElement(b []byte) (der []byte, rest []byte, err error) {
 		} else if len(body) == 0 {
 			break
 		}
-		child, more, err := berElement(body)
+		child, more, err := berElement(body, depth+1)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -127,9 +143,9 @@ func berElement(b []byte) (der []byte, rest []byte, err error) {
 		body = more
 	}
 
-	// A constructed string type (OCTET STRING, BIT STRING is not merged,
-	// UTF8String etc.) collapses to one primitive with the concatenated
-	// contents, which is what DER requires.
+	// A constructed string type (OCTET STRING, UTF8String, PrintableString,
+	// IA5String) collapses to one primitive with the concatenated contents,
+	// which is what DER requires.
 	if universalTag == 4 || universalTag == 12 || universalTag == 19 || universalTag == 22 {
 		var merged []byte
 		for _, c := range children {

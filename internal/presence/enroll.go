@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 
@@ -58,6 +59,21 @@ func BootstrapCodeHash(challenge []byte, code string) []byte {
 	return hashParts(contextBootstrap, challenge, []byte(code))
 }
 
+// EnrollmentTool is the Tool an enrolling device's presence assertion names.
+// There is no catalog tool yet; the assertion is for totem itself.
+const EnrollmentTool = "totem"
+
+// PreEnrollmentDeviceID is the device identifier used before the issuer has
+// assigned one: the hex SHA-256 of the device public key's SPKI DER. The
+// agent uses it as SigningInput.DeviceID on the enrollment assertion, and the
+// issuer mints the enrollment challenge for it and expects it, so both sides
+// derive the same value from the same bytes. The issuer assigns the real
+// device ID after Enroll succeeds.
+func PreEnrollmentDeviceID(devicePublicKeySPKI []byte) string {
+	sum := sha256.Sum256(devicePublicKeySPKI)
+	return hex.EncodeToString(sum[:])
+}
+
 // Enrollment errors.
 var (
 	// ErrEnrollmentMalformed: a field is missing, over length, or the wrong
@@ -69,7 +85,129 @@ var (
 	// ErrEnrollmentBadSignature: the proof-of-possession signature does not
 	// verify under the device public key in the input.
 	ErrEnrollmentBadSignature = errors.New("presence: enrollment signature does not verify")
+	// ErrEnrollmentNeedsPresence: the input carries a presence key but no
+	// presence assertion came with it. The issuer never records a presence
+	// key it has not seen sign under a human's touch.
+	ErrEnrollmentNeedsPresence = errors.New("presence: enrollment with a presence key requires a presence assertion")
+	// ErrEnrollmentUnexpectedPresence: the input carries no presence key but
+	// a presence assertion came with it. A none-level device has nothing that
+	// could have produced one.
+	ErrEnrollmentUnexpectedPresence = errors.New("presence: enrollment without a presence key cannot carry a presence assertion")
+	// ErrEnrollmentChallengeSplit: the presence assertion was signed over a
+	// different challenge than the enrollment input. One challenge covers
+	// both signatures of one enrollment, so they provably belong to the same
+	// attempt; two challenges would let a device signature from one attempt
+	// be paired with a presence assertion from another.
+	ErrEnrollmentChallengeSplit = errors.New("presence: enrollment assertion is over a different challenge than the enrollment")
 )
+
+// Enrolled is a successful Enroll: everything the issuer records for the
+// device, each value taken from what was verified and nothing self-reported.
+type Enrolled struct {
+	// DeviceID is PreEnrollmentDeviceID of the verified device key. The
+	// issuer may assign a different durable id; this is what the challenge
+	// and the assertion were bound to.
+	DeviceID string
+	// DeviceKey is the parsed, verified device public key.
+	DeviceKey *ecdsa.PublicKey
+	// PresenceKey is the parsed presence public key, proven by Presence; nil
+	// when the level has none.
+	PresenceKey *ecdsa.PublicKey
+	// Presence is the verified assertion from the presence half, or nil for a
+	// none-level device. It is a Verified like any other: single-use, and
+	// already consumed by Enroll (the enrollment is what it authorized).
+	Presence *Verified
+	// State is StatePresent when a human touched the sensor to enroll,
+	// StateNone when the device cannot. Recorded on the enrollment.
+	State State
+}
+
+// Enroll verifies one enrollment atomically: it spends the challenge ONCE and
+// that one spend covers both signatures of the enrollment, the device-half
+// proof of possession (sig) and, when the input carries a presence key, the
+// presence-half assertion (a) over the same challenge with RequestHash =
+// in.Digest(). This is the whole of the challenge-consumption rule for
+// enrollment; the issuer calls Enroll, never Verify plus VerifyEnrollment
+// separately, so "single-use" and "used by two signatures of one atomic
+// operation" cannot be conflated into a replay bug.
+//
+// The challenge must have been minted for PreEnrollmentDeviceID(in.
+// DevicePublicKey) and the assertion must name that DeviceID, EnrollmentTool,
+// and issuer as its target. A presence key without an assertion, an
+// assertion without a presence key, or an assertion over a different
+// challenge are each their own rejection. Like Verify, a failed Enroll has
+// spent the challenge.
+func (v *Verifier) Enroll(in EnrollmentInput, sig []byte, a *Assertion, issuer string) (*Enrolled, error) {
+	if in.Version != EncodingVersion {
+		return nil, fmt.Errorf("%w: %d", ErrUnsupportedVersion, in.Version)
+	}
+	if _, err := in.Bytes(); err != nil {
+		return nil, err
+	}
+	if len(sig) == 0 {
+		return nil, fmt.Errorf("%w: empty signature", ErrEnrollmentMalformed)
+	}
+	hasPresence := len(in.PresencePublicKey) != 0
+	switch {
+	case hasPresence && a == nil:
+		return nil, ErrEnrollmentNeedsPresence
+	case !hasPresence && a != nil:
+		return nil, ErrEnrollmentUnexpectedPresence
+	}
+	var ain SigningInput
+	if a != nil {
+		if a.Version != EncodingVersion {
+			return nil, fmt.Errorf("%w: %d", ErrUnsupportedVersion, a.Version)
+		}
+		ain = a.signingInput()
+		if err := ain.validate(); err != nil {
+			return nil, err
+		}
+		if len(a.Signature) == 0 {
+			return nil, fmt.Errorf("%w: empty signature", ErrMalformed)
+		}
+		if !equalBytes(a.Challenge, in.Challenge) {
+			return nil, ErrEnrollmentChallengeSplit
+		}
+	}
+	deviceID := PreEnrollmentDeviceID(in.DevicePublicKey)
+
+	now := v.now()
+	if err := v.spend(in.Challenge, deviceID, now); err != nil {
+		return nil, err
+	}
+
+	deviceKey, presenceKey, err := VerifyEnrollment(in, sig)
+	if err != nil {
+		return nil, err
+	}
+	out := &Enrolled{DeviceID: deviceID, DeviceKey: deviceKey, PresenceKey: presenceKey, State: StateNone}
+	if a == nil {
+		return out, nil
+	}
+	digest, err := in.Digest()
+	if err != nil {
+		return nil, err
+	}
+	ver, err := check(a, ain, Expectation{
+		PresenceKey: presenceKey,
+		DeviceID:    deviceID,
+		Tool:        EnrollmentTool,
+		Target:      issuer,
+		Binding:     BindingRequired,
+		RequestHash: digest,
+	}, now)
+	if err != nil {
+		return nil, err
+	}
+	// The enrollment is what this touch authorized; nothing else may use it.
+	if err := ver.consume(); err != nil {
+		return nil, err
+	}
+	out.Presence = ver
+	out.State = StatePresent
+	return out, nil
+}
 
 // EnrollmentInput is exactly what the device key signs at enroll: the proof
 // that the device holding this key answered this issuer's challenge and

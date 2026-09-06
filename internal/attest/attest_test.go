@@ -8,8 +8,14 @@ package attest
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/asn1"
 	"errors"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
@@ -546,5 +552,152 @@ func TestAnchorValidation(t *testing.T) {
 		if _, err := newAttestor(f, []spiffe.CatalogEntry{e}, nil); err == nil {
 			t.Errorf("%s: accepted", e.Name)
 		}
+	}
+}
+
+// craftedCD builds a minimal v0x20400 CodeDirectory header with the given
+// page shift, for exercising parse-time bounds.
+func craftedCD(pageShift byte) []byte {
+	cd := make([]byte, 88+6+32)
+	be := func(off int, v uint32) {
+		cd[off] = byte(v >> 24)
+		cd[off+1] = byte(v >> 16)
+		cd[off+2] = byte(v >> 8)
+		cd[off+3] = byte(v)
+	}
+	be(0, csMagicCodeDirectory)
+	be(4, uint32(len(cd)))
+	be(8, 0x20400)
+	be(16, 88+6) // hashOffset
+	be(20, 88)   // identOffset
+	be(28, 1)    // nCodeSlots
+	be(32, 4096) // codeLimit
+	cd[36] = 32
+	cd[37] = csHashTypeSHA256
+	cd[39] = pageShift
+	copy(cd[88:], "a.out\x00")
+	return cd
+}
+
+func TestCodeDirectoryPageShiftIsBounded(t *testing.T) {
+	for _, shift := range []byte{0, 1, 11, 17, 28, 40, 63, 255} {
+		if _, err := parseCodeDirectory(craftedCD(shift)); err == nil {
+			t.Errorf("page shift %d accepted; verifyPages would allocate 1<<%d bytes", shift, shift)
+		}
+	}
+	for _, shift := range []byte{12, 14, 16} {
+		if _, err := parseCodeDirectory(craftedCD(shift)); err != nil {
+			t.Errorf("page shift %d refused: %v", shift, err)
+		}
+	}
+}
+
+func TestBERDepthIsBounded(t *testing.T) {
+	nest := func(depth int) []byte {
+		var b []byte
+		for i := 0; i < depth; i++ {
+			b = append(b, 0x30, 0x80)
+		}
+		b = append(b, 0x05, 0x00)
+		for i := 0; i < depth; i++ {
+			b = append(b, 0x00, 0x00)
+		}
+		return b
+	}
+	if _, err := berToDER(nest(maxBERDepth - 1)); err != nil {
+		t.Fatalf("nesting inside the bound refused: %v", err)
+	}
+	for _, d := range []int{maxBERDepth + 2, 1000, 100000} {
+		if _, err := berToDER(nest(d)); !errors.Is(err, errBERTooDeep) {
+			t.Errorf("nesting %d: err = %v, want errBERTooDeep", d, err)
+		}
+	}
+}
+
+func TestCMSRequiresContentTypeAttribute(t *testing.T) {
+	// A CMS built by the test signer verifies; the same CMS with its
+	// contentType attribute stripped must not.
+	ca := newTestCA(t)
+	cd := craftedCD(12)
+	cms, err := buildCMS(ca, cd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifyCMS(cms, cd, ca.roots()); err != nil {
+		t.Fatalf("intact CMS: %v", err)
+	}
+	// Locate the contentType attribute OID inside the signed attributes and
+	// corrupt its last arc so the attribute is no longer contentType. The
+	// signature no longer matches either, but the attribute check runs
+	// first and must be the reported failure.
+	oid, _ := asn1.Marshal(oidAttrContentType)
+	i := bytes.Index(cms, oid)
+	if i < 0 {
+		t.Fatal("contentType OID not found in CMS")
+	}
+	broken := append([]byte(nil), cms...)
+	broken[i+len(oid)-1] ^= 0x01
+	_, err = verifyCMS(broken, cd, ca.roots())
+	if err == nil || !strings.Contains(err.Error(), "contentType") {
+		t.Fatalf("CMS without contentType: %v, want a contentType refusal", err)
+	}
+}
+
+func TestChainPathLenConstraint(t *testing.T) {
+	// The test intermediate has pathLen 0. Insert a second CA under it and
+	// issue the leaf from that; buildChain must refuse the extra level.
+	ca := newTestCA(t)
+	if err := checkPathLen([]*x509.Certificate{ca.leaf, ca.inter, ca.root}); err != nil {
+		t.Fatalf("valid chain refused: %v", err)
+	}
+	subKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	subTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(9), Subject: pkix.Name{CommonName: "Rogue Sub CA"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
+	}
+	subDER, err := x509.CreateCertificate(rand.Reader, subTmpl, ca.inter, &subKey.PublicKey, ca.interKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, _ := x509.ParseCertificate(subDER)
+	leafKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	leafTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(10), Subject: pkix.Name{CommonName: "leaf", OrganizationalUnit: []string{"X"}},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, sub, &leafKey.PublicKey, subKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, _ := x509.ParseCertificate(leafDER)
+	chain, err := buildChain(leaf, []*x509.Certificate{leaf, sub, ca.inter}, ca.roots(), time.Now())
+	if err != nil {
+		t.Fatalf("buildChain: %v", err)
+	}
+	if err := checkPathLen(chain); err == nil {
+		t.Fatal("pathLen 0 intermediate with a subordinate CA was accepted")
+	}
+}
+
+func TestBinarySizeBound(t *testing.T) {
+	f := newFake(t, []fakeProc{{pid: 100, exe: "/opt/tools/tool"}})
+	a := fakeAttestor(t, f, pinFor(t, f, 100))
+	// A sparse file over the bound costs nothing to create and must be
+	// refused before it is read.
+	big := filepath.Join(t.TempDir(), "huge")
+	fh, err := os.Create(big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fh.Truncate(maxBinarySize + 1); err != nil {
+		t.Skipf("cannot create a sparse %d byte file here: %v; would assert ErrNotInCatalog naming the size bound", maxBinarySize+1, err)
+	}
+	fh.Close()
+	f.files[100] = big
+	_, err = a.attest(context.Background(), peerCred{pid: 100, uid: 501})
+	if !errors.Is(err, ErrNotInCatalog) || !strings.Contains(err.Error(), "bound") {
+		t.Fatalf("err = %v, want ErrNotInCatalog naming the size bound", err)
 	}
 }

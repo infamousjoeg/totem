@@ -338,7 +338,13 @@ func (v *Verifier) Verify(a *Assertion, exp Expectation) (*Verified, error) {
 	if err := v.spend(a.Challenge, exp.DeviceID, now); err != nil {
 		return nil, err
 	}
+	return check(a, in, exp, now)
+}
 
+// check is Verify after the challenge has been spent: key, bindings,
+// request hash, signature. Shared with Enroll, which spends once for two
+// signatures.
+func check(a *Assertion, in SigningInput, exp Expectation, now time.Time) (*Verified, error) {
 	if exp.PresenceKey == nil {
 		return nil, ErrNoPresenceKey
 	}

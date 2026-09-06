@@ -147,3 +147,35 @@ func TestRealClaudeBinary(t *testing.T) {
 		t.Error("chain does not end at Apple Root CA")
 	}
 }
+
+// TestKernelCDHashSelectsBeforeVerification proves the order that keeps a
+// swapped file from driving work: with a kernel cdhash no slice matches, a
+// tampered copy of /bin/zsh is refused as "no slice matches" and its pages
+// are never checked; with the right cdhash the page check runs and fails.
+func TestKernelCDHashSelectsBeforeVerification(t *testing.T) {
+	data, err := os.ReadFile("/bin/zsh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f0 := bytes.NewReader(data)
+	good, err := verifyMachO(f0, int64(len(data)), sliceSelector{}, appleRoots())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ff, err := macho.NewFatFile(bytes.NewReader(data)); err == nil {
+		for _, a := range ff.Arches {
+			if a.Cpu == hostCPU() {
+				data[int64(a.Offset)+int64(a.Size)/2] ^= 0xff
+			}
+		}
+	}
+	r := bytes.NewReader(data)
+	_, err = verifyMachO(r, int64(len(data)), sliceSelector{kernelCDHash: bytes.Repeat([]byte{0xee}, cdHashLen)}, appleRoots())
+	if !errors.Is(err, errSliceNotFound) || strings.Contains(err.Error(), "code page") {
+		t.Fatalf("unknown kernel cdhash: %v, want errSliceNotFound with no page check", err)
+	}
+	_, err = verifyMachO(r, int64(len(data)), sliceSelector{kernelCDHash: good.CDHash}, appleRoots())
+	if err == nil || !strings.Contains(err.Error(), "code page") {
+		t.Fatalf("matching kernel cdhash on a tampered slice: %v, want page check failure", err)
+	}
+}

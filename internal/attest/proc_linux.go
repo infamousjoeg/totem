@@ -8,6 +8,18 @@ package attest
 // installed at a root-owned, non-writable path". The running executable is
 // hashed through /proc/<pid>/exe, which opens the running inode itself, so a
 // binary replaced on disk after exec is seen for what is actually running.
+//
+// The pid-reuse close is thinner here than on macOS, and that is a stated
+// limit rather than an oversight: Linux exposes no per-process unique id or
+// pid version to an unprivileged reader, so process.uniqueID,
+// parentUniqueID and pidVersion stay zero and the checks on them in
+// attestor.go are no-ops. What remains is the start time at USER_HZ (10 ms)
+// resolution plus the exe path, re-read after inspection. A pid recycled
+// within the same 10 ms tick by a process at the same exe path would pass the
+// re-read. In practice a parent's death reparents its children to init
+// (which ends the walk) and a catalog match requires a pin, so the residual
+// is a same-tick race against a pinned binary, not an identity of the
+// attacker's choosing.
 
 import (
 	"bufio"
