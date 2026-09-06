@@ -95,9 +95,12 @@ import (
 // KeychainStore is the macOS keyring level: a P-256 key generated in-process
 // and stored as a generic-password item in the user's login keychain. It is
 // "keyring-backed software key when no hardware exists; never refused, always
-// recorded": the keychain encrypts it at rest and ACLs it to this binary, but
-// the private key is in process memory during Sign, so the level is
-// ProtectionKeyring, not hardware, and there is no presence capability.
+// recorded": the keychain encrypts it at rest, but the item carries the default
+// access (no kSecAttrAccessControl, no access group, which would need Developer
+// ID signing), so it is readable by any process running as this user while the
+// login keychain is unlocked, and the private key is in process memory during
+// Sign. The level is ProtectionKeyring, not hardware, and there is no presence
+// capability; the design makes no theft-elimination claim below hardware.
 type KeychainStore struct{}
 
 // NewKeychainStore returns the keychain store, or an error when this process

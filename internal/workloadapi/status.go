@@ -3,8 +3,10 @@ package workloadapi
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -25,7 +27,7 @@ import (
 //	attest.ErrTooManyShellHops   -> OutOfRange         (one hop is the range)
 //	attest.ErrInterpreterWrapped -> Unimplemented      (permanent by design)
 //	attest.ErrUnsignedAtWritablePath -> Unauthenticated (no credential of its own)
-//	attest.ErrChainChanged       -> Canceled          (lifecycle, not an attack)
+//	attest.ErrChainChanged       -> Unavailable       (lifecycle; MUST reconnect)
 //	ErrIssuerUnreachable         -> Unavailable        (retryable, not terminal)
 //	platform.ErrPresenceDenied   -> PermissionDenied   (human said no)
 func statusCodeFor(err error) codes.Code {
@@ -46,15 +48,27 @@ func statusCodeFor(err error) codes.Code {
 		// present anything totem can authenticate it by at all.
 		return codes.Unauthenticated
 	case errors.Is(err, attest.ErrChainChanged):
-		// Canceled, because this is a lifecycle event rather than a refusal:
-		// the process that connected is still itself, but the tool or the
-		// shell above it exited and the helper was reparented, so the walk no
-		// longer reaches the tool that vouched for it. Giving it a code
-		// distinct from every rejection is the point. An operator reading a
-		// log has to be able to tell "a helper outlived its shell" from "an
-		// untrusted program tried to get credentials", and before this existed
-		// the two collapsed into the same catalog miss.
-		return codes.Canceled
+		// Unavailable, and the choice is dictated by what go-spiffe's client
+		// DOES rather than by what the code names.
+		//
+		// This was codes.Canceled, which reads perfectly: the caller's chain
+		// went away, nobody did anything wrong. It was also a bug. go-spiffe's
+		// handleWatchError returns immediately on Canceled and on
+		// InvalidArgument, and backs off and reconnects on everything else.
+		// Measured against a real client, every code reconnects except those
+		// two. So Canceled is the one code that turns "reconnect and carry on"
+		// into a permanently dead stream, with an X509Source that silently
+		// never updates again. A retryable error must never carry a code the
+		// client treats as terminal; TestRetryableErrorsNeverStallTheClient
+		// enforces that for all of them, not just this one.
+		//
+		// The distinguishability that motivated a separate code is preserved
+		// where it costs nothing: the message says the chain member exited,
+		// and the machine-readable reason token rides in the status details as
+		// ErrorInfo (see StatusFromError), so a log reader and a harness can
+		// both still tell a helper outliving its shell from an untrusted
+		// program fishing for credentials.
+		return codes.Unavailable
 	case errors.Is(err, platform.ErrPresenceDenied):
 		return codes.PermissionDenied
 	case errors.Is(err, platform.ErrPresenceUnavailable):
@@ -223,9 +237,20 @@ func binaryOf(ident *attest.Identity) string {
 	return "the calling program"
 }
 
+// ErrorDomain identifies totem as the source of a status detail, per the
+// google.rpc.ErrorInfo convention.
+const ErrorDomain = "totem.dev"
+
 // StatusFromError turns any refusal into the gRPC status a calling tool will
 // print. The message is one sentence of what happened plus one sentence of what
 // to do, because calling tools rarely forward anything richer.
+//
+// The machine-readable reason token also rides along as a google.rpc.ErrorInfo
+// detail. Status CODES cannot carry it: the code has to be chosen for what the
+// client will DO with it (see statusCodeFor on ErrChainChanged), which means
+// several distinct refusals necessarily share one. The detail is where the
+// distinction survives, so a harness can branch precisely without totem having
+// to pick a code that would strand the caller.
 func StatusFromError(err error, ident *attest.Identity) error {
 	if err == nil {
 		return nil
@@ -234,5 +259,25 @@ func StatusFromError(err error, ident *attest.Identity) error {
 	if fix := fixFor(err, ident); fix != "" {
 		parts = append(parts, fix)
 	}
-	return status.Error(statusCodeFor(err), strings.Join(parts, " "))
+	st := status.New(statusCodeFor(err), strings.Join(parts, " "))
+
+	reason := reasonFor(err)
+	if reason == "" {
+		return st.Err()
+	}
+	meta := map[string]string{"retryable": strconv.FormatBool(Retryable(err))}
+	if ident != nil && ident.Tool != "" {
+		meta["tool"] = ident.Tool
+	}
+	withDetails, derr := st.WithDetails(&errdetails.ErrorInfo{
+		Reason:   strings.ToUpper(reason),
+		Domain:   ErrorDomain,
+		Metadata: meta,
+	})
+	if derr != nil {
+		// Attaching a detail is best effort. A caller that cannot read details
+		// still gets the code and the sentence, which is the primary channel.
+		return st.Err()
+	}
+	return withDetails.Err()
 }

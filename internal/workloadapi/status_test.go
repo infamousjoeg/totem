@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -104,4 +105,140 @@ func TestRetryableClassification(t *testing.T) {
 			t.Errorf("%v must not be retryable", err)
 		}
 	}
+}
+
+// clientTerminalCodes are the status codes a go-spiffe workloadapi.Client
+// treats as the END of a watch: handleWatchError returns immediately on these
+// and backs off and reconnects on everything else.
+//
+// Measured against a real client rather than assumed from the names. Probing
+// every code a stream might carry:
+//
+//	Canceled            watch loop terminated, no reconnect
+//	InvalidArgument     watch loop terminated, no reconnect
+//	Unavailable         reconnected
+//	PermissionDenied    reconnected
+//	Aborted             reconnected
+//	FailedPrecondition  reconnected
+//	OutOfRange          reconnected
+//	Unauthenticated     reconnected
+//	Unimplemented       reconnected
+//
+// Canceled is the trap, because it is the code whose NAME fits a lifecycle
+// event best and whose BEHAVIOUR is the opposite of what a lifecycle event
+// needs.
+var clientTerminalCodes = map[codes.Code]bool{
+	codes.Canceled:        true,
+	codes.InvalidArgument: true,
+}
+
+// TestRetryableErrorsNeverStallTheClient is the invariant that keeps this
+// class of bug from coming back: if totem says an error is retryable, the
+// status it sends must be one the client will actually retry.
+//
+// Getting this wrong is silent in the worst way. The server logs a refusal
+// that says "reconnect and carry on", the harness reads retryable and agrees,
+// and the client has already torn the watch down for good, so an X509Source
+// stops updating and nothing anywhere reports a problem until a credential
+// expires.
+func TestRetryableErrorsNeverStallTheClient(t *testing.T) {
+	retryable := []error{
+		ErrIssuerUnreachable,
+		attest.ErrPIDReused,
+		attest.ErrChainChanged,
+	}
+	for _, err := range retryable {
+		if !Retryable(err) {
+			t.Fatalf("%v is in the retryable list but Retryable says otherwise", err)
+		}
+		code := statusCodeFor(err)
+		if clientTerminalCodes[code] {
+			t.Errorf("%v is retryable but maps to %v, which a go-spiffe client treats as the end of the watch: "+
+				"the stream dies for good and the source silently stops updating", err, code)
+		}
+	}
+}
+
+// TestOnlyDeliberateRefusalsUseTerminalCodes is the other direction. A code
+// that stops the client reconnecting is a strong statement, so it belongs only
+// where retrying genuinely cannot help.
+func TestOnlyDeliberateRefusalsUseTerminalCodes(t *testing.T) {
+	for _, err := range []error{
+		attest.ErrNotInCatalog,
+		attest.ErrSignatureMismatch,
+		attest.ErrTooManyShellHops,
+		attest.ErrInterpreterWrapped,
+		attest.ErrUnsignedAtWritablePath,
+		attest.ErrChainChanged,
+		ErrIssuerUnreachable,
+		ErrSourceUnavailable,
+		ErrNotEnrolled,
+	} {
+		if clientTerminalCodes[statusCodeFor(err)] {
+			t.Errorf("%v maps to %v, which permanently stops a client reconnecting; "+
+				"that is only correct for a caller that must change something before it can ever succeed", err, statusCodeFor(err))
+		}
+	}
+}
+
+// TestStatusCarriesTheMachineReadableReason: status codes have to be chosen for
+// what the client will DO with them, so several distinct refusals necessarily
+// share one. The reason token in the status details is where the distinction
+// survives, which is what lets a harness branch precisely without totem having
+// to pick a code that would strand the caller.
+func TestStatusCarriesTheMachineReadableReason(t *testing.T) {
+	cases := []struct {
+		err    error
+		reason string
+		retry  string
+	}{
+		{attest.ErrChainChanged, "CHAIN_CHANGED", "true"},
+		{ErrIssuerUnreachable, "ISSUER_UNREACHABLE", "true"},
+		{attest.ErrNotInCatalog, "NOT_IN_CATALOG", "false"},
+	}
+	for _, tc := range cases {
+		st, ok := status.FromError(StatusFromError(tc.err, nil))
+		if !ok {
+			t.Fatalf("%v did not become a status", tc.err)
+		}
+		var info *errdetails.ErrorInfo
+		for _, d := range st.Details() {
+			if ei, is := d.(*errdetails.ErrorInfo); is {
+				info = ei
+			}
+		}
+		if info == nil {
+			t.Errorf("%v carries no machine-readable reason", tc.err)
+			continue
+		}
+		if info.GetReason() != tc.reason {
+			t.Errorf("%v reason = %q, want %q", tc.err, info.GetReason(), tc.reason)
+		}
+		if info.GetDomain() != ErrorDomain {
+			t.Errorf("%v domain = %q, want %q", tc.err, info.GetDomain(), ErrorDomain)
+		}
+		if got := info.GetMetadata()["retryable"]; got != tc.retry {
+			t.Errorf("%v retryable = %q, want %q", tc.err, got, tc.retry)
+		}
+	}
+
+	// Two errors sharing a code must still be told apart by their reason.
+	chain, _ := status.FromError(StatusFromError(attest.ErrChainChanged, nil))
+	issuer, _ := status.FromError(StatusFromError(ErrIssuerUnreachable, nil))
+	if chain.Code() != issuer.Code() {
+		t.Skip("these no longer share a code, so there is nothing to disambiguate")
+	}
+	if reasonOf(t, chain) == reasonOf(t, issuer) {
+		t.Error("two different refusals share a code AND a reason; nothing can tell them apart")
+	}
+}
+
+func reasonOf(t *testing.T, st *status.Status) string {
+	t.Helper()
+	for _, d := range st.Details() {
+		if ei, ok := d.(*errdetails.ErrorInfo); ok {
+			return ei.GetReason()
+		}
+	}
+	return ""
 }

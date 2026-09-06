@@ -208,6 +208,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -274,8 +275,20 @@ func NewSecureEnclaveStore(dir string) (*SecureEnclaveStore, error) {
 // seUnavailableReason probes by creating an ephemeral (non-persisted) Secure
 // Enclave key and discarding it, which is the only real test of availability:
 // it exercises the SEP, the code-signing state, and the keybag. Empty when
-// usable.
+// usable. The answer is cached for the life of the process: it depends on the
+// binary and the keybag's after-first-unlock state, neither of which changes
+// while the agent runs, and Open sits on the per-exchange hot path.
 func seUnavailableReason() string {
+	seProbeOnce.Do(func() { seProbeReason = seProbe() })
+	return seProbeReason
+}
+
+var (
+	seProbeOnce   sync.Once
+	seProbeReason string
+)
+
+func seProbe() string {
 	var blob, pub unsafe.Pointer
 	var bl, pl C.size_t
 	var e C.totem_err
