@@ -3,6 +3,7 @@ module github.com/infamousjoeg/totem
 go 1.26
 
 require (
+	github.com/go-jose/go-jose/v4 v4.1.5 // indirect
 	github.com/google/go-tpm v0.9.8 // indirect
 	github.com/spiffe/go-spiffe/v2 v2.8.1 // indirect
 	golang.org/x/net v0.58.0 // indirect
