@@ -28,6 +28,8 @@ type fakeEngine struct {
 	challengeErr error
 	enrolled     *policy.EnrollResult
 	enrollErr    error
+	lastSig      policy.Signature
+	lastSubject  string
 	lastEnroll   policy.EnrollRequest
 	lastIssuerFP []byte
 	seen         []string
@@ -48,7 +50,8 @@ func (f *fakeEngine) Challenge(string) ([]byte, error)    { return f.challenge, 
 func (f *fakeEngine) Prepare(string, policy.Action, string) (*policy.ToSign, error) {
 	return &policy.ToSign{Input: presence.SigningInput{Version: presence.EncodingVersion}}, nil
 }
-func (f *fakeEngine) Approve(context.Context, string, policy.Signature) (*policy.EnrollmentRecord, error) {
+func (f *fakeEngine) Approve(_ context.Context, code string, sig policy.Signature) (*policy.EnrollmentRecord, error) {
+	f.lastSig, f.lastSubject = sig, code
 	return &policy.EnrollmentRecord{DeviceID: "abc"}, nil
 }
 func (f *fakeEngine) GrantAdmin(context.Context, string, policy.Signature) error   { return nil }
@@ -455,4 +458,74 @@ func TestABareSignatureFailureStaysASignatureFailure(t *testing.T) {
 	if body := w.Body.String(); strings.Contains(body, "--trust-domain") {
 		t.Errorf("a genuine signature failure was blamed on a name mismatch: %q", body)
 	}
+}
+
+// TestTheBodyCannotChooseWhatTheVerifierHashes.
+//
+// presence.Assertion is the verifier's input: presence re-encodes it and hashes
+// the result, so any field left in it from a request body is a caller-chosen
+// string inside the bytes a signature is checked over. Three of its fields are
+// things the issuer already knows, and the issuer sets all three.
+//
+// internal/policy builds its own Expectation from issuer state and would refuse
+// a mismatched Tool or Target anyway, so this was safe before. That is exactly
+// the arrangement worth removing: safe because two things agree, both correct
+// today. Now it is safe because the value never gets in.
+func TestTheBodyCannotChooseWhatTheVerifierHashes(t *testing.T) {
+	t.Parallel()
+	f := &fakeEngine{}
+	s, _ := newTestServer(t, f)
+
+	// Everything a hostile body could try to put in front of the verifier.
+	body := SignedRequest{
+		Subject: "APPROVAL-CODE",
+		Assertion: Assertion{
+			Version:     presence.EncodingVersion,
+			Tool:        "some-other-tool",
+			Target:      "revoke-admin somebody-else",
+			Challenge:   make([]byte, presence.ChallengeSize),
+			Signature:   []byte("sig"),
+			RequestHash: make([]byte, presence.RequestHashSize),
+		},
+	}
+	r := httptest.NewRequest(http.MethodPost, "/v1/devices/approve", bytes.NewReader(mustJSON(t, body)))
+	r.Header.Set("Content-Type", "application/json")
+	r.TLS = attestedTLS(t)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d: %s", w.Code, w.Body.String())
+	}
+
+	got := f.lastSig.Assertion
+	if got == nil {
+		t.Fatal("no assertion reached the engine")
+	}
+	if got.Tool != policy.SigningTool {
+		t.Errorf("Tool reached the verifier as %q; there is one signing tool and the issuer knows it", got.Tool)
+	}
+	if want := policy.Target(policy.ActionApprove, body.Subject); got.Target != want {
+		t.Errorf("Target reached the verifier as %q, want %q. The action is fixed by the endpoint and the "+
+			"subject is the operand, so the issuer derives it and never accepts one the signer chose.",
+			got.Target, want)
+	}
+	if got.Target == "revoke-admin somebody-else" {
+		t.Fatal("a request to approve an enrollment carried a target naming a DIFFERENT action into the bytes the signature is checked over")
+	}
+	// The proof itself must survive untouched, or there is nothing to verify.
+	if string(got.Signature) != "sig" {
+		t.Errorf("the signature was rewritten: %q", got.Signature)
+	}
+	if len(got.Challenge) != presence.ChallengeSize {
+		t.Errorf("the challenge was rewritten: %d bytes", len(got.Challenge))
+	}
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }

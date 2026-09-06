@@ -208,7 +208,7 @@ func (s *Server) handlePrepare(w http.ResponseWriter, r *http.Request, a *policy
 
 // handleApprove applies an admin's signed approval of a pending enrollment.
 func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, a *policy.Attested) {
-	req, sig, ok := s.signed(w, r, a)
+	req, sig, ok := s.signed(w, r, a, policy.ActionApprove)
 	if !ok {
 		return
 	}
@@ -244,7 +244,7 @@ func (s *Server) applyDeviceAction(
 	w http.ResponseWriter, r *http.Request, a *policy.Attested,
 	action policy.Action, apply func(ctx context.Context, deviceID string, sig policy.Signature) error,
 ) {
-	req, sig, ok := s.signed(w, r, a)
+	req, sig, ok := s.signed(w, r, a, action)
 	if !ok {
 		return
 	}
@@ -259,12 +259,45 @@ func (s *Server) applyDeviceAction(
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// signed decodes a signed admin request and binds the signature to the CALLING
-// device. The signer is the attested credential, and an assertion naming a
-// different device is refused here rather than being handed to the engine,
-// which would otherwise verify a perfectly good signature from a device that is
-// not the one on the connection.
-func (s *Server) signed(w http.ResponseWriter, r *http.Request, a *policy.Attested) (SignedRequest, policy.Signature, bool) {
+// signed decodes a signed admin request and rebuilds every field of the
+// assertion that the issuer can derive for itself.
+//
+// THE RULE, and it is the build lead's constraint on the enrollment diagnostic
+// generalised: a device-supplied value must not reach the verifier's input at
+// all, regardless of what else guards it. presence.Assertion is exactly that
+// input, because presence re-encodes it and hashes the result, so anything left
+// in it from a request body is a caller-chosen string inside the bytes a
+// signature is checked over.
+//
+// Three of its fields are things the issuer already knows, so the issuer sets
+// them and the body cannot:
+//
+//   - DeviceID is the ATTESTED credential on the connection. A body that could
+//     name its own signer would let any enrolled device claim to be the admin
+//     whose key is about to be verified against.
+//   - Tool is always policy.SigningTool. There is one.
+//   - Target is always policy.Target(action, subject): the action is fixed by
+//     the endpoint the request arrived at, and the subject is the operand.
+//     internal/policy's own comment says "the issuer never accepts a target the
+//     signer chose", and until now this handler was accepting one and relying
+//     on policy's independent Expectation to disagree with it.
+//
+// That reliance was safe and is exactly the arrangement this build has found
+// three defects in: two things that have to agree, both correct today. The
+// safety no longer depends on the second one existing.
+//
+// Challenge, RequestHash and Signature necessarily come from the body, because
+// they ARE the proof. Each is checked against issuer state by internal/policy:
+// the challenge must be one it minted for this device, and the request hash
+// must equal the digest it computed from its own records.
+//
+// The cost is a sentinel. A device that signed a different target now fails as
+// ErrBadSignature rather than ErrTargetMismatch, because the bytes no longer
+// carry what it thought it was signing. That is the same trade the lead ruled
+// on for enrollment, and it goes the same way: the invariant is worth more than
+// the precise error, and the human-facing message is written from the request
+// code the CLI printed either way.
+func (s *Server) signed(w http.ResponseWriter, r *http.Request, a *policy.Attested, action policy.Action) (SignedRequest, policy.Signature, bool) {
 	var req SignedRequest
 	if err := decode(r, &req); err != nil {
 		s.refuse(w, r, a.ID().DeviceID, err)
@@ -275,15 +308,21 @@ func (s *Server) signed(w http.ResponseWriter, r *http.Request, a *policy.Attest
 			"Say which device or code this applies to.", "that request did not say what it applies to."))
 		return req, policy.Signature{}, false
 	}
+	// Refused rather than silently corrected, because a mismatch here is a
+	// person running the command from the wrong machine and they need to know
+	// that, not to have it quietly rewritten under them.
 	if req.Assertion.DeviceID != "" && req.Assertion.DeviceID != a.ID().DeviceID {
 		s.refuse(w, r, a.ID().DeviceID, badRequest(
 			"Run this from the device that confirmed it, not through another one.",
 			"the confirmation came from a different device than the one asking."))
 		return req, policy.Signature{}, false
 	}
-	sig := policy.Signature{DeviceID: a.ID().DeviceID, Assertion: req.Assertion.presence()}
-	sig.Assertion.DeviceID = a.ID().DeviceID
-	return req, sig, true
+
+	assertion := req.Assertion.presence()
+	assertion.DeviceID = a.ID().DeviceID
+	assertion.Tool = policy.SigningTool
+	assertion.Target = policy.Target(action, req.Subject)
+	return req, policy.Signature{DeviceID: a.ID().DeviceID, Assertion: assertion}, true
 }
 
 // CRLView is one signed certificate revocation list, scoped to the

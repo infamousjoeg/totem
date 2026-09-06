@@ -153,12 +153,22 @@ func TestRequestBodiesCarryNoIdentity(t *testing.T) {
 			}
 		}
 	}
-	// SignedRequest carries an Assertion whose DeviceID is the one identity-ish
-	// field on any body. It exists so a mismatch with the attested device is a
-	// clear refusal, and signed() overwrites it with the attested value before
-	// it reaches the engine. Assert that overwrite is still there.
-	if n := countOutsideComments(packageSource(t), "sig.Assertion.DeviceID = a.ID().DeviceID"); n != 1 {
-		t.Error("signed() must overwrite the assertion's device id with the attested one, so a body cannot name its own signer")
+	// SignedRequest carries an Assertion, which IS the verifier's input:
+	// presence re-encodes it and hashes the result, so anything left in it from
+	// a request body is a caller-chosen string inside the bytes a signature is
+	// checked over. Every field the issuer can derive for itself must be
+	// overwritten before it reaches the engine, and these are the three.
+	src := packageSource(t)
+	for _, overwrite := range []string{
+		"assertion.DeviceID = a.ID().DeviceID",
+		"assertion.Tool = policy.SigningTool",
+		"assertion.Target = policy.Target(action, req.Subject)",
+	} {
+		if n := countOutsideComments(src, overwrite); n != 1 {
+			t.Errorf("signed() must set %q exactly once. A field the issuer knows and takes from the body "+
+				"instead is a device-supplied value in the verifier's input, safe only for as long as some "+
+				"other check keeps disagreeing with it.", overwrite)
+		}
 	}
 }
 

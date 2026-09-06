@@ -439,3 +439,73 @@ func TestEncodingVersionMismatchIsRefusedBeforeAnythingIsSpent(t *testing.T) {
 		t.Fatal("an enrollment in an unknown format must be refused")
 	}
 }
+
+// TestANoneLevelDeviceHasNoNameBindingAtAll corrects something I had wrong, and
+// mirrors internal/policy's own case from this side.
+//
+// I had assumed a presence:none device that mistypes the issuer name gets a
+// bare ErrBadSignature. It does not: it ENROLLS, and the reason is structural
+// rather than a quirk of the verifier. The issuer name is not a field of
+// EnrollmentInput at all, so the device-key proof of possession does not cover
+// it. The name is bound ONLY by the presence assertion, which a none-level
+// device never makes, so there is nothing for a typo to break.
+//
+// The first subtest asserts the behaviour; the second asserts the reason, which
+// is the half that would catch this changing. If the name were ever added to
+// the canonical enrollment bytes, the behaviour test would keep passing for a
+// while and the encoding test would fail immediately.
+func TestANoneLevelDeviceHasNoNameBindingAtAll(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a wrong asserted name still enrolls", func(t *testing.T) {
+		t.Parallel()
+		v := presence.NewVerifier(0, nil)
+		d := newEnrollingDevice(t, false) // no presence half
+		challenge, err := v.Mint(d.deviceID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req, assertion := d.request(t, challenge, "an-issuer-that-is-not-us", "", issuerFingerprint(t))
+		if assertion != nil {
+			t.Fatal("a device with no presence key produced an assertion")
+		}
+		in, err := EnrollmentInput(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := v.Enroll(in, req.Signature, nil, testTrustDomain)
+		if err != nil {
+			t.Fatalf("a presence:none device with a mistyped issuer name must still enroll, because nothing "+
+				"binds the name for it to have got wrong: %v", err)
+		}
+		if out.State != presence.StateNone {
+			t.Errorf("state %q, want %q", out.State, presence.StateNone)
+		}
+	})
+
+	t.Run("the issuer name is not in the canonical enrollment bytes", func(t *testing.T) {
+		t.Parallel()
+		v := presence.NewVerifier(0, nil)
+		d := newEnrollingDevice(t, false)
+		challenge, err := v.Mint(d.deviceID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		const asserted = "a-very-distinctive-issuer-name"
+		req, _ := d.request(t, challenge, asserted, "", issuerFingerprint(t))
+		in, err := EnrollmentInput(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if indexOf(mustBytes(t, in), []byte(asserted)) >= 0 {
+			t.Fatal("the asserted issuer name appears in the canonical enrollment bytes. If that is now " +
+				"deliberate, a none-level device's name IS bound and the diagnostic story changes for it.")
+		}
+		// The same is true of the trust domain the issuer would verify against:
+		// it reaches presence.Verifier.Enroll as an argument, and is only ever
+		// compared against an assertion, which a none-level device does not send.
+		if indexOf(mustBytes(t, in), []byte(testTrustDomain)) >= 0 {
+			t.Fatal("the issuer's own trust domain appears in the canonical enrollment bytes")
+		}
+	})
+}
