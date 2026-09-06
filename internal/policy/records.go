@@ -225,15 +225,12 @@ type pendingEnrollment struct {
 	input    presence.EnrollmentInput
 }
 
-// grantMeta is what policy keeps about a root grant beyond the registry:
-// whether it is a shadow grant and the sanctioned scope it ran under.
-type grantMeta struct {
-	sponsor    string
-	shadow     bool
-	sanctioned presence.Scope
-	agent      string
-	until      time.Time
-}
+// The registry (presence.Registry) is the ONE authority for grant substance:
+// agent, sponsor, scope, expiry, lineage, revocation. Policy keeps only what
+// the registry has no field for, the shadow flag, plus the set of root ids
+// it has recorded so renewals can be enumerated (the registry has no list).
+// Neither can drift into disagreeing with the registry about a grant's
+// content, because neither holds any.
 
 // dailySpend is the running outward money total for a root grant today.
 type dailySpend struct {
@@ -253,7 +250,8 @@ type state struct {
 	enrollments  map[string]*EnrollmentRecord
 	pending      map[string]*pendingEnrollment
 	windows      []presence.Window
-	grants       map[string]*grantMeta
+	shadows      map[string]bool
+	roots        map[string]struct{}
 	observations map[string][]Observation
 	spend        map[string]*dailySpend
 	loading      bool
@@ -263,7 +261,8 @@ func newState() *state {
 	return &state{
 		enrollments:  make(map[string]*EnrollmentRecord),
 		pending:      make(map[string]*pendingEnrollment),
-		grants:       make(map[string]*grantMeta),
+		shadows:      make(map[string]bool),
+		roots:        make(map[string]struct{}),
 		observations: make(map[string][]Observation),
 		spend:        make(map[string]*dailySpend),
 	}

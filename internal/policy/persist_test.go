@@ -83,10 +83,72 @@ func TestReloadRebuildsFromChain(t *testing.T) {
 	mustErr(t, iss.RevokeAdmin(ctx, headless, w.sign(laptop, ActionRevokeAdmin, headless)), nil)
 	_, err = w.trySign(laptop, ActionRevokeAdmin, laptop)
 	mustErr(t, err, ErrLastAdmin)
-	// Grant metadata survived (the sponsor is known), even though the
-	// registry itself could not be restored.
-	if m := iss.state.grants[root.ID]; m == nil || m.sponsor != laptop {
-		t.Fatalf("grant meta after reload %+v", m)
+	// The root id is remembered for renewal enumeration.
+	if _, ok := iss.state.roots[root.ID]; !ok {
+		t.Fatal("root id not remembered after reload")
+	}
+}
+
+func TestGrantsSurviveRestart(t *testing.T) {
+	// The assertion nothing made before: a grant sponsored before a restart
+	// is served by the registry after it. A credential minted under it opens
+	// a session, evaluates, and its shadow flag and revocation state hold.
+	w := newWorld(t)
+	ctx := ctxb()
+	founder := w.found("founder", true)
+	box := w.enrolled(founder, "studio", true)
+	sponsor := w.enrolled(founder, "sponsor", true)
+
+	g := presence.NewGrant("cassidy", wideScope(), w.clk.Now())
+	root, err := w.iss.Sponsor(ctx, g, w.sign(sponsor, ActionGrant, GrantSubject(g)))
+	mustErr(t, err, nil)
+	sh := presence.NewGrant("ember", wideScope(), w.clk.Now())
+	shadow, err := w.iss.Shadow(ctx, sh, w.sign(founder, ActionGrant, GrantSubject(sh)))
+	mustErr(t, err, nil)
+	dead := presence.NewGrant("dead", wideScope(), w.clk.Now())
+	deadRoot, err := w.iss.Sponsor(ctx, dead, w.sign(founder, ActionGrant, GrantSubject(dead)))
+	mustErr(t, err, nil)
+	mustErr(t, w.iss.RevokeGrant(ctx, deadRoot.ID, w.sign(founder, ActionRevokeGrant, deadRoot.ID)), nil)
+	cred := w.attest(agentID(box, "cassidy"), delegatedClaims(root))
+
+	w.clk.Advance(time.Hour)
+	iss, err := w.reopen()
+	mustErr(t, err, nil)
+	w.iss = iss
+
+	// Substance comes back from the registry, under the recorded id.
+	got, err := iss.Grant(root.ID)
+	mustErr(t, err, nil)
+	if got.Sponsor != sponsor || got.Agent != "cassidy" || !got.Until.Equal(root.Until) || !got.SignedAt.Equal(root.SignedAt) || !got.Scope.Within(root.Scope) || !root.Scope.Within(got.Scope) {
+		t.Fatalf("restored grant differs:\n%+v\n%+v", got, root)
+	}
+	// The credential minted before the restart still works.
+	sess, err := iss.OpenSession(ctx, cred, "")
+	mustErr(t, err, nil)
+	d, err := iss.Evaluate(ctx, cred, Request{Tool: "aws", Target: "dev", SessionID: sess.ID})
+	mustErr(t, err, nil)
+	if d.Verdict != VerdictAllow || d.Provenance.GrantID != root.ID {
+		t.Fatalf("after restart %+v", d)
+	}
+	// The sponsor can still revoke it (sponsor read from the registry).
+	mustErr(t, iss.RevokeGrant(ctx, root.ID, w.sign(sponsor, ActionRevokeGrant, root.ID)), nil)
+	_, err = iss.Grant(root.ID)
+	mustErr(t, err, presence.ErrGrantRevoked)
+	// The shadow flag survives.
+	ember := w.attest(agentID(box, "ember"), delegatedClaims(shadow))
+	d, _ = iss.Evaluate(ctx, ember, Request{Tool: "aws", Target: "dev"})
+	if d.Verdict != VerdictAllow || !d.Shadow {
+		t.Fatalf("shadow after restart %+v", d)
+	}
+	// A revocation recorded before the restart is not undone by the replay
+	// of the grant that preceded it.
+	_, err = iss.Grant(deadRoot.ID)
+	mustErr(t, err, presence.ErrGrantRevoked)
+	// Renewal enumeration sees the survivors.
+	w.clk.Advance(presence.DefaultGrantDuration - 2*time.Hour)
+	due := iss.RenewalsDue()
+	if len(due) != 1 || due[0].ID != shadow.ID {
+		t.Fatalf("renewals due %+v", due)
 	}
 }
 

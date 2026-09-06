@@ -18,7 +18,7 @@ import (
 func TestGrantNarrowingIsMonotonic(t *testing.T) {
 	clk := newTestClock()
 	v := presence.NewVerifier(0, clk.Now)
-	reg := presence.NewRegistry(clk.Now)
+	reg := liveRegistry(clk.Now)
 	key := newDeviceKey(t)
 	const deviceID = "admin-device-1"
 
@@ -84,7 +84,7 @@ func TestGrantNarrowingIsMonotonic(t *testing.T) {
 func TestReWideningRequiresFreshPresenceAfterNarrowing(t *testing.T) {
 	clk := newTestClock()
 	v := presence.NewVerifier(0, clk.Now)
-	reg := presence.NewRegistry(clk.Now)
+	reg := liveRegistry(clk.Now)
 	key := newDeviceKey(t)
 	const deviceID = "admin-device-1"
 
@@ -142,7 +142,7 @@ func TestReWideningRequiresFreshPresenceAfterNarrowing(t *testing.T) {
 func TestConcurrentNarrowingNeverCorruptsRegistryState(t *testing.T) {
 	clk := newTestClock()
 	v := presence.NewVerifier(0, clk.Now)
-	reg := presence.NewRegistry(clk.Now)
+	reg := liveRegistry(clk.Now)
 	key := newDeviceKey(t)
 	const deviceID = "admin-device-1"
 
@@ -202,7 +202,7 @@ func TestConcurrentNarrowingNeverCorruptsRegistryState(t *testing.T) {
 func TestConcurrentWidenWithSameVerifiedSucceedsExactlyOnce(t *testing.T) {
 	clk := newTestClock()
 	v := presence.NewVerifier(0, clk.Now)
-	reg := presence.NewRegistry(clk.Now)
+	reg := liveRegistry(clk.Now)
 	key := newDeviceKey(t)
 	const deviceID = "admin-device-1"
 
@@ -266,7 +266,7 @@ func TestConcurrentWidenWithSameVerifiedSucceedsExactlyOnce(t *testing.T) {
 func TestGrantRevocationReachesEverySubGrant(t *testing.T) {
 	clk := newTestClock()
 	v := presence.NewVerifier(0, clk.Now)
-	reg := presence.NewRegistry(clk.Now)
+	reg := liveRegistry(clk.Now)
 	key := newDeviceKey(t)
 	const deviceID = "admin-device-1"
 

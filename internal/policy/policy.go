@@ -13,12 +13,15 @@
 //
 // What that does NOT cover, stated so nobody reads more into it: a host
 // with write access to the store can TRUNCATE the chain to before a revoke
-// record and move the recorded head to match. The prefix is internally
+// record and move the recorded head to match, and a RESTORE of a backup
+// taken before the revoke lands in the same place. The prefix is internally
 // consistent (links hold, ordinals stay sequential, every signature still
 // verifies), so reload cannot tell it from the whole chain and the
 // revocation is reverted. History cannot be changed; it can be rolled back.
-// Closing that needs the chain head held off the box and compared at start,
-// which is a deployment decision above this package (see store.Store.Head).
+// load has no anchor for "at least as new as what I last saw". Closing that
+// needs the chain head held off the box and compared at open and after
+// restore, which is a deployment decision above this package (see
+// store.Store.Head).
 //
 // The package evaluates against internal/presence and never re-implements it:
 // presence assertions go through presence.Verifier, sessions through

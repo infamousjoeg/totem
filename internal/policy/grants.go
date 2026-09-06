@@ -61,7 +61,7 @@ func (i *Issuer) sponsorGrant(ctx context.Context, g presence.Grant, sig Signatu
 		i.cfg.Grants.Revoke(root.ID)
 		return nil, err
 	}
-	i.state.grants[root.ID] = &grantMeta{sponsor: root.Sponsor, shadow: shadow, sanctioned: root.Scope, agent: root.Agent, until: root.Until}
+	i.state.recordRoot(root.ID, shadow)
 	return root, nil
 }
 
@@ -89,7 +89,7 @@ func (i *Issuer) revokeGrant(ctx context.Context, grantID string, sig Signature)
 	payload, _ := json.Marshal(idPayload{IDs: []string{grantID}})
 	i.state.mu.Lock()
 	defer i.state.mu.Unlock()
-	if err := i.state.requireAdminOrSponsorLocked(signer.DeviceID, root); err != nil {
+	if err := i.state.requireAdminOrSponsorLocked(i.cfg.Grants, signer.DeviceID, root); err != nil {
 		return err
 	}
 	if err := i.record(ctx, &signedRecord{
@@ -105,10 +105,14 @@ func (i *Issuer) revokeGrant(ctx context.Context, grantID string, sig Signature)
 func (i *Issuer) requireAdminOrSponsor(deviceID, rootID string) error {
 	i.state.mu.Lock()
 	defer i.state.mu.Unlock()
-	return i.state.requireAdminOrSponsorLocked(deviceID, rootID)
+	return i.state.requireAdminOrSponsorLocked(i.cfg.Grants, deviceID, rootID)
 }
 
-func (s *state) requireAdminOrSponsorLocked(deviceID, rootID string) error {
+// requireAdminOrSponsorLocked accepts an admin, or the sponsor the REGISTRY
+// records for the root grant. The sponsor is read from the registry and
+// nowhere else; a grant the registry no longer serves (expired, revoked,
+// unknown) has no sponsor here, so only an admin can act on it.
+func (s *state) requireAdminOrSponsorLocked(reg *presence.Registry, deviceID, rootID string) error {
 	e, err := s.liveEnrollment(deviceID)
 	if err != nil {
 		return err
@@ -116,17 +120,25 @@ func (s *state) requireAdminOrSponsorLocked(deviceID, rootID string) error {
 	if e.Admin {
 		return nil
 	}
-	if m, ok := s.grants[rootID]; ok && m.sponsor == deviceID {
+	if g, err := reg.Get(rootID); err == nil && g.Sponsor == deviceID {
 		return nil
 	}
 	return fmt.Errorf("%w: %s", ErrNotSponsor, deviceID)
 }
 
+// recordRoot remembers a root grant id and its shadow flag, under the lock.
+func (s *state) recordRoot(id string, shadow bool) {
+	s.roots[id] = struct{}{}
+	if shadow {
+		s.shadows[id] = true
+	}
+}
+
 func (i *Issuer) renewalsDue() []presence.Grant {
 	now := i.now()
 	i.state.mu.Lock()
-	ids := make([]string, 0, len(i.state.grants))
-	for id := range i.state.grants {
+	ids := make([]string, 0, len(i.state.roots))
+	for id := range i.state.roots {
 		ids = append(ids, id)
 	}
 	i.state.mu.Unlock()

@@ -321,3 +321,19 @@ func sponsorRootGrant(t *testing.T, v *presence.Verifier, reg *presence.Registry
 	}
 	return grant
 }
+
+// liveRegistry returns a registry in the state a running issuer's registry is
+// in: sealed, so Sponsor and Open work and Restore is refused.
+//
+// A registry starts out restoring, which is the window a replaying issuer
+// reloads persisted grants through, and policy.load seals it once the replay
+// has verified every record. These tests drive the live path directly with no
+// policy in the loop, so nothing would otherwise seal it and every Sponsor
+// would fail with ErrRegistryRestoring. Sealing here is not a workaround for
+// the guard; it is these fixtures standing in for the replay that a real
+// issuer always performs first.
+func liveRegistry(now func() time.Time) *presence.Registry {
+	r := presence.NewRegistry(now)
+	r.Seal()
+	return r
+}

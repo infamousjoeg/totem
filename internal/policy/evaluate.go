@@ -148,13 +148,18 @@ func (i *Issuer) evaluateAgent(ctx context.Context, a *Attested, req Request) (D
 	}
 	root := g.RootID()
 	i.state.mu.Lock()
-	meta := i.state.grants[root]
-	var shadow bool
-	var sanctioned presence.Scope
-	if meta != nil {
-		shadow, sanctioned = meta.shadow, meta.sanctioned
-	}
+	shadow := i.state.shadows[root]
 	i.state.mu.Unlock()
+	var sanctioned presence.Scope
+	if shadow {
+		// The sanctioned scope is the ROOT grant's scope as the registry
+		// holds it; policy keeps no copy that could disagree.
+		rg, err := i.cfg.Grants.Get(root)
+		if err != nil {
+			return deny(err.Error()), nil
+		}
+		sanctioned = rg.Scope
+	}
 
 	covered := scopeCovers(g.Scope, req)
 	if shadow {

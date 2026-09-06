@@ -19,7 +19,9 @@ import (
 // authority (admin, or sponsor) as it stood at that ordinal. Records are
 // replayed in chain order so that authority is what it was, not what it
 // became. Store.Walk verifies each link as it goes; a break is
-// store.ErrChainBroken and the issuer does not start.
+// store.ErrChainBroken and the issuer does not start. Grants are put back
+// into the registry under their recorded ids (Registry.Restore) and the
+// registry is sealed only after a complete, verified replay.
 func (i *Issuer) load(ctx context.Context) error {
 	i.state.mu.Lock()
 	defer i.state.mu.Unlock()
@@ -52,6 +54,11 @@ func (i *Issuer) load(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Every persisted grant and revocation is back in the registry; seal
+	// it so Restore is unreachable from any request path from here on.
+	// A registry that never gets here (load failed) stays restoring and
+	// refuses every write, which is the loud failure the guard exists for.
+	i.cfg.Grants.Seal()
 	return nil
 }
 
@@ -162,32 +169,33 @@ func (i *Issuer) replay(rec *signedRecord) error {
 		if _, err := i.verifyStored(rec, p.Hash); err != nil {
 			return err
 		}
-		i.state.grants[p.ID] = &grantMeta{sponsor: p.Sponsor, shadow: p.Shadow, sanctioned: g.Scope, agent: p.Agent, until: p.Until}
-		// presence.Registry has no restore path (Sponsor needs a live
-		// Verified and mints its own id), so a restarted issuer cannot put
-		// the grant back under its recorded id. If the registry ever grows
-		// one, this is where the grant re-enters it; until then a restart
-		// means every root grant is re-sponsored with presence.
-		if r, ok := any(i.cfg.Grants).(interface{ Restore(presence.Grant) error }); ok {
-			if err := r.Restore(presence.Grant{
-				ID: p.ID, Agent: p.Agent, Sponsor: p.Sponsor, Scope: g.Scope, Until: p.Until,
-				SignedAt: p.SignedAt, DerivedAt: p.SignedAt,
-			}); err != nil {
-				return err
-			}
+		// Re-register the grant under its RECORDED id. This is a direct
+		// call on the concrete registry: a required capability breaks the
+		// build when missing rather than degrading at runtime. The presence
+		// proof is not skipped here, it was just re-verified above from the
+		// chained record; Restore authorizes nothing and refuses an id the
+		// registry already holds, so a duplicated grant record is a bad
+		// chain, not a second grant.
+		if err := i.cfg.Grants.Restore(presence.Grant{
+			ID: p.ID, Agent: p.Agent, Sponsor: p.Sponsor, Scope: g.Scope, Until: p.Until,
+			SignedAt: p.SignedAt, DerivedAt: p.SignedAt,
+		}); err != nil {
+			return err
 		}
+		i.state.recordRoot(p.ID, p.Shadow)
 		return nil
 	case ActionRevokeGrant:
 		signer, err := i.verifyStored(rec, recordDigest(rec.Action, rec.Subject, []byte(rec.Subject)))
 		if err != nil {
 			return err
 		}
-		if err := i.state.requireAdminOrSponsorLocked(signer.DeviceID, rec.Subject); err != nil {
-			// The subject may be a sub-grant; its root is unknown after a
-			// restart, so accept an admin and otherwise refuse.
-			if !signer.Admin {
-				return err
-			}
+		// Chain order guarantees the grant record replayed before this one,
+		// so the sponsor check reads the registry exactly as it did live.
+		// Registry.Revoke accepts an id it does not hold (a sub-grant that
+		// died with its session) and records it anyway: a replayed
+		// revocation is never dropped.
+		if err := i.state.requireAdminOrSponsorLocked(i.cfg.Grants, signer.DeviceID, rec.Subject); err != nil {
+			return err
 		}
 		i.cfg.Grants.Revoke(rec.Subject)
 		return nil
