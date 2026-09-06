@@ -550,11 +550,17 @@ func (s *Summoner) Drifted() []string {
 // leave the running process fine and the next start broken.
 //
 // internal/ca enforces this order rather than trusting a caller to read it:
-// re-sealing before adoption returns ca.ErrPassphraseNotAdopted, which says
-// the resolver is still returning the value the material is sealed under. That
-// refusal exists because the alternative, which this package's serving of the
-// old value creates, is a re-seal that reports success having skipped every
-// file.
+// re-sealing before adoption returns ca.ErrPassphraseNotAdopted instead of the
+// success it would otherwise report. That refusal exists because of the
+// behaviour above: while this package is still serving the old value, a
+// re-seal can find nothing to do and cannot tell "already done" from "never
+// started".
+//
+// The exact condition that triggers it is ca's to define and has already been
+// widened once. Read it there, not here: a doc in this package that restates
+// another package's trigger will eventually describe a narrower one than the
+// code enforces, and someone whose case IS covered will read it and conclude
+// theirs is not.
 func (s *Summoner) ResealCompleted(ctx context.Context, name string) error {
 	s.rotateMu.Lock()
 	defer s.rotateMu.Unlock()
