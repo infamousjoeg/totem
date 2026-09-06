@@ -40,4 +40,6 @@ is not checked, and code signature timestamps are not verified.
 
 Design: `docs/totem-design.md` and `docs/totem-design-decisions.md`.
 
+The [wiki](https://github.com/infamousjoeg/totem/wiki) covers the decisions that took real work, at the length the reasoning needs: why the Secure Enclave holds two keys, why tool identity comes from the kernel rather than from the file, and why a release build refuses to link today.
+
 Apache 2.0. Contributions take a DCO sign-off; see CONTRIBUTING.md.
