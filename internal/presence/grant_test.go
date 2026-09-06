@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -28,6 +29,7 @@ func sponsored(t *testing.T) (*clock, *Registry, *Grant) {
 	t.Helper()
 	clk := newClock()
 	reg := NewRegistry(clk.Now)
+	reg.Seal()
 	g := NewGrant("cassidy", wideScope(), clk.Now())
 	root, err := reg.Sponsor(g, verified("mac-studio", clk.Now(), g.Hash()))
 	if err != nil {
@@ -107,6 +109,7 @@ func TestSponsor(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			reg := NewRegistry(clk.Now)
+			reg.Seal()
 			root, err := reg.Sponsor(tc.g(), tc.v)
 			mustErr(t, err, tc.want)
 			if tc.want != nil {
@@ -144,6 +147,7 @@ func TestMaxGrantDurationInteraction(t *testing.T) {
 	}
 	clk := newClock()
 	reg := NewRegistry(clk.Now)
+	reg.Seal()
 	// A grant signed at the ceiling, then narrowed: the child inherits the
 	// parent's expiry exactly and cannot be pushed past it.
 	g := NewGrant("cassidy", wideScope(), clk.Now())
@@ -549,6 +553,7 @@ func TestNarrowingMonotonicProperty(t *testing.T) {
 	for i := range iterations {
 		clk := newClock()
 		reg := NewRegistry(clk.Now)
+		reg.Seal()
 		parent := genParent()
 		g := NewGrant("agent", parent, clk.Now())
 		root, err := reg.Sponsor(g, verified("dev", clk.Now(), g.Hash()))
@@ -797,4 +802,217 @@ func TestOpenRequiresActiveGrant(t *testing.T) {
 	mustErr(t, err, ErrGrantExpired)
 	_, err = reg.Open("nope", "nope")
 	mustErr(t, err, ErrGrantNotFound)
+}
+
+// Restore reinstates persisted grants before Seal and nothing after; it
+// never overwrites; sub-grants must fit their restored tree; revocations of
+// ids not held are recorded. (Lead: grants must survive a restart.)
+func TestRestoreLifecycle(t *testing.T) {
+	// Build a tree in a live registry, then reload it into a fresh one.
+	clk, live, root := sponsored(t)
+	s, _ := live.Open(root.ID, root.ID)
+	clk.Advance(time.Hour)
+	child, _ := live.Narrow(s.ID, Scope{AWSProfiles: []string{"dev"}, Money: Money{PerTransactionUSD: 1, PerDayUSD: 1}}, time.Time{})
+	grand, _ := live.Narrow(s.ID, Scope{}, root.Until.Add(-time.Hour))
+
+	clk.Advance(24 * time.Hour) // the restart happens a day later
+	reg := NewRegistry(clk.Now)
+	if reg.Sealed() {
+		t.Fatal("new registry is not restoring")
+	}
+	// Request-path writes are refused while restoring, loudly.
+	_, err := reg.Sponsor(NewGrant("x", Scope{}, clk.Now()), verified("mac-studio", clk.Now(), nil))
+	mustErr(t, err, ErrRegistryRestoring)
+	// Replay in chain order: root, child, grandchild.
+	for _, g := range []*Grant{root, child, grand} {
+		if err := reg.Restore(*g); err != nil {
+			t.Fatalf("restore %s: %v", g.ID, err)
+		}
+	}
+	// A second Restore of the same id never overwrites.
+	altered := *root
+	altered.Scope.AWSProfiles = append(altered.Scope.AWSProfiles, "prod")
+	mustErr(t, reg.Restore(altered), ErrGrantExists)
+	got, _ := reg.Get(root.ID)
+	if slices.Contains(got.Scope.AWSProfiles, "prod") {
+		t.Fatal("restore overwrote a held grant")
+	}
+	reg.Seal()
+	reg.Seal() // idempotent
+	if !reg.Sealed() {
+		t.Fatal("not sealed")
+	}
+	mustErr(t, reg.Restore(*root), ErrRegistrySealed)
+
+	// Everything came back under its recorded identity and times.
+	for _, want := range []*Grant{root, child, grand} {
+		g, err := reg.Get(want.ID)
+		if err != nil {
+			t.Fatalf("get %s after restore: %v", want.ID, err)
+		}
+		if !reflect.DeepEqual(g.Lineage, want.Lineage) || !g.SignedAt.Equal(want.SignedAt) || !g.DerivedAt.Equal(want.DerivedAt) || !g.Until.Equal(want.Until) || g.Sponsor != want.Sponsor {
+			t.Fatalf("restored %s differs:\n got %+v\nwant %+v", want.ID, g, want)
+		}
+	}
+	// The tree still narrows and still revokes through lineage.
+	s2, err := reg.Open(grand.ID, grand.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.Narrow(s2.ID, Scope{}, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = reg.Open(grand.ID, root.ID)
+	mustErr(t, err, ErrNotHolder)
+	reg.Revoke(child.ID)
+	_, err = reg.Get(grand.ID)
+	mustErr(t, err, ErrGrantRevoked)
+	if _, err := reg.Get(root.ID); err != nil {
+		t.Fatal("revoking a restored child hit the root")
+	}
+}
+
+func TestRestoreRefusals(t *testing.T) {
+	clk, live, root := sponsored(t)
+	s, _ := live.Open(root.ID, root.ID)
+	child, _ := live.Narrow(s.ID, Scope{AWSProfiles: []string{"dev"}}, time.Time{})
+	fresh := func() *Registry {
+		r := NewRegistry(clk.Now)
+		if err := r.Restore(*root); err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	cases := []struct {
+		name string
+		mut  func(g *Grant)
+		want error
+	}{
+		{"valid child", func(*Grant) {}, nil},
+		{"no id", func(g *Grant) { g.ID = "" }, ErrGrantInvalid},
+		{"no agent", func(g *Grant) { g.Agent = "" }, ErrGrantInvalid},
+		{"no sponsor", func(g *Grant) { g.Sponsor = "" }, ErrGrantInvalid},
+		{"zero signed at", func(g *Grant) { g.SignedAt = time.Time{} }, ErrGrantInvalid},
+		{"zero derived at", func(g *Grant) { g.DerivedAt = time.Time{} }, ErrGrantInvalid},
+		{"expiry before signing", func(g *Grant) { g.Until = g.SignedAt }, ErrGrantInvalid},
+		{"expiry past the ceiling", func(g *Grant) {
+			g.Lineage = nil
+			g.ID = "other"
+			g.Until = g.SignedAt.Add(MaxGrantDuration + time.Second)
+		}, ErrGrantInvalid},
+		{"NaN money", func(g *Grant) { g.Scope.Money.PerDayUSD = math.NaN() }, ErrGrantInvalid},
+		{"parent not present", func(g *Grant) { g.Lineage = []string{"ghost"} }, ErrRestoreLineage},
+		{"lineage skips the parent", func(g *Grant) { g.Lineage = []string{root.ID, "ghost"} }, ErrRestoreLineage},
+		{"wider than parent", func(g *Grant) { g.Scope.AWSProfiles = []string{"dev", "prod"} }, ErrRestoreLineage},
+		{"outlives parent", func(g *Grant) { g.Until = root.Until.Add(time.Nanosecond) }, ErrRestoreLineage},
+		{"different agent", func(g *Grant) { g.Agent = "ember" }, ErrRestoreLineage},
+		{"different sponsor", func(g *Grant) { g.Sponsor = "work-mbp" }, ErrRestoreLineage},
+		{"different signing time", func(g *Grant) { g.SignedAt = g.SignedAt.Add(time.Second) }, ErrRestoreLineage},
+		{"derived before parent", func(g *Grant) { g.DerivedAt = root.DerivedAt.Add(-time.Second) }, ErrRestoreLineage},
+		{"same id as the root", func(g *Grant) { g.ID = root.ID }, ErrGrantExists},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := fresh()
+			g := *child
+			g.Lineage = slices.Clone(child.Lineage)
+			g.Scope.AWSProfiles = slices.Clone(child.Scope.AWSProfiles)
+			tc.mut(&g)
+			err := r.Restore(g)
+			mustErr(t, err, tc.want)
+			if tc.want != nil && tc.want != ErrGrantExists {
+				if _, err := r.Get(g.ID); !errors.Is(err, ErrGrantNotFound) {
+					t.Fatal("refused restore left a grant behind")
+				}
+			}
+		})
+	}
+	// An expired grant restores (its descendants need it present) and reads
+	// as expired.
+	r := NewRegistry(clk.Now)
+	old := *root
+	old.ID = "old"
+	old.SignedAt = clk.At(-2 * DefaultGrantDuration)
+	old.DerivedAt = old.SignedAt
+	old.Until = old.SignedAt.Add(DefaultGrantDuration)
+	if err := r.Restore(old); err != nil {
+		t.Fatal(err)
+	}
+	_, err := r.Get("old")
+	mustErr(t, err, ErrGrantExpired)
+}
+
+// A revocation for an id the registry does not hold is recorded, not
+// dropped, so a replay that revokes before (or without ever) restoring the
+// grant still revokes it, and a later Restore under that id arrives revoked.
+func TestRevokeUnknownIsRecorded(t *testing.T) {
+	clk, live, root := sponsored(t)
+	reg := NewRegistry(clk.Now)
+	reg.Revoke(root.ID)
+	if !reg.Revoked(root.ID) {
+		t.Fatal("revocation of an unheld id was dropped")
+	}
+	if err := reg.Restore(*root); err != nil {
+		t.Fatal(err)
+	}
+	_, err := reg.Get(root.ID)
+	mustErr(t, err, ErrGrantRevoked)
+	// And a child restored under a revoked ancestor is revoked on arrival.
+	s, _ := live.Open(root.ID, root.ID)
+	child, _ := live.Narrow(s.ID, Scope{}, time.Time{})
+	if err := reg.Restore(*child); err != nil {
+		t.Fatal(err)
+	}
+	_, err = reg.Get(child.ID)
+	mustErr(t, err, ErrGrantRevoked)
+	reg.Seal()
+	_, err = reg.Open(child.ID, child.ID)
+	mustErr(t, err, ErrGrantRevoked)
+}
+
+// Restore re-validates against CURRENT rules, not the rules in force when
+// the grant was signed. If MaxGrantDuration is ever lowered, grants written
+// under the old ceiling are refused at reload with the reason, not
+// grandfathered and not silently dropped.
+func TestRestoreRevalidatesAgainstCurrentCeiling(t *testing.T) {
+	clk := newClock()
+	reg := NewRegistry(clk.Now)
+	signed := clk.At(-time.Hour)
+	// A grant that was legal under a hypothetical earlier, longer ceiling.
+	g := Grant{
+		ID: "legacy", Agent: "cassidy", Sponsor: "mac-studio", Scope: wideScope().Normalize(),
+		SignedAt: signed, DerivedAt: signed, Until: signed.Add(MaxGrantDuration + 24*time.Hour),
+	}
+	err := reg.Restore(g)
+	mustErr(t, err, ErrGrantInvalid)
+	if !strings.Contains(err.Error(), "expiry more than") {
+		t.Fatalf("refusal must carry the reason: %v", err)
+	}
+	if _, err := reg.Get("legacy"); !errors.Is(err, ErrGrantNotFound) {
+		t.Fatal("refused grant was held")
+	}
+	// Exactly at the current ceiling is accepted; the anchor is SignedAt, not
+	// now, so a grant signed days ago is measured from when it was signed.
+	g.Until = signed.Add(MaxGrantDuration)
+	if err := reg.Restore(g); err != nil {
+		t.Fatal(err)
+	}
+	// An already-expired grant restores for lineage and audit but is never
+	// live.
+	old := g
+	old.ID = "expired"
+	old.SignedAt = clk.At(-2 * DefaultGrantDuration)
+	old.DerivedAt = old.SignedAt
+	old.Until = old.SignedAt.Add(DefaultGrantDuration)
+	if err := reg.Restore(old); err != nil {
+		t.Fatal(err)
+	}
+	reg.Seal()
+	_, err = reg.Get("expired")
+	mustErr(t, err, ErrGrantExpired)
+	_, err = reg.Open("expired", "expired")
+	mustErr(t, err, ErrGrantExpired)
+	if _, err := reg.Get("legacy"); err != nil {
+		t.Fatal(err)
+	}
 }

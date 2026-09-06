@@ -317,6 +317,7 @@ func TestParkedErrorsAreDistinct(t *testing.T) {
 		ErrParkedNotFound, ErrParkedInvalid, ErrParkedNotPending, ErrParkedNotApproved,
 		ErrParkedExpired, ErrParkedConsumed, ErrIrreversibleInBatch, ErrPreSigned, ErrTooManyParked,
 		ErrNotHolder, ErrPresenceConsumed, ErrScopeInvalid,
+		ErrRegistryRestoring, ErrRegistrySealed, ErrGrantExists, ErrRestoreLineage,
 		ErrEnrollmentMalformed, ErrEnrollmentKeyUnsupported, ErrEnrollmentBadSignature,
 		ErrEnrollmentNeedsPresence, ErrEnrollmentUnexpectedPresence, ErrEnrollmentChallengeSplit,
 		ErrGrantNotFound, ErrGrantRevoked, ErrGrantExpired, ErrGrantInvalid, ErrGrantHashMismatch,

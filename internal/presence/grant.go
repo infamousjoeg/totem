@@ -57,6 +57,24 @@ var (
 	// ErrGrantInvalid: the grant is structurally unusable (no agent, expiry
 	// not in the future or beyond MaxGrantDuration, lineage on a root).
 	ErrGrantInvalid = errors.New("presence: grant invalid")
+	// ErrRegistryRestoring: the registry is still replaying persisted state
+	// and does not serve request-path writes (Sponsor, Open, Narrow, Widen)
+	// until Seal is called. An issuer that forgets to Seal fails loudly on
+	// its first request rather than serving from a half-restored tree.
+	ErrRegistryRestoring = errors.New("presence: registry is restoring; not sealed yet")
+	// ErrRegistrySealed: Restore was called after Seal. Once sealed, Sponsor
+	// is the only way a grant comes into being; there is no reload path from
+	// a request.
+	ErrRegistrySealed = errors.New("presence: registry is sealed; restore is closed")
+	// ErrGrantExists: Restore was asked to reinstate an id the registry
+	// already holds. Restore never overwrites; an overwrite is a rollback
+	// primitive.
+	ErrGrantExists = errors.New("presence: grant id already present")
+	// ErrRestoreLineage: a restored sub-grant does not fit the tree it
+	// claims: its parent is not present, its Lineage is not the parent's
+	// plus the parent's id, or it is wider or longer-lived than its parent,
+	// or its agent, sponsor, or signing time differ from the parent's.
+	ErrRestoreLineage = errors.New("presence: restored grant does not fit its lineage")
 	// ErrNotHolder: a session may be opened only on the grant the caller's
 	// credential names, or a descendant of it. Opening an ancestor from a
 	// sub-grant credential would be the out-of-session route around
@@ -357,6 +375,15 @@ type Grant struct {
 	DerivedAt time.Time
 }
 
+// Revoked reports whether id is in the revoked set, whether or not the
+// registry holds a grant under it.
+func (r *Registry) Revoked(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.revoked[id]
+	return ok
+}
+
 // NewGrant is the convenience constructor for a root grant a human is about
 // to sign: agent, scope, and the thirty-day default expiry from now. The
 // caller hashes it (Hash), mints a challenge, has the human sign with the hash
@@ -458,27 +485,120 @@ func WidenHash(sessionID, toGrantID string) []byte {
 // audit. Grant storage on disk is the issuer's concern; this type is the
 // in-memory authority the issuer consults on every exchange.
 type Registry struct {
-	mu       sync.Mutex
-	now      func() time.Time
-	newID    func() (string, error)
-	grants   map[string]*Grant
-	revoked  map[string]time.Time
-	sessions map[string]*AgentSession
+	mu        sync.Mutex
+	now       func() time.Time
+	newID     func() (string, error)
+	restoring bool
+	grants    map[string]*Grant
+	revoked   map[string]time.Time
+	sessions  map[string]*AgentSession
 }
 
 // NewRegistry returns an empty registry on the given clock (nil means
-// time.Now).
+// time.Now). It starts RESTORING: only Restore, Revoke, and reads work until
+// Seal is called. The issuer replays its persisted grant and revocation
+// records, then Seals; a registry that is never sealed refuses every
+// request-path write, so forgetting is loud.
 func NewRegistry(now func() time.Time) *Registry {
 	if now == nil {
 		now = time.Now
 	}
 	return &Registry{
-		now:      now,
-		newID:    randomID,
-		grants:   make(map[string]*Grant),
-		revoked:  make(map[string]time.Time),
-		sessions: make(map[string]*AgentSession),
+		now:       now,
+		newID:     randomID,
+		restoring: true,
+		grants:    make(map[string]*Grant),
+		revoked:   make(map[string]time.Time),
+		sessions:  make(map[string]*AgentSession),
 	}
+}
+
+// Seal ends the restoring state. After Seal, Restore returns
+// ErrRegistrySealed and Sponsor is the only way a grant comes into being.
+// Sealing twice is harmless. There is no unseal.
+func (r *Registry) Seal() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.restoring = false
+}
+
+// Sealed reports whether Seal has been called.
+func (r *Registry) Sealed() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return !r.restoring
+}
+
+// Restore reinstates a persisted grant under its RECORDED id, with its
+// recorded Sponsor, SignedAt, DerivedAt, Until, and Lineage, without a live
+// Verified. This is not a grant-forging primitive, and the reason is worth
+// stating exactly: the presence proof is not being skipped, it already
+// happened and is in the chain. The issuer re-verifies the sponsoring
+// record (the sponsor's presence assertion against their enrolled presence
+// key, the hash chain) BEFORE calling Restore, so what arrives here is an
+// admin-signed, presence-proven, hash-chained record being reloaded. Restore
+// authorizes nothing.
+//
+// That argument holds only while Restore is unreachable from a request path,
+// so the guard is the type's own state, not a convention: Restore works
+// only before Seal (ErrRegistrySealed after). It never overwrites an id the
+// registry already holds (ErrGrantExists). A sub-grant must fit the tree it
+// claims: its parent (last Lineage entry) must already be present, its
+// Lineage must equal the parent's Lineage plus the parent's id, its scope
+// must be Within the parent's, its expiry not later, and its agent, sponsor,
+// and signing time must equal the parent's (ErrRestoreLineage otherwise), so
+// a tampered record cannot restore a child wider than its ancestors and
+// read-time ancestor revocation keeps working. Expired grants restore too;
+// Get reports them expired, and their descendants still need them present.
+func (r *Registry) Restore(g Grant) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.restoring {
+		return ErrRegistrySealed
+	}
+	switch {
+	case g.ID == "":
+		return fmt.Errorf("%w: no id", ErrGrantInvalid)
+	case g.Agent == "":
+		return fmt.Errorf("%w: no agent", ErrGrantInvalid)
+	case g.Sponsor == "":
+		return fmt.Errorf("%w: no sponsor", ErrGrantInvalid)
+	case g.Until.IsZero() || g.SignedAt.IsZero() || g.DerivedAt.IsZero():
+		return fmt.Errorf("%w: zero time", ErrGrantInvalid)
+	case !g.Until.After(g.SignedAt):
+		return fmt.Errorf("%w: expiry not after signing", ErrGrantInvalid)
+	case g.Until.Sub(g.SignedAt) > MaxGrantDuration:
+		return fmt.Errorf("%w: expiry more than %s after signing", ErrGrantInvalid, MaxGrantDuration)
+	}
+	if err := g.Scope.Validate(); err != nil {
+		return fmt.Errorf("%w: %w", ErrGrantInvalid, err)
+	}
+	if _, exists := r.grants[g.ID]; exists {
+		return fmt.Errorf("%w: %s", ErrGrantExists, g.ID)
+	}
+	if len(g.Lineage) != 0 {
+		parentID := g.Lineage[len(g.Lineage)-1]
+		parent, ok := r.grants[parentID]
+		if !ok {
+			return fmt.Errorf("%w: parent %s not present", ErrRestoreLineage, parentID)
+		}
+		want := append(slices.Clone(parent.Lineage), parent.ID)
+		switch {
+		case !slices.Equal(g.Lineage, want):
+			return fmt.Errorf("%w: lineage does not extend the parent's", ErrRestoreLineage)
+		case !g.Scope.Within(parent.Scope):
+			return fmt.Errorf("%w: wider than parent", ErrRestoreLineage)
+		case g.Until.After(parent.Until):
+			return fmt.Errorf("%w: outlives parent", ErrRestoreLineage)
+		case g.Agent != parent.Agent || g.Sponsor != parent.Sponsor || !g.SignedAt.Equal(parent.SignedAt):
+			return fmt.Errorf("%w: agent, sponsor, or signing time differ from parent", ErrRestoreLineage)
+		case g.DerivedAt.Before(parent.DerivedAt):
+			return fmt.Errorf("%w: derived before parent", ErrRestoreLineage)
+		}
+	}
+	c := copyGrant(&g)
+	r.grants[c.ID] = c
+	return nil
 }
 
 func randomID() (string, error) {
@@ -496,6 +616,9 @@ func randomID() (string, error) {
 func (r *Registry) Sponsor(g Grant, v *Verified) (*Grant, error) {
 	if !v.Valid() {
 		return nil, ErrPresenceRequired
+	}
+	if !r.Sealed() {
+		return nil, ErrRegistryRestoring
 	}
 	now := r.now()
 	switch {
@@ -570,8 +693,11 @@ func (r *Registry) active(id string, now time.Time) (*Grant, error) {
 
 // Revoke revokes a grant instantly. Every sub-grant below it is revoked with
 // it, not by walking and marking children but because Get checks the
-// lineage: there is no descendant the revocation can miss. Revoking an
-// unknown id is not an error; the outcome is the same.
+// lineage: there is no descendant the revocation can miss. Revoking an id
+// the registry does not hold is RECORDED, not dropped: the revoked set is
+// independent of the grant map, so a replayed revocation lands whether or
+// not its grant has been (or ever is) restored, and a grant restored later
+// under that id is revoked on arrival. Works during restoring and after.
 func (r *Registry) Revoke(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -589,6 +715,9 @@ func (r *Registry) Revoke(id string) {
 func (r *Registry) Open(presentedGrantID, grantID string) (*AgentSession, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.restoring {
+		return nil, ErrRegistryRestoring
+	}
 	now := r.now()
 	if _, err := r.active(presentedGrantID, now); err != nil {
 		return nil, err
@@ -647,6 +776,9 @@ func (r *Registry) Narrow(sessionID string, scope Scope, until time.Time) (*Gran
 	now := r.now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.restoring {
+		return nil, ErrRegistryRestoring
+	}
 	s, ok := r.sessions[sessionID]
 	if !ok {
 		return nil, ErrSessionNotFound
@@ -698,6 +830,9 @@ func (r *Registry) Widen(sessionID, toGrantID string, v *Verified) (*Grant, erro
 	now := r.now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.restoring {
+		return nil, ErrRegistryRestoring
+	}
 	s, ok := r.sessions[sessionID]
 	if !ok {
 		return nil, ErrSessionNotFound

@@ -29,6 +29,7 @@ func TestProofSingleUseAndBindingProperty(t *testing.T) {
 		clk := newClock()
 		st := NewSessionStore(clk.Now)
 		reg := NewRegistry(clk.Now)
+		reg.Seal()
 		lot := NewLot(clk.Now, 0, 0)
 
 		// A world of things a proof might be bound to.
