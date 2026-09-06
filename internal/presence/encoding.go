@@ -35,6 +35,7 @@ const (
 	contextGrant     = "totem/grant"
 	contextWiden     = "totem/widen"
 	contextCode      = "totem/request-code"
+	contextBootstrap = "totem/bootstrap-code"
 )
 
 // ErrMalformed is a structural rejection: a field is missing, over length, or

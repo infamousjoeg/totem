@@ -35,6 +35,7 @@ func enrollFixture(t *testing.T) (*fakeKey, EnrollmentInput) {
 		ProtectionLevel:   spiffe.ProtectionHardware,
 		Hostname:          "joes-mac-studio",
 		OS:                "macOS 26.1",
+		FirstContact:      FirstContactFragment,
 	}
 }
 
@@ -59,6 +60,8 @@ func TestEnrollmentInputLayoutAndDomain(t *testing.T) {
 	field([]byte(in.ProtectionLevel))
 	field([]byte(in.Hostname))
 	field([]byte(in.OS))
+	field([]byte(in.FirstContact))
+	field(in.BootstrapCodeHash)
 	if !bytes.Equal(got, want) {
 		t.Fatal("layout mismatch")
 	}
@@ -73,12 +76,51 @@ func TestEnrollmentInputLayoutAndDomain(t *testing.T) {
 	if bytes.Equal(d, HashRequest(in.Challenge, in.IssuerFingerprint, in.DevicePublicKey)) {
 		t.Fatal("enrollment digest collides with a request hash")
 	}
+	// First contact cannot be relabelled, and absent vs present bootstrap
+	// code differ, without changing the bytes.
+	relabel := in
+	relabel.FirstContact = FirstContactPrompt
+	rb, _ := relabel.Bytes()
+	if bytes.Equal(rb, got) {
+		t.Fatal("first contact relabel produced identical bytes")
+	}
+	admin := in
+	admin.BootstrapCodeHash = BootstrapCodeHash(in.Challenge, "ABCD-1234")
+	ab, _ := admin.Bytes()
+	if bytes.Equal(ab, got) || len(ab) != len(got)+sha256.Size {
+		t.Fatal("bootstrap code presence not bound")
+	}
+	// The bootstrap hash is salted by the challenge and empty for no code.
+	if BootstrapCodeHash(in.Challenge, "") != nil {
+		t.Fatal("empty code produced a hash")
+	}
+	if bytes.Equal(BootstrapCodeHash(in.Challenge, "X"), BootstrapCodeHash(bytes.Repeat([]byte{4}, ChallengeSize), "X")) {
+		t.Fatal("bootstrap hash not salted by challenge")
+	}
+	if bytes.Equal(BootstrapCodeHash(in.Challenge, "X"), HashRequest(in.Challenge, []byte("X"))) {
+		t.Fatal("bootstrap hash shares the request domain")
+	}
 	// Hostname/OS boundary shift changes the bytes.
 	shifted := in
 	shifted.Hostname, shifted.OS = in.Hostname+in.OS[:1], in.OS[1:]
 	sb, _ := shifted.Bytes()
 	if bytes.Equal(sb, got) {
 		t.Fatal("boundary shift produced identical bytes")
+	}
+}
+
+func TestFirstContactZeroValueIsWeaker(t *testing.T) {
+	for _, f := range []FirstContact{"", FirstContactPrompt, "verified", "Fragment", "fragment "} {
+		if f.Verified() {
+			t.Fatalf("%q read as fragment-verified", f)
+		}
+	}
+	if !FirstContactFragment.Verified() {
+		t.Fatal("fragment not verified")
+	}
+	var zero FirstContact
+	if zero.Verified() {
+		t.Fatal("zero value read as verified")
 	}
 }
 
@@ -95,6 +137,11 @@ func TestEnrollmentValidate(t *testing.T) {
 		{"short fingerprint", func(in *EnrollmentInput) { in.IssuerFingerprint = in.IssuerFingerprint[:31] }, ErrEnrollmentMalformed},
 		{"no device key", func(in *EnrollmentInput) { in.DevicePublicKey = nil }, ErrEnrollmentMalformed},
 		{"no protection level", func(in *EnrollmentInput) { in.ProtectionLevel = "" }, ErrEnrollmentMalformed},
+		{"prompt first contact", func(in *EnrollmentInput) { in.FirstContact = FirstContactPrompt }, nil},
+		{"empty first contact", func(in *EnrollmentInput) { in.FirstContact = "" }, ErrEnrollmentMalformed},
+		{"unknown first contact", func(in *EnrollmentInput) { in.FirstContact = "trust-me" }, ErrEnrollmentMalformed},
+		{"bootstrap code hash", func(in *EnrollmentInput) { in.BootstrapCodeHash = BootstrapCodeHash(in.Challenge, "ABCD-1234") }, nil},
+		{"short bootstrap code hash", func(in *EnrollmentInput) { in.BootstrapCodeHash = []byte("ABCD-1234") }, ErrEnrollmentMalformed},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -146,6 +193,10 @@ func TestEnrollmentSignVerify(t *testing.T) {
 		{"empty signature", func(_ *EnrollmentInput, s *[]byte) { *s = nil }, ErrEnrollmentMalformed},
 		{"field altered after signing", func(in *EnrollmentInput, _ *[]byte) { in.ProtectionLevel = spiffe.ProtectionSoftware }, ErrEnrollmentBadSignature},
 		{"fingerprint altered after signing", func(in *EnrollmentInput, _ *[]byte) { in.IssuerFingerprint = bytes.Repeat([]byte{9}, 32) }, ErrEnrollmentBadSignature},
+		{"first contact relabelled after signing", func(in *EnrollmentInput, _ *[]byte) { in.FirstContact = FirstContactPrompt }, ErrEnrollmentBadSignature},
+		{"bootstrap code attached after signing", func(in *EnrollmentInput, _ *[]byte) {
+			in.BootstrapCodeHash = BootstrapCodeHash(in.Challenge, "STOLEN")
+		}, ErrEnrollmentBadSignature},
 		{"key swapped to another device's", func(in *EnrollmentInput, _ *[]byte) { in.DevicePublicKey = spki(t, &otherKey.priv.PublicKey) }, ErrEnrollmentBadSignature},
 		{"signature from another key", func(_ *EnrollmentInput, s *[]byte) {
 			b, _ := in.Bytes()
