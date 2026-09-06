@@ -4,11 +4,15 @@ package platform
 
 import (
 	"context"
+	"fmt"
+	"path/filepath"
 
 	"github.com/infamousjoeg/totem/internal/spiffe"
 )
 
 // Linux selection order: TPM 2.0 (hardware), then the 0600 file (software).
+// A TPM record on disk with no usable TPM is ErrHardwareKeyStranded, not a
+// fallback.
 //
 // There is no keyring level on Linux in this build, and it is reported that
 // way rather than papered over: the kernel keyring does not survive a reboot,
@@ -17,8 +21,12 @@ import (
 // go.mod. Adding one would slot in between the two candidates below.
 func init() {
 	Open = func(ctx context.Context) (KeyStore, error) {
-		if s, err := NewTPMStore(""); err == nil {
+		s, tpmErr := NewTPMStore("")
+		if tpmErr == nil {
 			return s, nil
+		}
+		if base, err := stateDir(); err == nil && hasRecords(filepath.Join(base, "tpm")) {
+			return nil, fmt.Errorf("%w: %v", ErrHardwareKeyStranded, tpmErr)
 		}
 		return NewFileStore("")
 	}

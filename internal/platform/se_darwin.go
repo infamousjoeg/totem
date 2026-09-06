@@ -36,12 +36,28 @@ static void *totem_copy_bytes(NSData *d, size_t *len) {
 	return out;
 }
 
-// The Secure Enclave token identifier for its keys. This is the value
-// SecKeyCopyAttributes returns under kSecAttrTokenOID for a Secure Enclave
-// key: the SEP-wrapped key blob, which is what CryptoKit exposes as
-// dataRepresentation. It only loads on the Secure Enclave that produced it.
-// kSecAttrTokenOID is not declared in the public SDK headers, so its string
-// value is used directly; see the package report for the trade-off.
+// PRIVATE ATTRIBUTE DEPENDENCY. totemTokenOID is the string value of
+// kSecAttrTokenOID, which is not declared in the public macOS SDK headers.
+// SecKeyCopyAttributes returns it for a Secure Enclave key: it is the
+// SEP-wrapped key blob (the same bytes CryptoKit exposes as
+// dataRepresentation), and passing it back in the attribute dictionary of
+// SecKeyCreateWithData is what makes the re-imported key THE SAME key rather
+// than a fresh one. Without this attribute, SecKeyCreateWithData on the SE
+// token silently yields a new random key (observed: different public key on
+// every call), which is why the Go tests assert a re-imported signature
+// verifies against the ORIGINAL public key.
+//
+// Why not the documented path: keeping SE keys in the data-protection
+// keychain requires the keychain-access-groups entitlement, i.e. a Developer
+// ID signed binary. Every build from source (contributors, `go install`,
+// Homebrew) would then silently lose the hardware level. That trade was
+// rejected by the lead; see the platform report.
+//
+// What breaks if Apple changes it: re-import of stored blobs fails. Load
+// returns a loud error naming re-enrollment (never a silent regenerate, never
+// a silent drop to keyring or file), and `totem doctor` exercises this path
+// via Check so an OS update is caught by a doctor run, not by a failed
+// exchange. The blob itself stays SEP-wrapped and non-exportable either way.
 static NSString *const totemTokenOID = @"toid";
 
 // totem_se_create makes a Secure Enclave P-256 key. With presence != 0 the
@@ -112,7 +128,11 @@ static int totem_se_public(const void *blob, size_t bloblen, void **pub, size_t 
 	NSData *pubData = pk ? CFBridgingRelease(SecKeyCopyExternalRepresentation(pk, &err)) : nil;
 	if (pk) CFRelease(pk);
 	CFRelease(key);
-	if (!pubData) { totem_fill_err(e, err); if (err) CFRelease(err); return 0; }
+	if (!pubData) {
+		totem_fill_err(e, err); if (err) CFRelease(err);
+		if (!e->code) { e->code = -1; strncpy(e->desc, "Secure Enclave returned no public key for this blob", sizeof(e->desc) - 1); }
+		return 0;
+	}
 	*pub = totem_copy_bytes(pubData, publen);
 	return 1;
 }
@@ -179,6 +199,7 @@ import (
 	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -456,7 +477,11 @@ func (s *SecureEnclaveStore) Generate(ctx context.Context, label string) (Key, e
 // Load returns the key under label or ErrKeyNotFound. The record file is
 // checked for ownership and permissions, and each blob is re-imported into the
 // Secure Enclave to recover its public key, which also proves the blob still
-// belongs to this SEP.
+// belongs to this SEP. The device key is then made to sign a nonce that is
+// verified against its public, because the SEP authenticates the wrapped
+// private half only when signing. Any failure is ErrKeyUnloadable: loud, no
+// regeneration, no fallback, re-enroll. The presence key cannot be test-signed
+// silently, so a damaged presence blob surfaces at the next prompt instead.
 func (s *SecureEnclaveStore) Load(ctx context.Context, label string) (Key, error) {
 	if err := validateLabel(label); err != nil {
 		return nil, err
@@ -478,13 +503,28 @@ func (s *SecureEnclaveStore) Load(ctx context.Context, label string) (Key, error
 	}
 	pub, err := sePublic(rec.Device)
 	if err != nil {
-		return nil, fmt.Errorf("loading device key: %w", err)
+		return nil, fmt.Errorf("%w: device key: %v", ErrKeyUnloadable, err)
 	}
 	k := &seKey{rec: rec, pub: pub}
 	if len(rec.Presence) > 0 {
 		if k.presPub, err = sePublic(rec.Presence); err != nil {
-			return nil, fmt.Errorf("loading presence key: %w", err)
+			return nil, fmt.Errorf("%w: presence key: %v", ErrKeyUnloadable, err)
 		}
+	}
+	// Re-import only checks the blob's structure and public point; the SEP
+	// authenticates the wrapped private half when it signs. One silent
+	// signature here, verified against the public we just recovered, is what
+	// makes "loaded" mean "this exact enrolled key is usable".
+	nonce := make([]byte, 32)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	sig, err := seSign(ctx, rec.Device, "verify the device identity", false, sha256sum(nonce))
+	if err != nil {
+		return nil, fmt.Errorf("%w: device key refused a test signature: %v", ErrKeyUnloadable, err)
+	}
+	if !VerifyChallenge(pub, nonce, sig) {
+		return nil, fmt.Errorf("%w: device key signature does not match its stored public key", ErrKeyUnloadable)
 	}
 	return k, nil
 }
@@ -582,6 +622,11 @@ func presenceReason(p Prompt) string {
 		r += fmt.Sprintf(" (request code %s)", p.RequestCode)
 	}
 	return r
+}
+
+func sha256sum(b []byte) []byte {
+	d := sha256.Sum256(b)
+	return d[:]
 }
 
 // seSign runs one Secure Enclave signature under a fresh LAContext. If ctx

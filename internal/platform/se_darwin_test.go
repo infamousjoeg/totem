@@ -6,8 +6,10 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -244,5 +246,48 @@ func TestPresenceReasonNamesEverything(t *testing.T) {
 	}
 	if strings.Contains(presenceReason(Prompt{Tool: "gh", Target: "github.com", DeviceID: "d"}), "request code") {
 		t.Fatal("windowed target must not show a request code")
+	}
+}
+
+// A record the Secure Enclave will not re-import must be ErrKeyUnloadable, not
+// ErrKeyNotFound (which a caller would read as "re-enroll me at any level").
+func TestSecureEnclaveCorruptBlobIsUnloadable(t *testing.T) {
+	ctx := context.Background()
+	s := newTestSEStore(t)
+	if _, err := s.Generate(ctx, DeviceKeyLabel); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(s.path(DeviceKeyLabel))
+	var rec seRecord
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		t.Fatal(err)
+	}
+	rec.Device[len(rec.Device)/2] ^= 0xff
+	broken, _ := json.Marshal(rec)
+	if err := os.WriteFile(s.path(DeviceKeyLabel), broken, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.Load(ctx, DeviceKeyLabel)
+	if !errors.Is(err, ErrKeyUnloadable) {
+		t.Fatalf("Load of corrupted blob = %v, want ErrKeyUnloadable", err)
+	}
+	t.Logf("loud failure: %v", err)
+}
+
+// A stranded hardware record must stop Open, not degrade it.
+func TestOpenRefusesFallbackWhenSERecordStranded(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("TOTEM_HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, "se"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "se", DeviceKeyLabel+".se"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if seUnavailableReason() == "" {
+		t.Skip("Secure Enclave is available here, so the stranded path cannot be reached; would have asserted Open returns ErrHardwareKeyStranded when an .se record exists and the SEP is unavailable")
+	}
+	if _, err := Open(context.Background()); !errors.Is(err, ErrHardwareKeyStranded) {
+		t.Fatalf("Open = %v, want ErrHardwareKeyStranded", err)
 	}
 }

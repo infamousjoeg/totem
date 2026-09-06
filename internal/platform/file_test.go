@@ -262,3 +262,31 @@ func TestOpenNeverRefuses(t *testing.T) {
 		t.Fatalf("software-level Sign(Required) = %v, want ErrPresenceUnavailable", err)
 	}
 }
+
+// Check is the doctor path: load, silent sign, verify. It must work at every
+// level that Open selects and never create a key.
+func TestCheck(t *testing.T) {
+	t.Setenv("TOTEM_HOME", t.TempDir())
+	ctx := context.Background()
+	label := "totem-test-check-" + randomSuffix(t)
+	if _, err := Check(ctx, label); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("Check on unenrolled label = %v, want ErrKeyNotFound", err)
+	}
+	store, err := Open(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, err := store.Generate(ctx, label)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Delete(ctx, label) })
+	k2, err := Check(ctx, label)
+	if err != nil {
+		t.Fatalf("Check = %v", err)
+	}
+	if !k.Public().(*ecdsa.PublicKey).Equal(k2.Public()) {
+		t.Fatal("Check loaded a different key")
+	}
+	t.Logf("Check passed at level %s", k2.ProtectionLevel())
+}

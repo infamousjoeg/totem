@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -50,6 +51,63 @@ var ErrBadKeyFile = errors.New("platform: refusing key file with unsafe ownershi
 // control character. Labels name files and keychain items, so they are
 // restricted to a conservative character set.
 var ErrInvalidLabel = errors.New("platform: invalid key label")
+
+// ErrKeyUnloadable means a stored hardware key record exists but the hardware
+// refused to re-import it (for example after an OS change to the wrapped-blob
+// format). The device must re-enroll. This is deliberately not ErrKeyNotFound:
+// a caller that treated it as "not enrolled" would silently re-enroll at
+// whatever level Open offers next, which is the degradation this package
+// exists to prevent.
+var ErrKeyUnloadable = errors.New("platform: stored hardware key cannot be re-imported; the device must re-enroll")
+
+// ErrHardwareKeyStranded means a hardware key record exists on disk but the
+// hardware store is unavailable in this process, so Open refused to hand back
+// a weaker store. Fix the hardware condition or explicitly revoke and re-enroll.
+var ErrHardwareKeyStranded = errors.New("platform: hardware device key exists but its store is unavailable; refusing to fall back to a weaker level")
+
+// Check is what `totem doctor` runs against an enrolled device: it opens the
+// selected store, loads label (on the Secure Enclave and TPM that is a real
+// re-import of the stored blob into the hardware), produces a silent
+// signature, and verifies it against Public. Any failure is returned as-is so
+// a breaking OS update is caught by a doctor run rather than by the next
+// exchange. It creates nothing.
+func Check(ctx context.Context, label string) (Key, error) {
+	store, err := Open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	k, err := store.Load(ctx, label)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, 32)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	sig, err := k.Sign(ctx, nonce, Prompt{Required: false, Tool: "totem", Target: "doctor", DeviceID: label})
+	if err != nil {
+		return nil, fmt.Errorf("platform: doctor signature: %w", err)
+	}
+	if !VerifyChallenge(k.Public(), nonce, sig) {
+		return nil, errors.New("platform: doctor signature did not verify against the enrolled public key")
+	}
+	return k, nil
+}
+
+// hasRecords reports whether dir holds any key record; Open uses it to refuse
+// a silent fallback when a hardware record is stranded.
+func hasRecords(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if e.Type().IsRegular() {
+			return true
+		}
+	}
+	return false
+}
 
 // validateLabel enforces the character set a label may use. Labels become file
 // names and keychain accounts, so anything that could traverse or confuse is
