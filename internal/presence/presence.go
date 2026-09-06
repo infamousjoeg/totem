@@ -1,10 +1,31 @@
-// Package presence holds the presence assertion, the three presence states, and
-// the grant and window types that gate an identity becoming a credential.
-// Scaffold only: types and doc comments, no signing, verification, or session
-// logic.
+// Package presence holds the presence assertion, the three presence states, the
+// per-target presence levels and issuer-side sessions, and the grant model
+// (grants, sub-grants, lineage, money ceilings, parked requests) that gate an
+// identity becoming a credential.
+//
+// The one rule, restated for this package: only a present human turns an
+// identity into a credential. Everything here is on the issuer side of that
+// rule. The laptop's only contribution is a one-shot signature (see Sign); the
+// issuer mints the challenge, verifies the signature, records the session,
+// holds the grants, and parks what falls outside them.
+//
+// Files in this package:
+//
+//   - presence.go: the three states, the three levels, and shipped windows.
+//   - encoding.go: the canonical bytes that get signed, and request hashing.
+//   - sign.go: the laptop side, calling through platform.Key.
+//   - verify.go: the issuer side, with one typed error per rejection.
+//   - session.go: in-memory, never-persisted presence sessions.
+//   - grant.go: grants, sub-grants, lineage, monotonic narrowing, money.
+//   - parked.go: out-of-grant requests parked for a present human.
+//
+// Standard library only.
 package presence
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // State is one of the three presence states, and the credential always says
 // which. A longer window is never one of the options.
@@ -21,62 +42,107 @@ const (
 	StateNone State = "none"
 )
 
-// Assertion is a one-shot presence assertion: a signature over an issuer
-// challenge from a biometric-gated key on the device, bound to the device, the
-// tool, and, for sensitive targets, the specific request. Presence state lives
-// on the issuer as a short session; the laptop never holds anything replayable.
-type Assertion struct {
-	// DeviceID is the enrolled device the assertion is bound to.
-	DeviceID string
-	// Tool is the tool the assertion authorizes.
-	Tool string
-	// Challenge is the issuer-minted value that was signed.
-	Challenge []byte
-	// Signature is over the issuer challenge from the biometric-gated key.
-	Signature []byte
-	// RequestHash binds the assertion to a specific request for presence:always
-	// targets, where the assertion cannot be reused.
-	RequestHash []byte
-}
+// Level is one of the three presence levels per target, named in the policy
+// file: window (ride-along risk within the window, stated), always (per
+// request, assertion bound to a hash of the request), step-up (park and
+// approve from another enrolled device). These three names are exactly what
+// the user-editable policy file accepts; there is no fourth.
+//
+// A windowed target that needs a fresh touch for one particular request (a
+// second request seconds after an approval, a prompt flood, money above the
+// step-up threshold) is not a level. It is a per-request escalation to always
+// semantics: see SessionStore.Evaluate's escalate parameter.
+type Level string
+
+const (
+	// LevelWindow: presence is checked once and then held for a bounded time.
+	// Within the window, everything that tool does is authorized, including by
+	// an attacker; that is the stated ride-along risk.
+	LevelWindow Level = "window"
+	// LevelAlways: per request. The assertion is bound to a hash of the
+	// request so it cannot be reused, and no session is ever opened.
+	LevelAlways Level = "always"
+	// LevelStepUp: park and approve from another enrolled device. No touch on
+	// the requesting device satisfies it and no session is ever opened; the
+	// request goes into a Lot and a present human approves it there, bound to
+	// its request hash.
+	LevelStepUp Level = "step-up"
+)
+
+// MaxWindow is the longest window any target may hold: the shipped claude
+// default of one hour. "A longer window is never one of the options" and
+// "no global switch": the session store refuses to open anything longer, so no
+// policy file, flag, or caller can extend it.
+const MaxWindow = time.Hour
 
 // Window is a shipped presence policy for a tool or profile: presence is
 // checked once and then held for a bounded time. Windows are issuer-side
 // sessions, evaluated on the issuer, never persisted; a restart means every
 // tool prompts once. There is no global switch and never a longer window.
 type Window struct {
-	// Tool or profile the window applies to.
+	// Tool or profile the window applies to, e.g. "claude" or "aws:prod".
 	Tool string
-	// Duration the presence session is honored for after a touch.
+	// Group names the session this window draws from. Windows with the same
+	// Group share one touch (gh and git share fifteen minutes). Empty means
+	// the window is its own group.
+	Group string
+	// Duration the presence session is honored for after a touch. Must be
+	// positive and at most MaxWindow.
 	Duration time.Duration
-	// Always, when set, binds the assertion to a hash of the request so it
-	// cannot be reused; init defaults this on for any profile whose role name
-	// contains admin or prod.
-	Always bool
+	// Level is the presence level for the target. LevelAlways binds the
+	// assertion to a hash of the request so it cannot be reused; init
+	// defaults it on for any profile whose role name contains admin or prod.
+	Level Level
 }
 
-// Grant is the presence-signed artifact that lets a long-running agent operate
-// without a prompt: which agent, which aws profiles, which GitHub repos and
-// scopes, whether Claude via the proxy and under what spend cap, until when.
-// The grant lives on the issuer; a hijacked agent gets exactly the grant and
-// nothing else, and the human has a dated record of what was authorized.
-type Grant struct {
-	// ID is referenced by every credential issued under this grant.
-	ID string
-	// Agent is the agent SPIFFE name the grant is scoped to.
-	Agent string
-	// AWSProfiles the agent may use inside the grant.
-	AWSProfiles []string
-	// GitHubScopes (repos and scopes) the agent may use inside the grant.
-	GitHubScopes []string
-	// ClaudeProxy allows Claude via the proxy under SpendCapUSD when true.
-	ClaudeProxy bool
-	// SpendCapUSD is the per-identity spend cap that is the runaway-agent fuse.
-	SpendCapUSD float64
-	// Until is the grant expiry; 30-day default, renewal requires presence, a
-	// notification goes out three days before, and if it lapses the agent keeps
-	// running but its credentials stop. Revocation is instant.
-	Until time.Time
-	// SignedAt is the human's signing time, recorded on every delegated
-	// credential alongside ID so provenance is legible.
-	SignedAt time.Time
+// SessionKey is the key a touch on this window is recorded under: the Group if
+// set, otherwise the Tool.
+func (w Window) SessionKey() string {
+	if w.Group != "" {
+		return w.Group
+	}
+	return w.Tool
+}
+
+// Shipped window durations from "Presence windows".
+const (
+	// ClaudeWindow: presence at session start, one-hour window. Covers the
+	// bearer refresh and anything aws or gh do inside Claude Code's bash tool.
+	ClaudeWindow = time.Hour
+	// AWSWindow: fifteen minutes per named profile, which is also the aws
+	// SVID lifetime.
+	AWSWindow = 15 * time.Minute
+	// GitWindow: gh and git, fifteen minutes, shared.
+	GitWindow = 15 * time.Minute
+	// GitGroup is the shared session group gh and git draw from.
+	GitGroup = "git"
+)
+
+// DefaultWindows returns the shipped defaults for the local policy file:
+// claude one hour; gh and git fifteen minutes on one shared session. AWS
+// profiles are added per profile at init with AWSProfileWindow.
+func DefaultWindows() []Window {
+	return []Window{
+		{Tool: "claude", Duration: ClaudeWindow, Level: LevelWindow},
+		{Tool: "gh", Group: GitGroup, Duration: GitWindow, Level: LevelWindow},
+		{Tool: "git", Group: GitGroup, Duration: GitWindow, Level: LevelWindow},
+	}
+}
+
+// AWSProfileWindow is the window init writes for one named aws profile: a
+// fifteen-minute window, or LevelAlways when the profile's role name contains
+// admin or prod.
+func AWSProfileWindow(profile, roleName string) Window {
+	w := Window{Tool: "aws:" + profile, Duration: AWSWindow, Level: LevelWindow}
+	if RoleRequiresAlways(roleName) {
+		w.Level = LevelAlways
+	}
+	return w
+}
+
+// RoleRequiresAlways reports whether init defaults presence:always for a role:
+// any role name containing admin or prod, case-insensitive.
+func RoleRequiresAlways(roleName string) bool {
+	r := strings.ToLower(roleName)
+	return strings.Contains(r, "admin") || strings.Contains(r, "prod")
 }
