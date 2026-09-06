@@ -19,12 +19,16 @@ const (
 	// RenewalNotice is how far before expiry the renewal notification goes
 	// out: three days.
 	RenewalNotice = 3 * 24 * time.Hour
-	// MaxGrantDuration is the longest a human can sign a grant for: ninety
-	// days, three renewal cycles. The spec gives a thirty-day default and
-	// says renewal requires presence; a grant that never needs renewing would
-	// make that sentence meaningless, and the CLI rendering the grant should
-	// not be the only thing between a human and a fifty-year signature.
-	MaxGrantDuration = 90 * 24 * time.Hour
+	// MaxGrantDuration is the longest a human can sign a grant for: 47 days.
+	// The number is a deliberate ceiling chosen by the project owner, not
+	// derived from anything; do not read a rationale into it. A ceiling
+	// exists at all because the spec gives a thirty-day default with
+	// presence renewal but names no maximum, and without one the CLI
+	// rendering the grant is the only thing standing between a human and a
+	// signature that outlives the machine. It caps what a human can sign,
+	// not what a narrowing can produce: a sub-grant inherits its parent's
+	// expiry and can never exceed it, so this is the whole tree's ceiling.
+	MaxGrantDuration = 47 * 24 * time.Hour
 )
 
 // TrivialMoneyUSD is the hard floor for delegated money: outward money

@@ -132,6 +132,43 @@ func TestSponsor(t *testing.T) {
 	}
 }
 
+// The ceiling caps what a human can sign, not what a narrowing can produce,
+// and the default sits under it so ordinary grants are unaffected. Pinned
+// symbolically so the constant and this test cannot drift apart.
+func TestMaxGrantDurationInteraction(t *testing.T) {
+	if MaxGrantDuration != 47*24*time.Hour {
+		t.Fatalf("MaxGrantDuration = %s; 47 days was ratified by the project owner, change both together", MaxGrantDuration)
+	}
+	if DefaultGrantDuration >= MaxGrantDuration {
+		t.Fatalf("default %s is not under the ceiling %s", DefaultGrantDuration, MaxGrantDuration)
+	}
+	clk := newClock()
+	reg := NewRegistry(clk.Now)
+	// A grant signed at the ceiling, then narrowed: the child inherits the
+	// parent's expiry exactly and cannot be pushed past it.
+	g := NewGrant("cassidy", wideScope(), clk.Now())
+	g.Until = clk.At(MaxGrantDuration)
+	root, err := reg.Sponsor(g, verified("mac-studio", clk.Now(), g.Hash()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := reg.Open(root.ID, root.ID)
+	child, err := reg.Narrow(s.ID, Scope{}, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !child.Until.Equal(root.Until) {
+		t.Fatalf("child expiry %v, parent %v", child.Until, root.Until)
+	}
+	_, err = reg.Narrow(s.ID, Scope{}, root.Until.Add(time.Nanosecond))
+	mustErr(t, err, ErrExpiryWidens)
+	// The default grant is ordinary and unaffected.
+	d := NewGrant("cassidy", wideScope(), clk.Now())
+	if _, err := reg.Sponsor(d, verified("mac-studio", clk.Now(), d.Hash())); err != nil {
+		t.Fatalf("default-duration grant refused: %v", err)
+	}
+}
+
 func TestGrantExpiryAndRenewal(t *testing.T) {
 	clk, reg, root := sponsored(t)
 	if root.RenewalDue(clk.Now()) {
