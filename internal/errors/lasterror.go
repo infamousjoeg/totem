@@ -77,6 +77,45 @@ func SpendCapExceeded(retryAfterSeconds int, opts ...Option) LastError {
 	return New(ReasonSpendCapExceeded, append([]Option{WithRetryAfter(retryAfterSeconds)}, opts...)...)
 }
 
+// retryFloors names the minimum RetryAfter, in seconds, Write enforces for a
+// retryable record that reaches it with none set. This is the durability-
+// boundary half of the invariant: New is deliberately still generic
+// (deserialization and round-trip tests both construct a LastError plainly),
+// so New(ReasonSpendCapExceeded) with no options is a legitimate way to get a
+// zero-value RetryAfter into a live *LastError before it ever reaches Write.
+// SpendCapExceeded's own clamp catches that at construction for its one
+// reason; this map is the backstop that holds no matter which constructor was
+// used, and it also covers the two other retryable reasons — issuer_unreachable
+// and out_of_grant_parked — that nothing was guarding before this existed.
+//
+// Floors differ deliberately rather than sharing one constant, because the
+// retry shapes differ:
+//   - issuer_unreachable wants a short initial backoff before totem run's own
+//     exponential backoff takes over — this is the coffee-shop network blip,
+//     not a wait for a scheduled reset.
+//   - out_of_grant_parked is resumed on the agent's next heartbeat tick, not
+//     retried tightly, so its floor is heartbeat-cadence-sized rather than a
+//     short backoff.
+//   - spend_cap_exceeded resets at a known wall-clock time; SpendCapExceeded
+//     computes a real value in the common path, so genericRetryFloor (below)
+//     only guards a caller whose arithmetic underflowed.
+//
+// PLACEHOLDER values: none of these are measured yet against real totem run
+// backoff behavior or a real agent heartbeat interval. Tune the numbers here
+// when those exist; the enforcement point (Write) should not need to change.
+var retryFloors = map[Reason]int{
+	ReasonIssuerUnreachable: 5,
+	ReasonOutOfGrantParked:  300,
+	ReasonSpendCapExceeded:  minSpendCapRetryAfterSeconds,
+}
+
+// genericRetryFloor is used for any retryable reason with no entry in
+// retryFloors — most importantly, a reason added to the closed set in the
+// future without also adding a tuned floor here. It exists so that gap fails
+// safe (some backoff) rather than reintroducing the RetryAfter=0 invitation to
+// a tight loop that this whole mechanism is closing.
+const genericRetryFloor = 30
+
 // resolvePath expands a leading "~" against the current user's home directory,
 // resolved at runtime (never baked in), and returns the absolute path.
 func resolvePath(path string) (string, error) {
@@ -99,9 +138,28 @@ func resolvePath(path string) (string, error) {
 //
 // If e.Timestamp is zero it is stamped with the current time, so a caller can
 // never write a record a reader would treat as immediately stale.
+//
+// Write also enforces, for every retryable record regardless of which
+// constructor produced it, that RetryAfter is positive: if e.Retryable is true
+// and e.RetryAfter is <= 0, it is set from retryFloors (or genericRetryFloor
+// for a reason with no entry there) before the record is persisted. This is
+// deliberately not done in New — New is a generic constructor and silently
+// rewriting a caller's explicit field there would be its own surprise — but a
+// retryable record with no backoff hint must never actually reach disk,
+// because that is precisely the shape that invites a harness to spin a tight
+// loop against whatever it's retrying. Enforcing it here, at the point a
+// record becomes durable, closes every construction path at once rather than
+// trusting each one individually.
 func Write(e LastError) error {
 	if e.Timestamp.IsZero() {
 		e.Timestamp = time.Now().UTC()
+	}
+	if e.Retryable && e.RetryAfter <= 0 {
+		if floor, ok := retryFloors[e.Reason]; ok {
+			e.RetryAfter = floor
+		} else {
+			e.RetryAfter = genericRetryFloor
+		}
 	}
 
 	path, err := resolvePath(LastErrorPath)

@@ -38,7 +38,10 @@ type Reason string
 const (
 	// ReasonIssuerUnreachable: the issuer could not be reached. Retryable —
 	// short outages ride out on existing credential lifetimes per the spec's
-	// fail-closed rule, and totem run performs the backoff itself.
+	// fail-closed rule, and totem run performs the backoff itself. This is the
+	// coffee-shop network-blip case; Write backstops it with a floor
+	// (retryFloors) if a record reaches disk with no RetryAfter set, so a
+	// harness never gets a bare "retry" with nothing to back off by.
 	ReasonIssuerUnreachable Reason = "issuer_unreachable"
 
 	// ReasonPresenceDenied: a human was asked and declined, or the sixty-second
@@ -70,6 +73,8 @@ const (
 	// grant and was parked for step-up rather than refused. Retryable, by
 	// design: "Parking must never look like a terminal failure" — the agent
 	// polls ParkedID on a later heartbeat rather than treating this as failed.
+	// Write backstops this with a heartbeat-cadence-sized floor (retryFloors)
+	// if a record reaches disk with no RetryAfter set.
 	ReasonOutOfGrantParked Reason = "out_of_grant_parked"
 
 	// ReasonGrantExpired: the delegated grant lapsed. Terminal: the agent's

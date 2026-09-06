@@ -138,6 +138,108 @@ func TestNewStampsRetryableFromTable(t *testing.T) {
 	}
 }
 
+// TestWriteNeverPersistsARetryableRecordWithoutABackoffHint is the property
+// the durability boundary enforces, checked generically rather than as a
+// hand-enumerated case list so it keeps holding when a ninth reason is added
+// to the closed set: for every reason, built the plainest possible way (no
+// options at all) and written, the record that actually lands on disk must
+// never say "retryable" with RetryAfter <= 0 — because that shape is exactly
+// what invites a harness to spin a tight loop against whatever it's retrying,
+// whether the retryable reason is a network blip, a parked step-up, or a
+// spend cap.
+func TestWriteNeverPersistsARetryableRecordWithoutABackoffHint(t *testing.T) {
+	withHome(t)
+
+	for _, reason := range Reasons() {
+		reason := reason
+		t.Run(string(reason), func(t *testing.T) {
+			if err := Write(New(reason)); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			got, err := Read()
+			if err != nil {
+				t.Fatalf("Read: %v", err)
+			}
+			if got.Retryable && got.RetryAfter <= 0 {
+				t.Fatalf("reason %s is retryable but the record on disk has RetryAfter = %d; "+
+					"every retryable record Write persists must carry a positive backoff hint",
+					reason, got.RetryAfter)
+			}
+		})
+	}
+}
+
+// TestWriteAppliesTheDocumentedPerReasonFloor pins the specific floor values
+// in retryFloors (as literals, not by reading the map back) so an accidental
+// change to those numbers shows up as a failing test rather than silently
+// shipping a different backoff.
+func TestWriteAppliesTheDocumentedPerReasonFloor(t *testing.T) {
+	withHome(t)
+
+	cases := []struct {
+		reason Reason
+		want   int
+	}{
+		{ReasonIssuerUnreachable, 5},
+		{ReasonOutOfGrantParked, 300},
+		{ReasonSpendCapExceeded, 60},
+	}
+	for _, c := range cases {
+		t.Run(string(c.reason), func(t *testing.T) {
+			if err := Write(New(c.reason)); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			got, err := Read()
+			if err != nil {
+				t.Fatalf("Read: %v", err)
+			}
+			if got.RetryAfter != c.want {
+				t.Fatalf("RetryAfter = %d, want the documented floor %d", got.RetryAfter, c.want)
+			}
+		})
+	}
+}
+
+// TestWriteFallsBackToGenericFloorForAnUnmappedRetryableReason covers "reason
+// nine": a hypothetical future retryable reason with no tuned entry in
+// retryFloors must still get some positive backoff from Write, not zero. This
+// deliberately builds the LastError by hand rather than through New/a real
+// Reason constant, since retryFloors already covers every reason in the
+// current closed set.
+func TestWriteFallsBackToGenericFloorForAnUnmappedRetryableReason(t *testing.T) {
+	withHome(t)
+
+	unmapped := Reason("hypothetical_future_reason_not_yet_in_retryFloors")
+	if err := Write(LastError{Reason: unmapped, Retryable: true}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, err := Read()
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if got.RetryAfter != genericRetryFloor {
+		t.Fatalf("RetryAfter = %d, want genericRetryFloor %d", got.RetryAfter, genericRetryFloor)
+	}
+}
+
+// TestWriteDoesNotOverrideAnExplicitPositiveRetryAfter guards the other
+// direction: Write's floor must only kick in when RetryAfter is missing, never
+// silently override a caller's real, positive value.
+func TestWriteDoesNotOverrideAnExplicitPositiveRetryAfter(t *testing.T) {
+	withHome(t)
+
+	if err := Write(New(ReasonIssuerUnreachable, WithRetryAfter(9999))); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, err := Read()
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if got.RetryAfter != 9999 {
+		t.Fatalf("RetryAfter = %d, want the explicit 9999 untouched", got.RetryAfter)
+	}
+}
+
 // TestNewNeverPanicsEvenForSpendCapExceededWithoutRetryAfter pins the "New
 // never panics" guarantee for exactly the case that used to panic: this
 // package is the error-reporting path, and crashing here would destroy the
