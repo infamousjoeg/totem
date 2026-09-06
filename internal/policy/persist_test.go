@@ -102,7 +102,7 @@ func TestReloadRefusesTampering(t *testing.T) {
 
 	t.Run("edited payload breaks the chain", func(t *testing.T) {
 		w, _, _ := build(t)
-		seq := findSeq(w.st, "policy/approve", 2)
+		seq := findSeq(w.st, "policy.approve", 2)
 		w.st.tamper(seq, func(b []byte) []byte { return bytes.Replace(b, []byte(`"laptop"`), []byte(`"laptoq"`), 1) }, false)
 		_, err := w.reopen()
 		mustErr(t, err, store.ErrChainBroken)
@@ -110,7 +110,7 @@ func TestReloadRefusesTampering(t *testing.T) {
 
 	t.Run("rechained edit fails signature verification", func(t *testing.T) {
 		w, _, _ := build(t)
-		seq := findSeq(w.st, "policy/approve", 2)
+		seq := findSeq(w.st, "policy.approve", 2)
 		// Flip the approval's recorded subject: the signature was over the
 		// old digest.
 		w.st.tamper(seq, func(b []byte) []byte {
@@ -131,7 +131,7 @@ func TestReloadRefusesTampering(t *testing.T) {
 		payload, _ := devicePayloadFor(ActionGrantAdmin, laptop)
 		forged := signedRecord{Ordinal: 3, Action: ActionGrantAdmin, At: w.clk.Now(), Subject: laptop, Payload: payload, Signer: laptop, SignerPresence: presence.StatePresent}
 		body, _ := json.Marshal(forged)
-		_, err := w.st.Append(ctxb(), store.Record{Kind: "policy/grant-admin", At: w.clk.Now(), Payload: body})
+		_, err := w.st.Append(ctxb(), store.Record{Kind: "policy.grant-admin", At: w.clk.Now(), Payload: body})
 		mustErr(t, err, nil)
 		_, err = w.reopen()
 		mustErr(t, err, ErrRecordInvalid)
@@ -141,13 +141,13 @@ func TestReloadRefusesTampering(t *testing.T) {
 		w, founder, laptop := build(t)
 		// Take the founder's genuine approval assertion and staple it onto a
 		// grant-admin record: bindings (target, digest) do not match.
-		seq := findSeq(w.st, "policy/approve", 2)
+		seq := findSeq(w.st, "policy.approve", 2)
 		var approve signedRecord
 		json.Unmarshal(w.st.log[seq-1].Payload, &approve)
 		payload, _ := devicePayloadFor(ActionGrantAdmin, laptop)
 		forged := signedRecord{Ordinal: 3, Action: ActionGrantAdmin, At: w.clk.Now(), Subject: laptop, Payload: payload, Signer: founder, SignerPresence: presence.StatePresent, Assertion: approve.Assertion}
 		body, _ := json.Marshal(forged)
-		w.st.Append(ctxb(), store.Record{Kind: "policy/grant-admin", At: w.clk.Now(), Payload: body})
+		w.st.Append(ctxb(), store.Record{Kind: "policy.grant-admin", At: w.clk.Now(), Payload: body})
 		_, err := w.reopen()
 		mustErr(t, err, ErrRecordInvalid)
 	})
@@ -166,7 +166,7 @@ func TestReloadRefusesTampering(t *testing.T) {
 		a := presence.Assertion{Version: presence.EncodingVersion, DeviceID: deviceID, Tool: presence.EnrollmentTool, Target: testDomain, Challenge: in.Challenge, Signature: req.PresenceSignature, RequestHash: digest}
 		rec := signedRecord{Ordinal: 3, Action: ActionApprove, At: w.clk.Now(), Subject: "founding", Payload: payload, Signer: deviceID, SignerPresence: presence.StatePresent, Assertion: toJSON(&a)}
 		body, _ := json.Marshal(rec)
-		w.st.Append(ctxb(), store.Record{Kind: "policy/approve", At: w.clk.Now(), Payload: body})
+		w.st.Append(ctxb(), store.Record{Kind: "policy.approve", At: w.clk.Now(), Payload: body})
 		_, err := w.reopen()
 		if !errors.Is(err, ErrRecordInvalid) || !strings.Contains(err.Error(), "founding") {
 			t.Fatalf("rogue founding accepted: %v", err)
@@ -175,7 +175,7 @@ func TestReloadRefusesTampering(t *testing.T) {
 
 	t.Run("presence state cannot be relabelled", func(t *testing.T) {
 		w, _, _ := build(t)
-		seq := findSeq(w.st, "policy/approve", 2)
+		seq := findSeq(w.st, "policy.approve", 2)
 		w.st.tamper(seq, func(b []byte) []byte {
 			var rec signedRecord
 			json.Unmarshal(b, &rec)
@@ -189,9 +189,9 @@ func TestReloadRefusesTampering(t *testing.T) {
 
 	t.Run("kind and action must agree", func(t *testing.T) {
 		w, _, _ := build(t)
-		seq := findSeq(w.st, "policy/approve", 2)
+		seq := findSeq(w.st, "policy.approve", 2)
 		w.st.mu.Lock()
-		w.st.log[seq-1].Kind = "policy/grant-admin"
+		w.st.log[seq-1].Kind = "policy.grant-admin"
 		w.st.mu.Unlock()
 		w.st.tamper(seq, func(b []byte) []byte { return b }, true)
 		_, err := w.reopen()

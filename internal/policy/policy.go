@@ -325,7 +325,7 @@ type Decision struct {
 // "which device is enrolled / what presence a target needs" lives.
 type AuditRecord struct {
 	// Kind is the chain record kind: "exchange", "issuance",
-	// "self-issuance", or "policy/<action>".
+	// "self-issuance", or "policy.<action>".
 	Kind string
 	// At is the record time.
 	At time.Time

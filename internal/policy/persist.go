@@ -14,8 +14,8 @@ import (
 // load rebuilds admin-signed state by walking the hash chain. Every policy
 // record is re-verified before it is applied: the enrollment signatures
 // inside an approve record with presence.VerifyEnrollment and
-// verifyOffline, the signer's assertion with verifyOffline against the key
-// the signer's OWN earlier enrollment record holds, and the signer's
+// presence.VerifyDetached, the signer's assertion with VerifyDetached
+// against the key the signer's OWN earlier enrollment record holds, and the signer's
 // authority (admin, or sponsor) as it stood at that ordinal. Records are
 // replayed in chain order so that authority is what it was, not what it
 // became. Store.Walk verifies each link as it goes; a break is
@@ -67,21 +67,25 @@ func (i *Issuer) verifyStored(rec *signedRecord, digest []byte) (*EnrollmentReco
 		DeviceID: signer.DeviceID, Tool: SigningTool, Target: Target(rec.Action, rec.Subject),
 		Binding: presence.BindingRequired, RequestHash: digest,
 	}
-	key := presenceKey
 	switch rec.SignerPresence {
 	case presence.StatePresent:
 		if presenceKey == nil {
 			return nil, errors.New("recorded as present but the signer has no presence key")
 		}
+		exp.PresenceKey = presenceKey
 	case presence.StateNone:
 		if presenceKey != nil {
 			return nil, errors.New("recorded as none but the signer has a presence key")
 		}
-		key = deviceKey
+		// The recorded none-level signing: the device key stands in for
+		// the presence key, exactly as it did when the record was applied.
+		exp.PresenceKey = deviceKey
 	default:
 		return nil, fmt.Errorf("signer presence %q", rec.SignerPresence)
 	}
-	if err := verifyOffline(rec.Assertion.assertion(), key, exp); err != nil {
+	// Detached: the challenge was minted and spent in a previous process.
+	// The Verified comes back consumed; only its verdict is used.
+	if _, err := presence.VerifyDetached(rec.Assertion.assertion(), exp, rec.At); err != nil {
 		return nil, err
 	}
 	return signer, nil
@@ -216,7 +220,7 @@ func (i *Issuer) storedDigest(rec *signedRecord) ([]byte, error) {
 	case ActionStepUp:
 		// The request hash lived in the lot; it is in the assertion, and the
 		// signature is what proves the human bound it. Verify against the
-		// assertion's own hash, which verifyOffline then checks the
+		// assertion's own hash, which VerifyDetached then checks the
 		// signature over.
 		if len(p.IDs) != 1 || p.IDs[0] != rec.Subject {
 			return nil, errors.New("step-up payload does not match subject")
@@ -266,10 +270,10 @@ func (i *Issuer) replayApprove(rec *signedRecord) error {
 			Version: presence.EncodingVersion, DeviceID: deviceID, Tool: presence.EnrollmentTool,
 			Target: i.cfg.TrustDomain, Challenge: in.Challenge, Signature: p.PresenceSignature, RequestHash: digest,
 		}
-		if err := verifyOffline(a, presenceKey, presence.Expectation{
-			DeviceID: deviceID, Tool: presence.EnrollmentTool, Target: i.cfg.TrustDomain,
+		if _, err := presence.VerifyDetached(a, presence.Expectation{
+			PresenceKey: presenceKey, DeviceID: deviceID, Tool: presence.EnrollmentTool, Target: i.cfg.TrustDomain,
 			Binding: presence.BindingRequired, RequestHash: digest,
-		}); err != nil {
+		}, rec.At); err != nil {
 			return fmt.Errorf("device presence assertion: %w", err)
 		}
 		enrolled.State = presence.StatePresent

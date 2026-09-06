@@ -75,7 +75,7 @@ func TestFoundingEnrollment(t *testing.T) {
 	mustErr(t, err, ErrBootstrapInvalid)
 	// The chain has the founding record.
 	kinds := w.st.kinds()
-	if kinds[len(kinds)-1] != "policy/approve" {
+	if kinds[len(kinds)-1] != "policy.approve" {
 		t.Fatalf("chain kinds %v", kinds)
 	}
 }
@@ -298,7 +298,7 @@ func TestPresencePolicySigned(t *testing.T) {
 		t.Fatal("dropped tool still has a window")
 	}
 	kinds := w.st.kinds()
-	if kinds[len(kinds)-1] != "policy/presence-policy" {
+	if kinds[len(kinds)-1] != "policy.presence-policy" {
 		t.Fatalf("chain %v", kinds)
 	}
 }
@@ -320,10 +320,18 @@ func TestVerifierSpendsBeforeKeyCheck(t *testing.T) {
 	mustErr(t, err, presence.ErrNoPresenceKey)
 	_, err = ver.Verify(a, exp)
 	mustErr(t, err, presence.ErrChallengeReplayed)
-	// And the offline half accepts the device-key signature over exactly
-	// those bytes, and nothing shifted.
-	mustErr(t, verifyOffline(a, &key.device.PublicKey, exp), nil)
-	mustErr(t, verifyOffline(a, &newFakeKey(t, false).device.PublicKey, exp), presence.ErrBadSignature)
+	// And the detached half accepts the device-key signature over exactly
+	// those bytes when the device key is passed as the presence key, and
+	// refuses another device's key.
+	exp.PresenceKey = &key.device.PublicKey
+	v, err := presence.VerifyDetached(a, exp, clk.Now())
+	mustErr(t, err, nil)
+	if !v.Used() {
+		t.Fatal("detached proof came back consumable")
+	}
+	exp.PresenceKey = &newFakeKey(t, false).device.PublicKey
+	_, err = presence.VerifyDetached(a, exp, clk.Now())
+	mustErr(t, err, presence.ErrBadSignature)
 }
 
 func TestConfigRefusesMissingPrimitives(t *testing.T) {

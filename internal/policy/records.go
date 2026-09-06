@@ -5,7 +5,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
@@ -34,13 +33,16 @@ const (
 	MaxObservations = 100_000
 )
 
-// Store collections and chain kinds.
+// Store collections and chain kinds. Kinds are dot-separated, never slash:
+// the store's name charset forbids path separators because a kind becomes a
+// tar entry name in a backup, and internal/ca already chains "svid.issued",
+// so one chain has one convention.
 const (
 	collectionBootstrap = "bootstrap"
 	bootstrapID         = "code"
-	kindPolicyPrefix    = "policy/"
-	kindGrantNarrow     = "grant/narrow"
-	kindSession         = "grant/session"
+	kindPolicyPrefix    = "policy."
+	kindGrantNarrow     = "grant.narrow"
+	kindSession         = "grant.session"
 	kindExchange        = "exchange"
 	kindParked          = "parked"
 )
@@ -408,69 +410,21 @@ func (i *Issuer) verifySignature(sig Signature, action Action, subject string, d
 		if requirePresence {
 			return nil, "", nil, fmt.Errorf("%w: %s has no presence key", ErrPresenceRequired, e.DeviceID)
 		}
-		if err := verifyOffline(sig.Assertion, deviceKey, exp); err != nil {
+		// The presence:none admin path. Verify has spent the challenge and
+		// found no presence half to check against. This device enrolled
+		// with no presence key, so its DEVICE key is passed as the presence
+		// key, here and nowhere else in the codebase: the one legitimate
+		// device-key-for-presence-key substitution, recorded as approved
+		// without presence. The Verified comes back already consumed, so
+		// it can authorize nothing on its own.
+		exp.PresenceKey = deviceKey
+		if _, err := presence.VerifyDetached(sig.Assertion, exp, i.now()); err != nil {
 			return nil, "", nil, err
 		}
 		return &e, presence.StateNone, nil, nil
 	default:
 		return nil, "", nil, err
 	}
-}
-
-// verifyOffline is the signature-and-bindings half of a presence verify,
-// without a challenge: it is what the none-level signing path uses after the
-// challenge has been spent, and what load uses to re-verify stored records
-// whose challenges are long gone. It rebuilds the canonical bytes with
-// presence.SigningInput (never trusting caller bytes) and compares every
-// binding the real verifier compares. TestOfflineAgreesWithVerifier holds it
-// to the real verifier's answers over generated inputs.
-func verifyOffline(a *presence.Assertion, key *ecdsa.PublicKey, exp presence.Expectation) error {
-	if a == nil || key == nil {
-		return presence.ErrBadSignature
-	}
-	if a.Version != presence.EncodingVersion {
-		return fmt.Errorf("%w: %d", presence.ErrUnsupportedVersion, a.Version)
-	}
-	in := presence.SigningInput{
-		Version: a.Version, DeviceID: a.DeviceID, Tool: a.Tool, Target: a.Target,
-		Challenge: a.Challenge, RequestHash: a.RequestHash,
-	}
-	digest, err := in.Digest()
-	if err != nil {
-		return err
-	}
-	switch {
-	case len(a.Signature) == 0:
-		return fmt.Errorf("%w: empty signature", presence.ErrMalformed)
-	case a.DeviceID != exp.DeviceID:
-		return presence.ErrDeviceMismatch
-	case a.Tool != exp.Tool:
-		return presence.ErrToolMismatch
-	case a.Target != exp.Target:
-		return presence.ErrTargetMismatch
-	}
-	switch exp.Binding {
-	case presence.BindingNone:
-		if len(a.RequestHash) != 0 {
-			return presence.ErrRequestHashUnexpected
-		}
-	case presence.BindingRequired:
-		if len(exp.RequestHash) != presence.RequestHashSize {
-			return fmt.Errorf("%w: binding required with no request hash", presence.ErrExpectation)
-		}
-		if len(a.RequestHash) == 0 {
-			return presence.ErrRequestHashRequired
-		}
-		if subtle.ConstantTimeCompare(a.RequestHash, exp.RequestHash) != 1 {
-			return presence.ErrRequestHashMismatch
-		}
-	default:
-		return fmt.Errorf("%w: unknown binding %d", presence.ErrExpectation, exp.Binding)
-	}
-	if !ecdsa.VerifyASN1(key, digest, a.Signature) {
-		return presence.ErrBadSignature
-	}
-	return nil
 }
 
 // challenge mints a signing challenge for a live enrolled device.

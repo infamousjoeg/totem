@@ -583,3 +583,82 @@ func TestSignSignsCanonicalBytes(t *testing.T) {
 		t.Fatal("key was handed the bare nonce")
 	}
 }
+
+// VerifyDetached is Verify without the challenge: same bindings and
+// signature rules, no mint/spend/expiry, and the proof it returns cannot
+// authorize anything.
+func TestVerifyDetached(t *testing.T) {
+	f := newFixture(t, true)
+	a := f.sign(t)
+	// Spend the challenge on the live path; the detached path still verifies
+	// the same assertion because it never looks at the challenge set.
+	if _, err := f.ver.Verify(a, f.exp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.ver.Verify(a, f.exp); !errors.Is(err, ErrChallengeReplayed) {
+		t.Fatalf("setup: %v", err)
+	}
+	v, err := VerifyDetached(a, f.exp, f.clk.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !v.Valid() || !v.Used() {
+		t.Fatalf("detached proof must be valid and already consumed: valid=%v used=%v", v.Valid(), v.Used())
+	}
+	mustErr(t, v.consume(), ErrPresenceConsumed)
+	// It cannot authorize anything: every consumer refuses it.
+	st := NewSessionStore(f.clk.Now)
+	w := Window{Tool: "aws", Target: "prod-admin", Duration: AWSWindow, Level: LevelWindow}
+	if _, err := st.Touch("mac-studio", w, v); !errors.Is(err, ErrBoundAssertionCannotOpenWindow) && !errors.Is(err, ErrPresenceConsumed) {
+		t.Fatalf("detached proof reached a window: %v", err)
+	}
+	lot := NewLot(f.clk.Now, 0, 0)
+	id, _ := lot.Park("agent", "g", Irreversible, "x", f.in.RequestHash)
+	mustErr(t, lot.Approve(id, v), ErrPresenceConsumed)
+	// An unbound detached proof is refused by Touch on consumption too.
+	g := newFixture(t, false)
+	b := g.sign(t)
+	uv, err := VerifyDetached(b, g.exp, g.clk.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = st.Touch("mac-studio", w, uv)
+	mustErr(t, err, ErrPresenceConsumed)
+
+	// Unminted, expired, and replayed challenges are invisible to it; every
+	// other rejection is identical to Verify's.
+	h := newFixture(t, false)
+	h.in.Challenge = bytes.Repeat([]byte{7}, ChallengeSize)
+	c := h.sign(t)
+	h.clk.Advance(48 * time.Hour)
+	if _, err := VerifyDetached(c, h.exp, h.clk.Now()); err != nil {
+		t.Fatalf("detached must ignore the challenge set: %v", err)
+	}
+	wrongKey := h.exp
+	wrongKey.PresenceKey = newFakeKey(t).PresencePublic()
+	_, err = VerifyDetached(c, wrongKey, h.clk.Now())
+	mustErr(t, err, ErrBadSignature)
+	wrongTool := h.exp
+	wrongTool.Tool = "gh"
+	_, err = VerifyDetached(c, wrongTool, h.clk.Now())
+	mustErr(t, err, ErrToolMismatch)
+	nilKey := h.exp
+	nilKey.PresenceKey = nil
+	_, err = VerifyDetached(c, nilKey, h.clk.Now())
+	mustErr(t, err, ErrNoPresenceKey)
+	_, err = VerifyDetached(nil, h.exp, h.clk.Now())
+	mustErr(t, err, ErrMalformed)
+	c.Version = 9
+	_, err = VerifyDetached(c, h.exp, h.clk.Now())
+	mustErr(t, err, ErrUnsupportedVersion)
+
+	// The none-admin case: a device-key signature verified deliberately
+	// against the device public key. Legitimate here and only here.
+	d := newFixture(t, false)
+	e := d.sign(t)
+	devKey := d.exp
+	devKey.PresenceKey = d.key.Public()
+	if _, err := VerifyDetached(e, devKey, d.clk.Now()); err != nil {
+		t.Fatalf("device-key detached verification: %v", err)
+	}
+}

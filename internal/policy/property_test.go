@@ -1,8 +1,6 @@
 package policy
 
 import (
-	"context"
-	"crypto/ecdsa"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -42,163 +40,6 @@ func seeded(t *testing.T, name string, defaultSeed uint64, defaultIters int) (*r
 	return rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15)), iters
 }
 
-// Property: verifyOffline gives the same answer as presence.Verifier.Verify
-// for every assertion and expectation, on everything except challenge
-// state, which the offline half deliberately does not have. The generator
-// draws devices, tools, targets, bindings and keys from small universes so
-// every mismatch class is hit, and signs with the real presence.Sign or the
-// device-key path.
-func TestOfflineAgreesWithVerifier(t *testing.T) {
-	rng, iters := seeded(t, "offline-agrees", 0x6f66666c696e6521, 600)
-	clk := newClock()
-	ver := presence.NewVerifier(0, clk.Now)
-	keys := []*fakeKey{newFakeKey(t, true), newFakeKey(t, true), newFakeKey(t, false)}
-	devices := []string{"a", "b"}
-	tools := []string{SigningTool, "claude"}
-	targets := []string{"", "approve X", "grant-admin Y"}
-	hashes := [][]byte{nil, reqHash("1"), reqHash("2")}
-	pick := func(n int) int { return rng.IntN(n) }
-
-	agreed, accepted := 0, 0
-	for i := range iters {
-		// An assertion the verifier refuses before the spend (malformed,
-		// wrong version) leaves its challenge outstanding; on a real issuer
-		// those expire on the TTL. Let the clock move so the generator
-		// never trips MaxOutstandingChallenges instead of a finding.
-		if i%32 == 31 {
-			clk.Advance(presence.DefaultChallengeTTL + time.Second)
-		}
-		signer := keys[pick(len(keys))]
-		dev, tool, target, h := devices[pick(2)], tools[pick(2)], targets[pick(3)], hashes[pick(3)]
-		ch, err := ver.Mint(dev)
-		if err != nil {
-			t.Fatal(err)
-		}
-		in := presence.SigningInput{DeviceID: dev, Tool: tool, Target: target, Challenge: ch, RequestHash: h}
-		var a *presence.Assertion
-		usePresence := signer.presence != nil && pick(4) != 0
-		if usePresence {
-			a, err = presence.Sign(context.Background(), signer, in)
-		} else {
-			a, err = SignWithoutPresence(context.Background(), signer, in)
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		// Sometimes corrupt the signature or a field after signing.
-		sigCorrupt := false
-		switch pick(8) {
-		case 0:
-			a.Signature[len(a.Signature)/2] ^= 0x40
-			sigCorrupt = true
-		case 1:
-			a.Target += " "
-		case 2:
-			a.Version = 2
-		}
-		// The expectation: which key, and which bindings. Half the time it
-		// is exactly what was signed, so acceptances are common enough to
-		// mean something; the rest of the time every field is independent.
-		expKey := keys[pick(len(keys))]
-		exp := presence.Expectation{
-			DeviceID: devices[pick(2)], Tool: tools[pick(2)], Target: targets[pick(3)],
-			Binding: presence.Binding(pick(2)), RequestHash: hashes[pick(3)],
-		}
-		if pick(2) == 0 {
-			expKey = signer
-			exp.DeviceID, exp.Tool, exp.Target, exp.RequestHash = dev, tool, target, h
-			exp.Binding = presence.BindingNone
-			if len(h) != 0 {
-				exp.Binding = presence.BindingRequired
-			}
-		}
-		// Verify against the presence half (nil for the none-level key)
-		// through the real verifier, and against the same key offline.
-		var ecKey = expKey.presence
-		if ecKey != nil {
-			exp.PresenceKey = &ecKey.PublicKey
-		}
-		_, verr := ver.Verify(a, exp)
-		if errors.Is(verr, presence.ErrUnknownChallenge) {
-			// Challenge state: the challenge was minted for a.DeviceID and
-			// the expectation names another device. The verifier refuses on
-			// the challenge; offline, with no challenge table, refuses on
-			// the device binding. Same outcome, different sentinel, and
-			// only when the device really differs.
-			if a.DeviceID == exp.DeviceID {
-				t.Fatalf("iter %d: unknown challenge for matching device", i)
-			}
-			oerr := verifyOffline(a, &expKey.device.PublicKey, exp)
-			if oerr == nil || (!errors.Is(oerr, presence.ErrDeviceMismatch) && !errors.Is(oerr, presence.ErrUnsupportedVersion)) {
-				t.Fatalf("iter %d: offline accepted a cross-device assertion: %v", i, oerr)
-			}
-			agreed++
-			continue
-		}
-		if errors.Is(verr, presence.ErrNoPresenceKey) {
-			// The verifier has no key to check; offline verifies against
-			// the device key, which is what the none path does. That is a
-			// different question, so compare against the device-key answer.
-			oerr := verifyOffline(a, &expKey.device.PublicKey, exp)
-			wantOK := !usePresence && !sigCorrupt && signer == expKey && fieldsMatch(a, exp) && a.Version == presence.EncodingVersion
-			if (oerr == nil) != wantOK {
-				t.Fatalf("iter %d: none path offline=%v want ok=%v", i, oerr, wantOK)
-			}
-			agreed++
-			continue
-		}
-		// A none-level expectation that was refused before the key check
-		// (malformed, version) is compared on the device key; every other
-		// case on the presence key the verifier used.
-		offlineKey := &expKey.device.PublicKey
-		if exp.PresenceKey != nil {
-			offlineKey = exp.PresenceKey.(*ecdsa.PublicKey)
-		}
-		oerr := verifyOffline(a, offlineKey, exp)
-		if (verr == nil) != (oerr == nil) {
-			t.Fatalf("iter %d: verifier=%v offline=%v", i, verr, oerr)
-		}
-		if verr != nil && !errors.Is(oerr, rootErr(verr)) {
-			t.Fatalf("iter %d: verifier=%v offline=%v (different rejection)", i, verr, oerr)
-		}
-		if verr == nil {
-			accepted++
-			if !(usePresence && signer == expKey && fieldsMatch(a, exp)) {
-				t.Fatalf("iter %d: accepted a mismatched assertion", i)
-			}
-		}
-		agreed++
-	}
-	if accepted < 20 {
-		t.Fatalf("under-exercised: %d acceptances", accepted)
-	}
-}
-
-// fieldsMatch is the binding rule, restated independently of both
-// implementations.
-func fieldsMatch(a *presence.Assertion, exp presence.Expectation) bool {
-	if a.DeviceID != exp.DeviceID || a.Tool != exp.Tool || a.Target != exp.Target {
-		return false
-	}
-	switch exp.Binding {
-	case presence.BindingNone:
-		return len(a.RequestHash) == 0
-	default:
-		return len(exp.RequestHash) != 0 && len(a.RequestHash) != 0 && string(a.RequestHash) == string(exp.RequestHash)
-	}
-}
-
-// rootErr strips the wrapping so errors.Is can compare sentinel to sentinel.
-func rootErr(err error) error {
-	for {
-		u := errors.Unwrap(err)
-		if u == nil {
-			return err
-		}
-		err = u
-	}
-}
-
 // Property: over a random sequence of admin operations from random signers,
 // an operation succeeds if and only if the signer is live and admin (for
 // admin actions) and the last-admin rule allows it; the number of live
@@ -218,7 +59,7 @@ func TestSigningAuthorityProperty(t *testing.T) {
 		policyRecords := func() int {
 			n := 0
 			for _, k := range w.st.kinds() {
-				if strings.HasPrefix(k, "policy/") && k != "policy/bootstrap-issued" {
+				if strings.HasPrefix(k, "policy.") && k != "policy.bootstrap-issued" {
 					n++
 				}
 			}

@@ -320,20 +320,10 @@ func (v *Verifier) Outstanding() int {
 // The window itself is evaluated on the issuer, not the laptop: a compromised
 // agent cannot extend its own window because it never decides freshness.
 func (v *Verifier) Verify(a *Assertion, exp Expectation) (*Verified, error) {
-	if a == nil {
-		return nil, fmt.Errorf("%w: nil assertion", ErrMalformed)
-	}
-	if a.Version != EncodingVersion {
-		return nil, fmt.Errorf("%w: %d", ErrUnsupportedVersion, a.Version)
-	}
-	in := a.signingInput()
-	if err := in.validate(); err != nil {
+	in, err := prepare(a)
+	if err != nil {
 		return nil, err
 	}
-	if len(a.Signature) == 0 {
-		return nil, fmt.Errorf("%w: empty signature", ErrMalformed)
-	}
-
 	now := v.now()
 	if err := v.spend(a.Challenge, exp.DeviceID, now); err != nil {
 		return nil, err
@@ -341,9 +331,63 @@ func (v *Verifier) Verify(a *Assertion, exp Expectation) (*Verified, error) {
 	return check(a, in, exp, now)
 }
 
+// prepare is the stateless, pre-spend half of Verify: structure and version.
+// Nothing here consults or changes the challenge set.
+func prepare(a *Assertion) (SigningInput, error) {
+	if a == nil {
+		return SigningInput{}, fmt.Errorf("%w: nil assertion", ErrMalformed)
+	}
+	if a.Version != EncodingVersion {
+		return SigningInput{}, fmt.Errorf("%w: %d", ErrUnsupportedVersion, a.Version)
+	}
+	in := a.signingInput()
+	if err := in.validate(); err != nil {
+		return SigningInput{}, err
+	}
+	if len(a.Signature) == 0 {
+		return SigningInput{}, fmt.Errorf("%w: empty signature", ErrMalformed)
+	}
+	return in, nil
+}
+
+// VerifyDetached is the bindings-and-signature half of Verify with NO
+// challenge involved: it does not check that the challenge was minted, is
+// unspent, or is fresh, and it spends nothing. It exists for exactly two
+// callers, and its name is the reminder that the caller has taken the
+// challenge question on itself:
+//
+//   - re-verifying a stored, hash-chained record at reload against the
+//     signer's enrollment as it stood then, where the challenge was minted
+//     and spent in a previous process and Verify would rightly refuse it;
+//   - the presence:none admin path, where a device with no presence half
+//     approves with its DEVICE key. That caller passes Key.Public in
+//     exp.PresenceKey deliberately and visibly, at the call site. It is the
+//     one legitimate device-key-for-presence-key substitution in the
+//     codebase; anywhere else it is the bug the two-key split exists to
+//     prevent, and on the live path Verify must always run first and spend.
+//
+// The Verified it returns is proof of a signature, not an authorization: it
+// comes back already consumed, so Used() is true and every consumer (Touch,
+// Sponsor, Widen, Approve, ApproveBatch) refuses it with ErrPresenceConsumed.
+// A re-verified record or a detached device-key check can never open a
+// window or approve anything by itself. Rejections are the same typed errors
+// Verify returns, minus the three challenge errors.
+func VerifyDetached(a *Assertion, exp Expectation, now time.Time) (*Verified, error) {
+	in, err := prepare(a)
+	if err != nil {
+		return nil, err
+	}
+	ver, err := check(a, in, exp, now)
+	if err != nil {
+		return nil, err
+	}
+	ver.used.Store(true)
+	return ver, nil
+}
+
 // check is Verify after the challenge has been spent: key, bindings,
 // request hash, signature. Shared with Enroll, which spends once for two
-// signatures.
+// signatures, and VerifyDetached, which involves no challenge at all.
 func check(a *Assertion, in SigningInput, exp Expectation, now time.Time) (*Verified, error) {
 	if exp.PresenceKey == nil {
 		return nil, ErrNoPresenceKey

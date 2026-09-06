@@ -63,6 +63,12 @@ func (m *memStore) Get(_ context.Context, c, id string) ([]byte, error) {
 	return bytes.Clone(v), nil
 }
 func (m *memStore) Put(_ context.Context, c, id string, v []byte) error {
+	if err := validName(c); err != nil {
+		return err
+	}
+	if err := validName(id); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.rows[c] == nil {
@@ -99,7 +105,31 @@ func chainHash(prev []byte, r store.Record) []byte {
 	h.Write(r.Payload)
 	return h.Sum(nil)
 }
+
+// validName mirrors the real store's name rule (store/schema.go validName)
+// so a kind or id policy writes is refused here the way SQLite and the
+// backup tarball would refuse it, instead of passing an in-memory fake and
+// failing at the seam.
+func validName(s string) error {
+	if s == "" || s == "." || s == ".." || len(s) > 128 {
+		return fmt.Errorf("%w: %q", store.ErrBadName, s)
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '-', c == '_', c == '.', c == ':', c == '@':
+		default:
+			return fmt.Errorf("%w: %q offset %d", store.ErrBadName, s, i)
+		}
+	}
+	return nil
+}
+
 func (m *memStore) Append(_ context.Context, r store.Record) ([]byte, error) {
+	if err := validName(r.Kind); err != nil {
+		return nil, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var prev []byte
