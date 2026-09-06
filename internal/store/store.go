@@ -50,6 +50,26 @@ type Store interface {
 	// follow from its predecessor.
 	Verify(ctx context.Context) (ok bool, firstBadSeq int64, err error)
 
+	// Walk streams records from seq onward, oldest first, calling fn for each.
+	// A tamper-evident log that cannot be read back is write-only: reload has
+	// to re-verify what is stored, and an operator has to be able to audit the
+	// thing the chain exists to protect.
+	//
+	// Walk VERIFIES each link as it goes and stops at the first record whose
+	// hash does not follow from its predecessor, returning ErrChainBroken
+	// after having delivered the valid prefix. Verification is not a separate
+	// call a reader may skip, because a reader who walks unverified records is
+	// trusting exactly the bytes an attacker would have edited. The valid
+	// prefix is still delivered because it is still evidence: where the chain
+	// breaks is the most useful fact an operator has.
+	//
+	// It streams rather than returning a slice because the chain carries every
+	// issuance and exchange for the life of the issuer and has no bound.
+	//
+	// fn returning an error stops the walk and Walk returns that error
+	// unchanged, so a caller can stop early without it looking like corruption.
+	Walk(ctx context.Context, from int64, fn func(Record) error) error
+
 	// Close releases the database.
 	Close() error
 }
