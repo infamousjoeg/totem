@@ -372,7 +372,7 @@ func TestCheckSecretFileRefusesAWritableDirectory(t *testing.T) {
 	if err := os.Chmod(filepath.Dir(p), 0o770); err != nil {
 		t.Fatal(err)
 	}
-	err := checkSecretFile(p, os.Geteuid())
+	err := checkSecretFile(secrets, p, os.Geteuid())
 	if !errors.Is(err, ErrFileProviderRefused) {
 		t.Fatalf("checkSecretFile in a group-writable directory = %v, want ErrFileProviderRefused", err)
 	}
@@ -390,7 +390,7 @@ func TestCheckSecretFileRefusesAnotherUsersFile(t *testing.T) {
 	}
 	dir := sandbox(t)
 	p := writeSecret(t, dir, "totem/a", "value", 0o600)
-	err := checkSecretFile(p, rootUID)
+	err := checkSecretFile(dir, p, rootUID)
 	if !errors.Is(err, ErrFileProviderRefused) {
 		t.Fatalf("checkSecretFile on a file owned by uid %d when root was required = %v, want ErrFileProviderRefused", os.Geteuid(), err)
 	}

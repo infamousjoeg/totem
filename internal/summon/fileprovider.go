@@ -80,7 +80,7 @@ func readFileSecret(dir string, ref Reference, trustedUID int) (*secret, error) 
 		return nil, err
 	}
 	p := filepath.Join(dir, filepath.FromSlash(string(ref)))
-	if err := checkSecretFile(p, trustedUID); err != nil {
+	if err := checkSecretFile(dir, p, trustedUID); err != nil {
 		return nil, err
 	}
 	f, err := os.Open(p)
@@ -117,7 +117,7 @@ func readFileSecret(dir string, ref Reference, trustedUID int) (*secret, error) 
 
 // checkSecretFile applies every file-provider refusal and names the path it
 // refuses.
-func checkSecretFile(p string, trustedUID int) error {
+func checkSecretFile(root, p string, trustedUID int) error {
 	fi, err := os.Lstat(p)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -137,15 +137,61 @@ func checkSecretFile(p string, trustedUID int) error {
 	if err := checkOwner(p, fi, trustedUID); err != nil {
 		return fmt.Errorf("%w: %s is not owned by root or by the issuer", ErrFileProviderRefused, p)
 	}
-	dir := filepath.Dir(p)
-	di, err := os.Stat(dir)
-	if err != nil {
-		return fmt.Errorf("%w: %s: %v", ErrFileProviderRefused, dir, err)
+	if err := checkSecretDirs(root, p, trustedUID); err != nil {
+		return err
 	}
-	if perm := di.Mode().Perm(); perm&0o022 != 0 {
-		return fmt.Errorf("%w: %s is mode %04o, so anyone in the group or on the box can replace the secret in it", ErrFileProviderRefused, dir, perm)
+	return checkNotPublished(filepath.Dir(p))
+}
+
+// checkSecretDirs checks EVERY directory from the file provider's root down to
+// the one holding the secret, not just the immediate parent.
+//
+// A reference may have several segments ("aws/prod/key" is a legal reference,
+// and the spec's own examples look like "totem/anthropic"), so there can be
+// directories between the configured root and the secret. The root and its
+// ancestors are covered by checkTree at start and on every resolve; the
+// immediate parent was covered here. Everything in between was covered by
+// neither, which was an inconsistency with the binary provider, whose whole
+// path is walked.
+//
+// It was not exploitable on its own: substituting the secret still had to
+// produce a regular, non-symlink, 0600 file owned by root or the issuer, which
+// someone who is neither cannot create. But "the other checks happen to catch
+// it" is a reason a hole stays closed today, not a reason it was closed, and
+// the same argument would have to be re-derived by whoever reads this next.
+//
+// The walk is outermost-first so the error names the outermost offending
+// directory: told that the innermost one is writable, an operator fixes that
+// one and leaves the directory that actually let it happen.
+func checkSecretDirs(root, p string, trustedUID int) error {
+	root = filepath.Clean(root)
+	var dirs []string
+	for d := filepath.Dir(filepath.Clean(p)); ; d = filepath.Dir(d) {
+		dirs = append(dirs, d)
+		if d == root || d == filepath.Dir(d) {
+			break
+		}
 	}
-	return checkNotPublished(dir)
+	for i := len(dirs) - 1; i >= 0; i-- {
+		d := dirs[i]
+		di, err := os.Lstat(d)
+		if err != nil {
+			return fmt.Errorf("%w: %s: %v", ErrFileProviderRefused, d, err)
+		}
+		if di.Mode()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("%w: %s is a symbolic link; the file provider will not follow one to a secret", ErrFileProviderRefused, d)
+		}
+		if !di.IsDir() {
+			return fmt.Errorf("%w: %s is not a directory", ErrFileProviderRefused, d)
+		}
+		if perm := di.Mode().Perm(); perm&0o022 != 0 {
+			return fmt.Errorf("%w: %s is mode %04o, so anyone in the group or on the box can replace the secret in it", ErrFileProviderRefused, d, perm)
+		}
+		if err := checkOwner(d, di, trustedUID); err != nil {
+			return fmt.Errorf("%w: %s is not owned by root or by the issuer", ErrFileProviderRefused, d)
+		}
+	}
+	return nil
 }
 
 // checkNotPublished walks up from dir looking for the two ways a plaintext

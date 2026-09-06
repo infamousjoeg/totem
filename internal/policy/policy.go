@@ -7,7 +7,18 @@
 // refuses to apply anything unsigned and stores the signed records in the
 // same hash chain as issuance. The issuer host is a verifier and a cache of
 // admin-signed state. A compromised host can mint under the CA (bounded by
-// KMS) but cannot quietly widen a grant or enroll a device.
+// KMS) but cannot forge, alter or insert a policy record: every record is
+// signed by an enrolled device and re-verified on load, so it cannot
+// quietly widen a grant or enroll a device that way.
+//
+// What that does NOT cover, stated so nobody reads more into it: a host
+// with write access to the store can TRUNCATE the chain to before a revoke
+// record and move the recorded head to match. The prefix is internally
+// consistent (links hold, ordinals stay sequential, every signature still
+// verifies), so reload cannot tell it from the whole chain and the
+// revocation is reverted. History cannot be changed; it can be rolled back.
+// Closing that needs the chain head held off the box and compared at start,
+// which is a deployment decision above this package (see store.Store.Head).
 //
 // The package evaluates against internal/presence and never re-implements it:
 // presence assertions go through presence.Verifier, sessions through
@@ -343,9 +354,10 @@ type Decision struct {
 
 // AuditRecord is one structured, hash-chained log line: every issuance and
 // exchange records the SPIFFE ID, device, tool anchor, presence type and age,
-// and outcome. The chain makes the log tamper-evident; config and policy
-// changes are logged the same way so the honest threat model has no gap where
-// "which device is enrolled / what presence a target needs" lives.
+// and outcome. The chain makes alteration and insertion evident (not
+// truncation; see the package doc); config and policy changes are logged the
+// same way so the honest threat model has no gap where "which device is
+// enrolled / what presence a target needs" lives.
 type AuditRecord struct {
 	// Kind is the chain record kind: "exchange", "issuance",
 	// "self-issuance", or "policy.<action>".
