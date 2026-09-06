@@ -16,6 +16,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -115,14 +116,24 @@ const (
 )
 
 // String names a Rotation for logs and errors.
+//
+// An unrecognised value renders as unknown(N) rather than as "undeclared",
+// because those are different facts and an error that conflates them sends the
+// reader to the wrong place. "undeclared" means the zero value: someone
+// configured a secret and did not say what shape it is. unknown(3) means a
+// shape exists in this package that whatever is reading it does not know
+// about, which is a version skew or a shape added without updating the gates
+// that have an opinion about it.
 func (r Rotation) String() string {
 	switch r {
+	case RotationUnset:
+		return "undeclared"
 	case RotationPull:
 		return "pull"
 	case RotationSealsDataAtRest:
 		return "seals-data-at-rest"
 	default:
-		return "undeclared"
+		return "unknown(" + strconv.Itoa(int(r)) + ")"
 	}
 }
 

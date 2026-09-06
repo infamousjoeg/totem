@@ -109,6 +109,17 @@ func (a *authority) VerifyPassphrase(ctx context.Context) error {
 	return nil
 }
 
+// CanOpen implements PassphraseOperator.CanOpen. It resolves nothing: the
+// candidate is tested against the files exactly as a restart would test it.
+func (a *authority) CanOpen(_ context.Context, candidate []byte) ([]string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return nil, ErrClosed
+	}
+	return a.unopenable(candidate)
+}
+
 // inMemoryKeyFor returns the unsealed intermediate key behind a key file, if
 // this process is already holding it.
 //
@@ -153,6 +164,10 @@ func (a *authority) Reseal(ctx context.Context, previous []byte) error {
 	}
 
 	var needPrevious []string
+	// resealed counts files this call actually rewrote. It is the difference
+	// between "the work is done" and "the work never started", which are
+	// otherwise indistinguishable from in here; see the refusal below.
+	resealed := 0
 	for _, p := range paths {
 		// Already under the current passphrase: leave it alone. This is what
 		// makes Reseal idempotent, and therefore what makes an interrupted
@@ -176,6 +191,27 @@ func (a *authority) Reseal(ctx context.Context, previous []byte) error {
 		if err := writeSealedKey(p, key, current.Bytes(), a.salt); err != nil {
 			return err
 		}
+		resealed++
+	}
+
+	// A previous passphrase was supplied and NOTHING needed it. Two situations
+	// produce that, and from in here they are identical: the material is
+	// already sealed under the current value and the work is done, or summon
+	// has raised a drift alarm and is still SERVING the old value, so every
+	// file opened under what the resolver just handed back, every file was
+	// skipped, and the previous value was never tried at all.
+	//
+	// The second is the one that matters, and reporting success for it tells an
+	// operator a restart is safe when nothing whatsoever has been done. Since
+	// the two cannot be told apart from inside, the honest answer is to refuse
+	// and name both readings rather than to pick the flattering one. A caller
+	// that wants to know which it is asks CanOpen, which answers against the
+	// files instead of against whatever the resolver is currently serving.
+	//
+	// previous == nil is exempt: that is the "re-seal whatever memory can
+	// reach" call, which is expected to be a no-op once everything is done.
+	if len(previous) > 0 && resealed == 0 {
+		return fmt.Errorf("%w: nothing needed re-sealing, so either this is already done or the resolver has not adopted the new value yet; ask CanOpen which", ErrPassphraseNotAdopted)
 	}
 	if len(needPrevious) > 0 {
 		return fmt.Errorf("%w: %s cannot be re-sealed without the previous passphrase; re-run reseal with it",

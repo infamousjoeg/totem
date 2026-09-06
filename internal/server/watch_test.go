@@ -342,24 +342,27 @@ func TestWatcherRefusesAnIncompleteConfig(t *testing.T) {
 	}
 }
 
-// TestResealDoesNothingUntilTheResolverReturnsTheNewValue is the evidence
-// behind the ordering `totem-issuer reseal-ca` uses, and behind a note to the
-// secrets owner and the build lead.
+// TestResealRefusesInsteadOfReportingSuccessBeforeAdoption is the evidence
+// behind the ordering `totem-issuer reseal-ca` uses.
 //
 // internal/summon deliberately keeps SERVING the old value for a secret that
 // seals material at rest: it is excluded from pull-based rotation, so when the
-// provider starts returning something new, summon alarms and carries on with the
-// value in use until `ResealCompleted` adopts the new one. Both ca.Reseal and
-// ca.VerifyPassphrase ask the resolver "what is the passphrase now". While
-// summon is still serving the old value, that answer is the old value, so
-// VerifyPassphrase SUCCEEDS and Reseal has nothing to do.
+// provider starts returning something new, summon alarms and carries on with
+// the value in use until ResealCompleted adopts the new one. Both ca.Reseal and
+// ca.VerifyPassphrase ask the resolver "what is the passphrase now", so during
+// that window the answer is the OLD value, every file already opens under it,
+// and there is nothing for a re-seal to do.
 //
-// The consequence is that re-sealing before adoption is inert. A reseal-ca that
-// ran ca.Reseal first and adopted afterwards would report success having changed
-// nothing, and then adopt the new value on top of files still sealed under the
-// old one, producing exactly the failed restart it exists to prevent. So the
-// command adopts first and re-seals second, and this test is why.
-func TestResealDoesNothingUntilTheResolverReturnsTheNewValue(t *testing.T) {
+// This test previously pinned what ca did then, which was to return nil. That
+// was a defect and ca has fixed it: a re-seal that reports success for work it
+// did not do tells an operator a restart is safe when nothing has been done,
+// which is the same class of lie as the silent brick the whole mechanism exists
+// to remove. "Already done" and "never started" are indistinguishable from
+// inside Reseal, so it now names both readings and refuses.
+//
+// The ordering consequence is unchanged and is now enforced rather than merely
+// necessary: reseal-ca adopts first and re-seals second.
+func TestResealRefusesInsteadOfReportingSuccessBeforeAdoption(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	authority, provider, _ := realCA(t)
@@ -369,19 +372,46 @@ func TestResealDoesNothingUntilTheResolverReturnsTheNewValue(t *testing.T) {
 	}
 	const original = "the original passphrase"
 
-	// While the resolver still returns the old value, which is precisely what
-	// summon does during a drift alarm:
+	// The drift window: the provider has moved on but summon is still serving
+	// the old value, so the CA opens and will not after a restart.
 	if err := op.VerifyPassphrase(ctx); err != nil {
 		t.Fatalf("the CA should open under the value in use: %v", err)
 	}
-	// ...a re-seal is a no-op, and says nothing about whether it did anything.
-	// Note it succeeds even with a previous value that is flatly wrong, because
-	// every file already opens under what the resolver returned.
-	if err := op.Reseal(ctx, []byte("a completely wrong previous value")); err != nil {
-		t.Fatalf("Reseal before adoption should be inert, not an error: %v", err)
+
+	// A re-seal here has nothing to do, and must say so rather than succeed.
+	// Both the correct previous value and a flatly wrong one land here, because
+	// neither is ever tried: every file opened under what the resolver handed
+	// back, so the loop skipped all of them.
+	for _, previous := range []string{original, "a completely wrong previous value"} {
+		if err := op.Reseal(ctx, []byte(previous)); !errors.Is(err, ca.ErrPassphraseNotAdopted) {
+			t.Fatalf("Reseal before adoption with previous %q returned %v, want ErrPassphraseNotAdopted; "+
+				"reporting success for work it did not do is how an operator is told a restart is safe when nothing has been done",
+				previous, err)
+		}
 	}
-	if err := op.VerifyPassphrase(ctx); err != nil {
-		t.Fatalf("the inert re-seal changed something: %v", err)
+
+	// A nil previous is exempt: that is the "re-seal whatever the in-memory
+	// keys can reach" call, and it is expected to be a no-op once done.
+	if err := op.Reseal(ctx, nil); err != nil {
+		t.Fatalf("Reseal with a nil previous must stay exempt: %v", err)
+	}
+
+	// CanOpen answers against the FILES, not against whatever the resolver is
+	// serving, which is the only thing that can tell the two readings apart
+	// from outside. This is the pre-flight reseal-ca runs before adopting.
+	bad, err := op.CanOpen(ctx, []byte(original))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bad) != 0 {
+		t.Errorf("CanOpen with the passphrase the files are sealed under named %v, want none", bad)
+	}
+	bad, err = op.CanOpen(ctx, []byte("the adopted passphrase"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bad) == 0 {
+		t.Error("CanOpen with a passphrase the files are NOT sealed under named nothing, so the pre-flight cannot refuse")
 	}
 
 	// Now the resolver returns the new value, which is what ResealCompleted
@@ -397,12 +427,49 @@ func TestResealDoesNothingUntilTheResolverReturnsTheNewValue(t *testing.T) {
 		t.Fatalf("after re-sealing, a restart would still fail: %v", err)
 	}
 
-	// And the wrong previous value after adoption is a real refusal, unlike the
-	// inert case above. This is the difference the command reports to the
-	// operator, and getting it backwards is how a success message hides a brick.
+	// And a wrong previous value after adoption is a real refusal, which is the
+	// case the pre-flight exists to catch before any file is written.
 	provider.set(testPassphraseRef, []byte("a third passphrase"))
 	if err := op.Reseal(ctx, []byte("still not the right one")); err == nil {
 		t.Fatal("re-sealing with a wrong previous value after adoption reported success")
+	}
+}
+
+// TestCanOpenAnswersAgainstTheFilesNotTheResolver. The pre-flight in reseal-ca
+// runs BEFORE adoption, so a check that consulted the resolver would be
+// answering about the old value and saying nothing about the candidate the
+// operator just typed.
+func TestCanOpenAnswersAgainstTheFilesNotTheResolver(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	authority, provider, _ := realCA(t)
+	op, ok := authority.(ca.PassphraseOperator)
+	if !ok {
+		t.Skip("this CA implementation seals nothing")
+	}
+
+	// Move the provider. The files have not changed, so CanOpen's answers must
+	// not change either.
+	before, err := op.CanOpen(ctx, []byte("the original passphrase"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.set(testPassphraseRef, []byte("something else entirely"))
+	after, err := op.CanOpen(ctx, []byte("the original passphrase"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != 0 || len(after) != 0 {
+		t.Fatalf("CanOpen for the sealing passphrase named %v then %v, want none both times", before, after)
+	}
+	// And the value the resolver now returns still does not open the files,
+	// which is exactly the state the operator is in when they run reseal-ca.
+	bad, err := op.CanOpen(ctx, []byte("something else entirely"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bad) == 0 {
+		t.Fatal("CanOpen followed the resolver rather than the files")
 	}
 }
 

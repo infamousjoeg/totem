@@ -227,3 +227,128 @@ func TestResealRefusesAWrongPreviousPassphrase(t *testing.T) {
 		t.Fatalf("got %v, want an error naming the file that opens under neither", err)
 	}
 }
+
+// TestResealRefusesBeforeTheResolverHasAdoptedTheNewValue is the defect issuerd
+// found while wiring reseal-ca, and it is the nastiest shape in this mechanism.
+//
+// summon deliberately keeps SERVING the old value for a Sealing reference while
+// it raises a drift alarm. Reseal resolves "the passphrase the resolver returns
+// now", so in that window every file opens under what it was just handed, every
+// file is skipped, and the previous value the operator typed is never tried at
+// all. It returned nil. An operator reading that success would believe a
+// restart is safe when nothing whatsoever had been done, which is the same
+// class of lie as the silent brick this whole mechanism exists to remove.
+//
+// Refusing is the only honest answer, because doing nothing and having done the
+// work are indistinguishable from outside.
+func TestResealRefusesBeforeTheResolverHasAdoptedTheNewValue(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ca := newTestCA(t)
+	op := ca.Authority.(PassphraseOperator)
+	const oldPass = "a-passphrase-only-summon-knows"
+
+	// The resolver still serves the old value: summon's pre-adoption state.
+	if err := op.Reseal(ctx, []byte(oldPass)); !errors.Is(err, ErrPassphraseNotAdopted) {
+		t.Fatalf("re-sealing before adoption: got %v, want ErrPassphraseNotAdopted", err)
+	}
+	// A flatly wrong previous value must not read as success either, which is
+	// what it did before: it was never tried.
+	if err := op.Reseal(ctx, []byte("a flatly wrong previous passphrase")); err == nil {
+		t.Fatal("a wrong previous value reported success; it was never checked against anything")
+	}
+
+	// After adoption the ordinary path works.
+	ca.setPassphrase("the value the provider now returns")
+	if err := op.Reseal(ctx, []byte(oldPass)); err != nil {
+		t.Fatalf("re-sealing after adoption: %v", err)
+	}
+	if err := op.VerifyPassphrase(ctx); err != nil {
+		t.Fatalf("after re-sealing: %v", err)
+	}
+}
+
+// TestCanOpenTestsTheCandidateAgainstTheFiles: the pre-flight issuerd needs
+// before reseal-ca writes anything.
+func TestCanOpenTestsTheCandidateAgainstTheFiles(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ca := newTestCA(t)
+	op := ca.Authority.(PassphraseOperator)
+	const oldPass = "a-passphrase-only-summon-knows"
+
+	bad, err := op.CanOpen(ctx, []byte(oldPass))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bad) != 0 {
+		t.Fatalf("the correct passphrase must open everything, got %v unopened", bad)
+	}
+
+	bad, err = op.CanOpen(ctx, []byte("wrong"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bad) != 2 {
+		t.Fatalf("a wrong candidate must name both the root and the intermediate, got %v", bad)
+	}
+	for _, name := range bad {
+		if !strings.HasPrefix(name, rootPrefix) && !strings.HasPrefix(name, interPrefix) {
+			t.Fatalf("unexpected file name %q", name)
+		}
+	}
+
+	// It resolves nothing. issuerd calls this BEFORE adoption, so a check that
+	// consulted the resolver would be answering about the old value and would
+	// say nothing at all about the candidate the operator just typed.
+	before := ca.res.callCount()
+	if _, err := op.CanOpen(ctx, []byte("wrong again")); err != nil {
+		t.Fatal(err)
+	}
+	if ca.res.callCount() != before {
+		t.Fatal("CanOpen resolved through the provider; it must test the candidate against the files alone")
+	}
+}
+
+// TestCanOpenSeesAPartiallyResealedDirectory is why it returns file names
+// rather than a bool. A re-seal interrupted between two files leaves a
+// directory that opens today and fails at the next restart, and the operator
+// needs to know WHICH half is which to finish it.
+func TestCanOpenSeesAPartiallyResealedDirectory(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ca := newTestCA(t)
+	op := ca.Authority.(PassphraseOperator)
+	const oldPass = "a-passphrase-only-summon-knows"
+	const newPass = "the value the provider now returns"
+
+	// Re-seal what can be done without the previous value: the intermediates,
+	// from the keys already in memory. The root is left under the old value.
+	ca.setPassphrase(newPass)
+	if err := op.Reseal(ctx, nil); !errors.Is(err, ErrPassphraseChanged) {
+		t.Fatalf("got %v, want the partial-result refusal", err)
+	}
+
+	underNew, err := op.CanOpen(ctx, []byte(newPass))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(underNew) != 1 || !strings.HasPrefix(underNew[0], rootPrefix) {
+		t.Fatalf("the root should be the only file not yet under the new value, got %v", underNew)
+	}
+	underOld, err := op.CanOpen(ctx, []byte(oldPass))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(underOld) != 1 || !strings.HasPrefix(underOld[0], interPrefix) {
+		t.Fatalf("the intermediate should be the only file no longer under the old value, got %v", underOld)
+	}
+
+	// Finishing it clears both views.
+	if err := op.Reseal(ctx, []byte(oldPass)); err != nil {
+		t.Fatal(err)
+	}
+	if bad, err := op.CanOpen(ctx, []byte(newPass)); err != nil || len(bad) != 0 {
+		t.Fatalf("after completing the re-seal everything must open under the new value: %v %v", bad, err)
+	}
+}

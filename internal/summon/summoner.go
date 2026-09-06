@@ -518,18 +518,43 @@ func (s *Summoner) Drifted() []string {
 }
 
 // ResealCompleted adopts the provider's current value for a sealed secret and
-// clears its alarm. It is the second half of rotating a value that seals
-// material at rest, and it is called only after the FIRST half has actually
-// happened: the material on disk has been re-sealed under the new value.
+// clears its alarm. It is one half of rotating a value that seals material at
+// rest, and the ORDER of the two halves is the opposite of what it looks like.
+//
+// CALL THIS FIRST, THEN RE-SEAL. The re-seal has to happen against a resolver
+// that is already returning the new value.
+//
+// The reason is not obvious and cost internal/issuerd a committed command to
+// find, so it is written down here rather than left to be rediscovered. A
+// re-seal takes its TARGET from the resolver, which is deliberate: taking it
+// from the caller would verify the caller's claim about the value rather than
+// what this resolver will actually hand out at the next start. But during a
+// drift this package is still serving the OLD value, on purpose, so before
+// adoption the target IS the old value. Every sealed file already opens under
+// it, every file is skipped, and the re-seal returns success having done
+// nothing at all. Then adopting on top of that produces exactly the failed
+// restart this mechanism exists to prevent, reported as success.
+//
+// So the sequence is: hold the previous value, ResealCompleted, re-seal, then
+// verify that a restart would now succeed.
+//
+// HOLD THE PREVIOUS VALUE BEFORE CALLING. Adoption retires the old value and
+// wipes it once the retire window passes, so this package stops being able to
+// give it back. Between the adoption and a successful re-seal there is a
+// window in which a restart would fail. That window is recoverable, because
+// the state is stable and a re-seal is idempotent, but only by someone who
+// still has the previous value: read it before calling this, not after.
 //
 // Nothing calls this on its own. An automatic adoption would be the very
 // rotation this exclusion exists to prevent, just with extra steps: it would
-// leave the running process fine and the next start broken. It exists so that
-// `totem issuer reseal-ca`, having re-sealed the CA key files, can tell this
-// package the world changed underneath it.
+// leave the running process fine and the next start broken.
 //
-// Calling it without having re-sealed anything is how you brick the issuer by
-// hand. The refusal it cannot make for you is the one where you have not.
+// internal/ca enforces this order rather than trusting a caller to read it:
+// re-sealing before adoption returns ca.ErrPassphraseNotAdopted, which says
+// the resolver is still returning the value the material is sealed under. That
+// refusal exists because the alternative, which this package's serving of the
+// old value creates, is a re-seal that reports success having skipped every
+// file.
 func (s *Summoner) ResealCompleted(ctx context.Context, name string) error {
 	s.rotateMu.Lock()
 	defer s.rotateMu.Unlock()

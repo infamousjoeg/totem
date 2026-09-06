@@ -212,16 +212,37 @@ type PassphraseOperator interface {
 	// the intended offline posture, and there is nothing local to re-seal.
 	VerifyPassphrase(ctx context.Context) error
 
+	// CanOpen reports which sealed key files the candidate passphrase does NOT
+	// open, by base name, in order. An empty result means it opens all of them.
+	//
+	// It resolves nothing and writes nothing. That matters more than it looks:
+	// the caller who needs it is `issuer reseal-ca`, running BEFORE the
+	// resolver has adopted the new value, so a check that consulted the
+	// resolver would be answering about the old value and would say nothing
+	// about the candidate the operator just typed. This tests the candidate
+	// against the FILES.
+	//
+	// It exists so a re-seal can refuse before touching anything. Reseal
+	// rewrites files one at a time and no filesystem renames a group of them
+	// atomically, so a wrong previous passphrase can open the first file and
+	// fail on the second, leaving a directory where some keys are under the new
+	// value and some under the old. That state is recoverable by re-running,
+	// and it is still worse than never having started: by the time someone is
+	// running reseal-ca they are already having a bad day.
+	CanOpen(ctx context.Context, candidate []byte) ([]string, error)
+
 	// Reseal re-seals every sealed key file under the passphrase the resolver
 	// returns NOW, given the previous passphrase that currently opens them.
 	// This is the mechanism behind `issuer reseal-ca`.
 	//
-	// It is idempotent and safe to re-run: a file that already opens under the
-	// current passphrase is left alone, so a Reseal interrupted halfway can be
-	// completed by running it again with the same previous value. That matters
-	// because the files are re-sealed one at a time and no filesystem offers to
-	// rename a group of them atomically, so "interrupted halfway" is a state
-	// that has to be recoverable rather than prevented.
+	// A file that already opens under the current passphrase is left alone, so
+	// a Reseal interrupted halfway is completed by running it again with the
+	// same previous value: the files it already did are skipped and the rest
+	// are finished. That matters because the files are re-sealed one at a time
+	// and no filesystem offers to rename a group of them atomically, so
+	// "interrupted halfway" is a state that has to be recoverable rather than
+	// prevented. Re-running once everything is done is the no-op case above,
+	// and is reported rather than passed off as success.
 	//
 	// The KDF salt is deliberately NOT changed. Rotating it would mean every
 	// file has to be rewritten together for any of them to be readable, which
@@ -232,6 +253,24 @@ type PassphraseOperator interface {
 	// previous may be nil when only the in-memory intermediate keys need
 	// re-sealing, but a root key file present on disk cannot be re-sealed
 	// without it and Reseal says so rather than leaving it stale.
+	//
+	// It REFUSES with ErrPassphraseNotAdopted when previous was supplied and
+	// NOTHING needed re-sealing. Two situations produce that and they are
+	// indistinguishable from inside: the material is already sealed under the
+	// current value, or summon has raised a drift alarm and is still SERVING
+	// the old value, so every file opened under what the resolver handed back,
+	// every file was skipped, and the previous value was never tried at all.
+	//
+	// The second is why this is a refusal. Reporting success there tells an
+	// operator a restart is safe when nothing has been done, which is the same
+	// class of lie as the silent brick this mechanism exists to remove. Since
+	// the two cannot be told apart from in here, it names both readings rather
+	// than picking the flattering one, and points at CanOpen, which answers
+	// against the FILES instead of against whatever the resolver is serving.
+	//
+	// A nil previous is exempt: that is the "re-seal whatever the in-memory
+	// keys can reach" call, and it is expected to be a no-op once the work is
+	// done.
 	Reseal(ctx context.Context, previous []byte) error
 }
 
@@ -843,6 +882,17 @@ var (
 	// safe-looking answer is exactly how the declaration's zero value would
 	// have become a silent brick in the first place.
 	ErrRotationShapeUnknown = errors.New("ca: the resolver cannot report whether the CA passphrase is excluded from pull-based rotation")
+
+	// ErrPassphraseNotAdopted means a re-seal was asked for while the resolver
+	// is still returning the value the material is already sealed under, so
+	// there is nothing to re-seal yet.
+	//
+	// It is an error rather than a silent success because the two are
+	// indistinguishable from the outside and mean opposite things: one is "the
+	// work is done", the other is "the work has not started and your previous
+	// value was never checked". An operator who saw success here would believe
+	// a restart is now safe.
+	ErrPassphraseNotAdopted = errors.New("ca: the resolver is still returning the passphrase the material is sealed under; adopt the new value before re-sealing")
 
 	// ErrClosed means the Authority has been closed.
 	ErrClosed = errors.New("ca: authority is closed")

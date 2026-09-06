@@ -119,18 +119,59 @@ func cmdResealCA(ctx context.Context, args []string) error {
 			"re-sealing needs the passphrase the CA material is currently sealed under, and none was given on stdin.")
 	}
 
+	// PRE-FLIGHT, BEFORE ANY ADOPTION AND BEFORE ANY WRITE.
+	//
+	// ca.Reseal rewrites files one at a time and no filesystem renames a group
+	// of them atomically, so a wrong previous value can open the first file and
+	// fail on the second, leaving a directory where some keys are under the new
+	// passphrase and some under the old. That state is recoverable by
+	// re-running, and it is still worse than never having started: by the time
+	// someone is running reseal-ca they are already having their second bad day.
+	//
+	// CanOpen answers against the FILES rather than against whatever the
+	// resolver is serving, which is the only check that means anything here,
+	// because at this point the resolver is still returning the OLD value and
+	// would happily agree with a candidate that opens nothing.
+	if len(previous) > 0 {
+		unopenable, err := op.CanOpen(ctx, previous)
+		if err != nil {
+			return err
+		}
+		if len(unopenable) > 0 {
+			return failf(
+				"Check that what you piped in is the passphrase the CA material is currently sealed under, then run reseal-ca again. Nothing was changed.",
+				"that passphrase does not open %s, so re-sealing would have failed partway and left some keys under one passphrase and some under another.",
+				strings.Join(unopenable, ", "))
+		}
+	}
+
 	if drifted {
 		// Adopt first. From here the resolver returns the NEW value, which is
 		// what ca.Reseal means by "the passphrase the resolver returns now", and
-		// only now can it re-seal anything. If the step after this fails, the
-		// files are still under the old value and the fix is to run this command
-		// again with the right one: recoverable, and loudly so.
+		// only now can it re-seal anything.
+		//
+		// Ordering, not preference. Before adoption every file already opens
+		// under what the resolver hands back, so Reseal has nothing to do and
+		// refuses with ErrPassphraseNotAdopted rather than reporting a success
+		// it did not earn. The pre-flight above has already established that the
+		// value we are about to need actually opens the files, so the window
+		// between adopting and finishing is as small as it can be made.
 		if err := rt.summoner.ResealCompleted(ctx, CAPassphraseRefName); err != nil {
 			return err
 		}
 	}
 
 	if err := op.Reseal(ctx, previous); err != nil {
+		if errors.Is(err, ca.ErrPassphraseNotAdopted) {
+			// Reaching this means this command got its own ordering wrong: the
+			// pre-flight said the previous value opens the files, and adoption
+			// either did not happen or did not take. Say that plainly rather
+			// than passing through a message about a mechanism the operator did
+			// not invoke.
+			return failf(
+				"Nothing was changed. Run 'totem-issuer status' to see whether the sealed-secret alarm is still set, and tell whoever maintains this issuer.",
+				"the issuer could not tell whether the re-seal was already done or had not started, so it refused: %v", err)
+		}
 		if errors.Is(err, ca.ErrPassphraseChanged) {
 			fix := "Check that what you piped in is the passphrase the CA material is sealed under, then run reseal-ca again. " +
 				"Re-sealing is idempotent, so re-running it with the right value finishes the job."

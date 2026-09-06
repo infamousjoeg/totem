@@ -418,7 +418,14 @@ func TestRotationStringNamesEachShape(t *testing.T) {
 	cases := map[Rotation]string{
 		RotationPull:            "pull",
 		RotationSealsDataAtRest: "seals-data-at-rest",
-		RotationUnset:           "undeclared",
+		// The zero value and an unrecognised value are different facts: one is
+		// a secret nobody declared a shape for, the other is a shape this
+		// build does not know about. An error that renders them identically
+		// sends the reader to the wrong place.
+		RotationUnset: "undeclared",
+		Rotation(3):   "unknown(3)",
+		Rotation(99):  "unknown(99)",
+		Rotation(-1):  "unknown(-1)",
 	}
 	for r, want := range cases {
 		if got := r.String(); got != want {
@@ -679,6 +686,19 @@ func TestTheTwoCannotDetermineCasesReadDifferently(t *testing.T) {
 // Decide what every holder of material at rest does with the new shape before
 // you add it to the list, and check that each of them still refuses by
 // default rather than by luck.
+//
+// Concretely, two gates outside this test have an opinion about which shapes
+// may seal material at rest, and both currently open for exactly one:
+// summon.RequireSealing here, and internal/ca's own gate on the CA passphrase.
+// Both refuse anything that is not RotationSealsDataAtRest, which is correct
+// and is what makes a carelessly added shape fail closed.
+//
+// The case that needs a human is a new shape that SHOULD be allowed to seal.
+// Adding it here without updating those gates does not produce a quiet bug, it
+// produces every issuer failing to start after a summon upgrade, with an error
+// blaming the operator's declaration rather than the upgrade that caused it.
+// If the shape you are adding is safe for material at rest, update those gates
+// in the same change.
 var legalRotations = []Rotation{RotationPull, RotationSealsDataAtRest}
 
 func TestTheSetOfRotationShapesIsClosed(t *testing.T) {
@@ -711,7 +731,10 @@ func TestTheSetOfRotationShapesIsClosed(t *testing.T) {
 		if !want[rot] {
 			t.Errorf("config validation accepts shape %d (%v), which is not in legalRotations. "+
 				"If you are adding a shape, decide what every holder of material at rest does with it "+
-				"and add it to the list deliberately", rot, rot)
+				"and add it to the list deliberately. If the new shape is SAFE for material at rest, "+
+				"summon.RequireSealing and internal/ca's passphrase gate both refuse it today and must be "+
+				"updated in the same change, or every issuer fails to start after this upgrade with an "+
+				"error blaming the operator's config rather than the upgrade", rot, rot)
 		}
 	}
 	// RotationUnset is deliberately absent from the list: the zero value is
