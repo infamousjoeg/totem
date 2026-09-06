@@ -6,11 +6,16 @@
 // compatibility with the ecosystem client that spiffe-helper, Envoy SDS, and
 // everything else in the wild actually uses.
 //
-// Every test here gates on the agent's socket being reachable and SKIPs,
-// naming exactly what it would have asserted, until it is. No test in this
-// file is allowed to pass without exercising the real assertion it names —
-// see the individual skip messages for what remains a documented gap even
-// once the socket exists.
+// By default (SPIFFE_ENDPOINT_SOCKET unset) TestMain, in main_test.go, starts
+// a real totem Workload API server via internal/workloadapi/wltest and points
+// this suite at it, so `go test ./test/conformance/` runs the whole gate
+// self-contained: no external agent, no env vars. Set SPIFFE_ENDPOINT_SOCKET
+// yourself to point the suite at a real running agent instead; every test
+// still gates on that socket being reachable and SKIPs, naming exactly what
+// it would have asserted, if it never comes up. No test in this file is
+// allowed to pass without exercising the real assertion it names — see the
+// individual skip messages for what remains a documented gap even once the
+// socket exists.
 package conformance
 
 import (
@@ -59,10 +64,12 @@ func defaultSocketAddress() (string, error) {
 
 // rotationTriggerEnv, when set, names a shell command this suite runs (via `sh
 // -c`) to make the connected totem agent rotate the SVID it is currently
-// serving. No such hook exists yet. Until the workload teammate wires one (or
-// tells this suite how to trigger a rotation some other way), TestRotationIsPushedNotPolled
-// documents exactly what it would assert and skips rather than passing hollow
-// on a rotation that was never actually forced to happen.
+// serving. It exists for pointing this suite at an external, already-running
+// agent with a long SVID lifetime where nothing will rotate on its own within
+// a test's timeout. It is NOT needed for the default self-contained run:
+// TestMain configures its own wltest agent with a short SVIDLifetime, which
+// rotates through the real half-life renewal path with no trigger at all — see
+// TestRotationIsPushedNotPolled and the selfContained flag in main_test.go.
 const rotationTriggerEnv = "TOTEM_TEST_ROTATE_SVID_CMD"
 
 // socketAddress resolves the Workload API address using the standard
@@ -100,25 +107,25 @@ func socketFilePath(addr string) (string, error) {
 }
 
 // socketWaitTimeout bounds how long reachableSocket will keep retrying before
-// reporting the socket unreachable. The agent creates its socket file during
-// startup, so a test process that starts the agent (or races an
-// already-starting one) can see ENOENT or a refused connection for a brief
-// window that means "not up yet," not "doesn't exist" — a single stat-and-dial
-// would misreport that window as "not yet functional" and skip a suite that
-// would have passed a moment later. This is a fixed guess at that window
-// pending real numbers from the workload teammate on agent startup latency.
-const socketWaitTimeout = 2 * time.Second
+// reporting the socket unreachable. It only needs to cover "the agent process
+// has not got there yet" — measured startup time (exec to socket accepting
+// connections) is ~260ms cold, 4-5.6ms warm — not "the socket exists but isn't
+// accepting": net.ListenUnix binds and listens before a totem agent's startup
+// call returns, so there is no window where os.Stat sees the file but a dial
+// would fail because nothing is serving it yet. 500ms is a comfortable margin
+// over the measured cold-start number, not a placeholder guess.
+const socketWaitTimeout = 500 * time.Millisecond
 
 // socketWaitInterval is the poll cadence within socketWaitTimeout.
-const socketWaitInterval = 50 * time.Millisecond
+const socketWaitInterval = 10 * time.Millisecond
 
 // reachableSocket resolves the configured Workload API address and reports
 // whether a listener answers there within socketWaitTimeout. It never asserts
 // anything about what the listener returns — that is every other test's job —
-// only whether the suite should run at all yet. Before step 1 lands this
-// always spends the full socketWaitTimeout finding nothing and returning
-// false; that fixed cost is the trade-off for not misreporting a genuine
-// startup race as "doesn't exist" once the agent does.
+// only whether the suite should run at all yet. Pointed at an external agent
+// that never comes up, this spends the full socketWaitTimeout finding nothing
+// and returns false; that fixed, now-small cost is the trade-off for not
+// misreporting a genuine startup race as "doesn't exist."
 func reachableSocket() (addr, path string, ok bool) {
 	addr, err := socketAddress()
 	if err != nil {
@@ -132,7 +139,11 @@ func reachableSocket() (addr, path string, ok bool) {
 	deadline := time.Now().Add(socketWaitTimeout)
 	for {
 		if _, statErr := os.Stat(path); statErr == nil {
-			if conn, dialErr := net.DialTimeout("unix", path, time.Second); dialErr == nil {
+			// Once the socket file exists it is already accepting (see the
+			// ListenUnix guarantee above), so one dial is enough — no need to
+			// retry the dial itself, only the wait for the file to appear.
+			conn, dialErr := net.DialTimeout("unix", path, time.Second)
+			if dialErr == nil {
 				conn.Close()
 				return addr, path, true
 			}
@@ -315,24 +326,38 @@ func (w *rotationWatcher) OnX509ContextWatchError(error) {
 // TestRotationIsPushedNotPolled exercises the spiffe-helper-shaped usage
 // pattern: hold client.WatchX509Context open and assert a rotation is pushed
 // to the callback, rather than requiring the caller to poll FetchX509SVID in a
-// loop. This is currently gated behind rotationTriggerEnv because nothing in
-// this repo yet exposes a way to force the agent to rotate on demand; without
-// that, "wait and see if an update arrives" would be a hollow pass on any run
-// that happens not to cross a real rotation boundary. See the reported gap in
-// the teammate summary: this is what's needed from the workload teammate to
-// turn this from a skip into a real assertion.
+// loop.
+//
+// In the default self-contained run (see main_test.go), this needs no trigger
+// at all: TestMain configures its own wltest agent with a short SVIDLifetime,
+// which renews at half-life through the agent's real production renewal path
+// and pushes the result down this test's open stream — there is no test-only
+// entry point in the server, which is a stronger proof than a forced trigger
+// would be. Since selfContained guarantees that renewal happens within this
+// test's timeout, a second update failing to arrive there is a real failure,
+// not a maybe.
+//
+// Pointed at an external, already-running agent instead (SPIFFE_ENDPOINT_SOCKET
+// set by the caller), nothing here can guarantee a rotation happens inside a
+// bounded test window unless rotationTriggerEnv names a command to force one;
+// without it, this SKIPs naming exactly what it would have asserted, rather
+// than hanging or passing hollow on a rotation that was never forced to
+// happen.
 func TestRotationIsPushedNotPolled(t *testing.T) {
-	addr, _ := skipUntilAgentExists(t, "hold client.WatchX509Context open, run the "+rotationTriggerEnv+
-		" command to force a rotation, and assert a second OnX509ContextUpdate delivers a different "+
-		"leaf certificate without the client calling FetchX509SVID again")
+	addr, _ := skipUntilAgentExists(t, "hold client.WatchX509Context open and assert a second "+
+		"OnX509ContextUpdate delivers a different leaf certificate without the client calling "+
+		"FetchX509SVID again")
 
 	trigger := os.Getenv(rotationTriggerEnv)
-	if trigger == "" {
-		t.Skipf("not yet functional: socket %s is reachable but %s is unset, so this suite has no way "+
-			"to force the agent to rotate its SVID on demand. Will hold client.WatchX509Context open, "+
-			"run the configured trigger command, and assert a second OnX509ContextUpdate delivers a "+
-			"different leaf certificate than the first — without the client polling FetchX509SVID — "+
-			"once a trigger mechanism exists.", addr, rotationTriggerEnv)
+	if trigger == "" && !selfContained {
+		t.Skipf("not yet functional: socket %s is reachable but this suite is pointed at an external "+
+			"agent (SPIFFE_ENDPOINT_SOCKET is set) with %s unset, so nothing here can force or guarantee "+
+			"a rotation within a bounded test window. Will hold client.WatchX509Context open and assert "+
+			"a second OnX509ContextUpdate delivers a different leaf certificate than the first — without "+
+			"the client polling FetchX509SVID — once %s names a command to force one, or once this "+
+			"suite runs self-contained (the default: unset SPIFFE_ENDPOINT_SOCKET and let TestMain start "+
+			"its own agent, which rotates on its own with no trigger needed).",
+			addr, rotationTriggerEnv, rotationTriggerEnv)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -365,12 +390,17 @@ func TestRotationIsPushedNotPolled(t *testing.T) {
 		t.Fatal("initial pushed X509Context's default SVID has zero certificates")
 	}
 
-	cmd := exec.CommandContext(ctx, "sh", "-c", trigger)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("rotation trigger %q failed: %v (stderr: %s)", trigger, err, stderr.String())
+	if trigger != "" {
+		cmd := exec.CommandContext(ctx, "sh", "-c", trigger)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("rotation trigger %q failed: %v (stderr: %s)", trigger, err, stderr.String())
+		}
 	}
+	// else: self-contained case. No explicit trigger is needed or possible —
+	// rotation happens on its own via the short SVIDLifetime TestMain
+	// configured, through the agent's real half-life renewal path. Just wait.
 
 	select {
 	case second := <-watcher.updates:
