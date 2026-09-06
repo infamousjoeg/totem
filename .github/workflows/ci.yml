@@ -1,0 +1,81 @@
+name: ci
+
+# Every check here exists because something in this repo was found by it and
+# would not have been found otherwise. The race detector caught two test suites
+# that were passing by winning a race against an exec rather than by
+# construction. Vetting under a second GOOS caught a portability shim that could
+# never have compiled on the platform it claimed to serve. The release gate
+# refuses to link while a certificate extension still carries a placeholder OID
+# arc, and an armed gate that nothing fires is not a gate.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      # The agent is macOS-first and the issuer runs on Linux, so a package
+      # that compiles here can still be broken there. Vetting the other way
+      # round is what surfaced a build-tagged file that no build selected and
+      # that therefore asserted nothing.
+      - name: vet linux
+        run: GOOS=linux go vet ./...
+
+      # cgo reaches the Secure Enclave; without it the agent falls back to a
+      # software key store. Both configurations ship, so both must build.
+      - name: build without cgo
+        run: CGO_ENABLED=0 go build ./...
+
+      # -race is not an optional extra here. It is the bar, and it has caught
+      # defects that plain `go test` reported as passing.
+      - name: test with the race detector
+        run: go test -race -count=1 ./...
+
+  release-gate:
+    # Proves the gate still bites. This job SUCCEEDS when the release build is
+    # REFUSED, because the OID arc is still a placeholder. When a real IANA
+    # enterprise number is registered and the marker is cleared, this job starts
+    # failing and is meant to be inverted then, not deleted.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: a release build must refuse a provisional OID arc
+        run: |
+          if go build -tags release ./internal/ca/... 2>/dev/null; then
+            echo "a release build linked while the OID arc is still provisional."
+            echo "if a real PEN was registered, invert this job; do not delete it."
+            exit 1
+          fi
+          echo "release build correctly refused: the OID arc is still a placeholder."
