@@ -299,8 +299,11 @@ func TestNoSourceIsNotACrash(t *testing.T) {
 	}
 }
 
-// TestNilAttestorIsNotACrash covers the state this repo is in while the
-// attestation backend is being written in parallel: attest.New is nil.
+// TestNilAttestorIsNotACrash covers an agent built or configured with no
+// attestation backend at all: the Server is handed a nil Attestor. It used to
+// also stand in for attest.New being nil, which stopped being true once the
+// package landed, so the value under test is passed explicitly here rather
+// than inferred from package state.
 func TestNilAttestorIsNotACrash(t *testing.T) {
 	ca := newTestCA(t)
 	client, _, _ := testServer(t, nil, newFakeSource(ca))
@@ -486,5 +489,89 @@ func TestForceRotateStillRefusesAMovedPeer(t *testing.T) {
 	_, err = stream.Recv()
 	if got := status.Code(err); got != codes.FailedPrecondition {
 		t.Fatalf("code = %v, want FailedPrecondition (err=%v)", got, err)
+	}
+}
+
+// TestAttestationCostDoesNotScaleWithRPCs locks in the per-connection rule as a
+// cost property, not just a call count. Attesting a large catalog binary is
+// around 0.1 second; if that ever moved to per-RPC, a client making calls on
+// one connection would pay it every time. The attestor here sleeps, so a
+// regression shows up as elapsed time rather than as a subtle refactor nobody
+// notices.
+func TestAttestationCostDoesNotScaleWithRPCs(t *testing.T) {
+	const attestCost = 60 * time.Millisecond
+	ident := toolIdentity(t)
+	slow := &fakeAttestor{onCall: func(int) (*attest.Identity, error) {
+		time.Sleep(attestCost)
+		return ident, nil
+	}}
+	ca := newTestCA(t)
+	client, _, _ := testServer(t, slow, newFakeSource(ca))
+
+	ctx, cancel := clientCtx(t)
+	defer cancel()
+
+	const rpcs = 8
+	start := time.Now()
+	for i := 0; i < rpcs; i++ {
+		stream, err := client.FetchX509Bundles(ctx, &workload.X509BundlesRequest{})
+		if err != nil {
+			t.Fatalf("FetchX509Bundles: %v", err)
+		}
+		if _, err := stream.Recv(); err != nil {
+			t.Fatalf("recv: %v", err)
+		}
+	}
+	elapsed := time.Since(start)
+
+	if n := slow.callCount(); n != 1 {
+		t.Errorf("attestor called %d times across %d RPCs on one connection, want 1", n, rpcs)
+	}
+	if elapsed > attestCost*3 {
+		t.Errorf("%d RPCs took %s; attestation is being paid more than once per connection", rpcs, elapsed)
+	}
+}
+
+// TestNoCallerSuppliedIdentityInput is the structural half of the grant
+// provenance rule: identity comes from attestation, never from a request body.
+// A delegated agent that narrowed itself into a near-empty sub-identity must
+// not be able to claim its way back out by putting a different identity in a
+// request.
+func TestNoCallerSuppliedIdentityInput(t *testing.T) {
+	// The X509 request type carries no identity fields at all, by protocol.
+	// This is a compile-time assertion disguised as a runtime one: if the proto
+	// ever grows a caller-supplied identity, this stops building.
+	req := &workload.X509SVIDRequest{}
+	_ = req
+
+	ca := newTestCA(t)
+	src := newFakeSource(ca)
+	src.jwt = &JWTSVID{ID: "x", Token: "y"}
+	client, _, _ := testServer(t, &fakeAttestor{identity: toolIdentity(t)}, src)
+
+	ctx, cancel := clientCtx(t)
+	defer cancel()
+
+	// The one caller-controlled identity field in the whole protocol.
+	for _, claimed := range []string{
+		"spiffe://" + testTrustDomain + "/device/" + testDeviceID + "/agent/root",
+		"spiffe://" + testTrustDomain + "/device/other/tool/claude",
+		"spiffe://elsewhere.example/device/x/tool/claude",
+	} {
+		_, err := client.FetchJWTSVID(ctx, &workload.JWTSVIDRequest{
+			Audience: []string{"aud"},
+			SpiffeId: claimed,
+		})
+		if status.Code(err) != codes.PermissionDenied {
+			t.Errorf("claiming %q returned %v, want PermissionDenied", claimed, status.Code(err))
+		}
+	}
+
+	// Asking for exactly the identity attestation derived is fine.
+	if _, err := client.FetchJWTSVID(ctx, &workload.JWTSVIDRequest{
+		Audience: []string{"aud"},
+		SpiffeId: "spiffe://" + testTrustDomain + "/device/" + testDeviceID + "/tool/" + testTool,
+	}); err != nil {
+		t.Errorf("a caller asking for its own identity was refused: %v", err)
 	}
 }

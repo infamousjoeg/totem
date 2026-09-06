@@ -141,12 +141,14 @@ func groupFingerprint(fp string) string {
 // describeFirstContact says, in words a person uses, how this device decided
 // its issuer was the right one.
 func describeFirstContact(fc workloadapi.FirstContact) string {
-	switch fc {
-	case workloadapi.FirstContactFragment:
+	if fc.Verified() {
 		return "checked automatically from your setup link"
-	case workloadapi.FirstContactPrompt:
-		return "checked by hand against your issuer's console (weaker, and recorded as such)"
-	default:
-		return "not recorded"
 	}
+	if fc == "" {
+		// A record that does not say is read as the weaker path, never the
+		// stronger one, so the easiest way to claim the strong path is not to
+		// omit the field.
+		return "not recorded, so totem assumes it was checked by hand (the weaker way)"
+	}
+	return "checked by hand against your issuer's console (weaker, and recorded as such)"
 }

@@ -64,6 +64,8 @@ func cmdDoctor(ctx context.Context, args []string) error {
 		checkKeyBackends(ctx),
 		checkDeviceKey(ctx, state),
 		checkSocket(state),
+		checkAgentIsCurrent(),
+		checkFirstContact(state),
 		checkCatalog(),
 	}
 	checks = append(checks, checkToolAnchors()...)
@@ -270,9 +272,16 @@ func checkDeviceKey(ctx context.Context, state *workloadapi.State) check {
 		}
 	}
 
-	// The presence half matters just as much and fails more quietly: a
-	// mismatch here leaves silent renewals working and every confirmation
-	// failing, which reads as a flaky sensor rather than a wrong key.
+	// The presence half gets its own message, and these two must NOT be merged
+	// into one "key mismatch" case, however tempting that looks.
+	//
+	// They fail differently, and the difference is the whole diagnostic value.
+	// A wrong DEVICE half is loud: nothing this machine signs is accepted, so
+	// it announces itself immediately. A wrong PRESENCE half is quiet in the
+	// worst way: silent half-life renewals keep working perfectly, and only
+	// the confirmations fail. That reads to a person as a flaky Touch ID
+	// sensor, and they will spend an afternoon on the sensor. Naming which key
+	// is wrong is the difference between that afternoon and one command.
 	loadedPresence := key.PresencePublic()
 	switch {
 	case loadedPresence == nil && len(state.PresencePublicDER) > 0:
@@ -309,6 +318,61 @@ func keyLabel(state *workloadapi.State) string {
 		return state.KeyLabel
 	}
 	return platform.DeviceKeyLabel
+}
+
+// checkAgentIsCurrent catches an upgrade that silently broke everything.
+//
+// The agent pins its own binary hash so it can recognise its own helpers.
+// Upgrade totem in place while the agent is running (a brew upgrade, say) and
+// the helper on disk stops matching the hash the running agent remembers, so
+// every helper connection is refused as an unknown program until the agent
+// restarts. That is the correct thing for it to do and it is baffling from the
+// outside: the tool worked, you upgraded it, and now it says it does not know
+// what you are. Naming it here is the difference between a ten second fix and
+// an afternoon.
+func checkAgentIsCurrent() check {
+	rs, err := workloadapi.LoadRuntimeStatus("")
+	if err != nil || rs == nil {
+		return check{name: "agent version", skipped: true, detail: "the agent is not running"}
+	}
+	if rs.BinaryPath == "" || rs.BinaryHash == "" {
+		return check{name: "agent version", skipped: true, detail: "the running agent did not record which copy it started from"}
+	}
+	onDisk, herr := hashFile(rs.BinaryPath)
+	if herr != nil {
+		return check{name: "agent version", skipped: true,
+			detail: "cannot read " + rs.BinaryPath + " to compare it against the running agent"}
+	}
+	if onDisk != rs.BinaryHash {
+		return check{
+			name:   "agent version",
+			detail: "totem was updated on disk while the agent was running, so the agent is still the old one",
+			fix:    "Restart the agent. Until you do, tools asking totem for identity will be told totem does not recognise them, which is correct and looks like a bug.",
+		}
+	}
+	return check{name: "agent version", ok: true, detail: "the running agent matches the totem on disk"}
+}
+
+// checkFirstContact reports how this device decided its issuer was the right
+// one. It is not a failure either way; the weaker path is recorded rather than
+// refused, exactly as a device with no presence capability is recorded rather
+// than refused. Showing it is what keeps it honest.
+func checkFirstContact(state *workloadapi.State) check {
+	if !state.Enrolled() {
+		return check{name: "issuer trust", skipped: true, detail: "not set up yet"}
+	}
+	if state.FirstContact.Verified() {
+		return check{name: "issuer trust", ok: true, detail: "checked automatically from your setup link"}
+	}
+	notes := []string{"This is the weaker way to set a device up. Your issuer operator can see it was done this way."}
+	detail := "checked by hand against your issuer's console"
+	if state.FirstContact == "" {
+		// Unrecorded resolves to the weaker path, not to a neutral third
+		// state, so an old or edited record cannot read as the strong one.
+		detail = "not recorded, so totem assumes it was checked by hand"
+		notes = append(notes, "Set this device up again if you want the stronger check on record.")
+	}
+	return check{name: "issuer trust", ok: true, detail: detail, notes: notes}
 }
 
 // checkToolAnchors reports each tool's anchor, which docs/totem-design.md

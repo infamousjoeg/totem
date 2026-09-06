@@ -17,9 +17,10 @@ import "github.com/infamousjoeg/totem/internal/presence"
 //     Secure Enclave enrollment is trust-on-first-use and the issuer has no
 //     way to tell "hardware" from a rewritten "software". Unbound, it is a
 //     lie the issuer would record permanently.
-//   - Presence and PresencePublicDER, because an enrollment that quietly lost
-//     its presence half would verify every future assertion against the wrong
-//     key and look healthy doing it.
+//   - PresencePublicDER, because an enrollment that quietly lost its presence
+//     half would verify every future assertion against the wrong key and look
+//     healthy doing it. The presence STATE is not a separate field: the key is
+//     the state, so the two can never disagree.
 //   - FirstContact, because it names the weaker path, and a field that names
 //     the weaker path is precisely the field worth rewriting to hide that it
 //     was taken.
@@ -39,20 +40,31 @@ import "github.com/infamousjoeg/totem/internal/presence"
 // shifted: ("ab","c") and ("a","bc") hash differently, and an empty field is
 // distinct from an absent one.
 //
-// This is the interim shape. presence is adding an EnrollmentInput type with
-// its own "totem/enrollment" context, and when it lands this whole function is
-// replaced by it; the field set here is what that type was specified from.
-func enrollmentRequestHash(req EnrollRequest) []byte {
-	return presence.HashRequest(
-		req.DevicePublicDER,
-		req.PresencePublicDER,
-		[]byte(req.ProtectionLevel),
-		[]byte(req.Presence),
-		[]byte(req.Hostname),
-		[]byte(req.OS),
-		[]byte(req.IssuerURL),
-		[]byte(req.IssuerFingerprint),
-		[]byte(req.FirstContact),
-		[]byte(req.BootstrapCode),
-	)
+// presence.EnrollmentInput is now the canonical encoder for all of this, with
+// its own "totem/enrollment" context. enrollmentInput below builds it from a
+// request, and it is the only place the mapping lives so the agent and the
+// issuer cannot drift.
+func enrollmentInput(req EnrollRequest) presence.EnrollmentInput {
+	in := presence.EnrollmentInput{
+		Version:           presence.EncodingVersion,
+		Challenge:         req.Challenge,
+		IssuerFingerprint: req.IssuerFingerprintBytes(),
+		DevicePublicKey:   req.DevicePublicDER,
+		PresencePublicKey: req.PresencePublicDER,
+		ProtectionLevel:   req.ProtectionLevel,
+		Hostname:          req.Hostname,
+		OS:                req.OS,
+		// OrWeakest, not a bare cast: an unset value must never be signed as
+		// the strong path. presence would refuse an empty value outright, but
+		// relying on that would make the safe outcome an accident of the other
+		// package's validation rather than a decision made here.
+		FirstContact: presence.FirstContact(req.FirstContact.OrWeakest()),
+	}
+	if req.BootstrapCode != "" {
+		// The code itself is never bound, only a hash of it bound to this
+		// challenge, so a structure that may end up in a log never carries the
+		// value that makes a device the founding admin.
+		in.BootstrapCodeHash = presence.BootstrapCodeHash(req.Challenge, req.BootstrapCode)
+	}
+	return in
 }

@@ -25,6 +25,7 @@ import (
 //	attest.ErrTooManyShellHops   -> OutOfRange         (one hop is the range)
 //	attest.ErrInterpreterWrapped -> Unimplemented      (permanent by design)
 //	attest.ErrUnsignedAtWritablePath -> Unauthenticated (no credential of its own)
+//	attest.ErrChainChanged       -> Canceled          (lifecycle, not an attack)
 //	ErrIssuerUnreachable         -> Unavailable        (retryable, not terminal)
 //	platform.ErrPresenceDenied   -> PermissionDenied   (human said no)
 func statusCodeFor(err error) codes.Code {
@@ -44,6 +45,16 @@ func statusCodeFor(err error) codes.Code {
 		// being refused a permission it might otherwise have, it has failed to
 		// present anything totem can authenticate it by at all.
 		return codes.Unauthenticated
+	case errors.Is(err, attest.ErrChainChanged):
+		// Canceled, because this is a lifecycle event rather than a refusal:
+		// the process that connected is still itself, but the tool or the
+		// shell above it exited and the helper was reparented, so the walk no
+		// longer reaches the tool that vouched for it. Giving it a code
+		// distinct from every rejection is the point. An operator reading a
+		// log has to be able to tell "a helper outlived its shell" from "an
+		// untrusted program tried to get credentials", and before this existed
+		// the two collapsed into the same catalog miss.
+		return codes.Canceled
 	case errors.Is(err, platform.ErrPresenceDenied):
 		return codes.PermissionDenied
 	case errors.Is(err, platform.ErrPresenceUnavailable):
@@ -79,6 +90,8 @@ func reasonFor(err error) string {
 		return "interpreter_wrapped"
 	case errors.Is(err, attest.ErrUnsignedAtWritablePath):
 		return "unsigned_at_writable_path"
+	case errors.Is(err, attest.ErrChainChanged):
+		return "chain_changed"
 	case errors.Is(err, platform.ErrPresenceDenied):
 		return "presence_denied"
 	case errors.Is(err, platform.ErrPresenceUnavailable):
@@ -104,7 +117,10 @@ func reasonFor(err error) string {
 // last-error file, and the gRPC status can never disagree.
 func Retryable(err error) bool {
 	switch {
-	case errors.Is(err, ErrIssuerUnreachable), errors.Is(err, attest.ErrPIDReused):
+	case errors.Is(err, ErrIssuerUnreachable), errors.Is(err, attest.ErrPIDReused), errors.Is(err, attest.ErrChainChanged):
+		// A chain that changed is retryable in the same sense a reused pid is:
+		// nothing is wrong with the caller, the connection just has to be
+		// established again from a process whose parent is still there.
 		return true
 	default:
 		return false
@@ -133,6 +149,8 @@ func humanRefusal(err error, ident *attest.Identity) string {
 		return who + " reached totem through more than one shell, so totem cannot tell what actually asked."
 	case errors.Is(err, attest.ErrInterpreterWrapped):
 		return who + " runs as a script under an interpreter, which any program running as you can rewrite, so totem will not identify it."
+	case errors.Is(err, attest.ErrChainChanged):
+		return "the program that started " + who + " has since exited, so totem can no longer see what asked for this."
 	case errors.Is(err, attest.ErrUnsignedAtWritablePath):
 		return who + " carries no signature totem can trace back to its maker, and it sits somewhere any program running as you could replace it, so totem has no way to know it is still the program you installed."
 	case errors.Is(err, platform.ErrPresenceDenied):
@@ -177,6 +195,8 @@ func fixFor(err error, ident *attest.Identity) string {
 		return "Call the helper directly instead of through a wrapper script. 'totem doctor' prints the chain totem walked."
 	case errors.Is(err, attest.ErrInterpreterWrapped):
 		return "Install the native build of " + tool + " and run 'totem init' again. There is no flag that turns this off."
+	case errors.Is(err, attest.ErrChainChanged):
+		return "Nothing is wrong. Run the command again from " + tool + " and it will reconnect."
 	case errors.Is(err, attest.ErrUnsignedAtWritablePath):
 		return "Install the build " + tool + "'s maker signs, or put it somewhere only an administrator can write to, then run 'totem init' again. A locally built or ad-hoc signed copy cannot be identified and there is no flag that turns this off."
 	case errors.Is(err, platform.ErrPresenceDenied):

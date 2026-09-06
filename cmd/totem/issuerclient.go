@@ -175,11 +175,6 @@ type EnrollRequest struct {
 	// issuer verifies presence assertions against this one, including the
 	// enrollment signature below. It is nil only when Presence is "none".
 	PresencePublicDER []byte `json:"presence_public_der,omitempty"`
-	// Presence is the presence state this device is enrolling at. A device
-	// with no way to check for a human enrolls at "none", recorded and carried
-	// on the identity, and exchanges still work; it is never inflated to make
-	// an enrollment look better than it is.
-	Presence presence.State `json:"presence"`
 	// ProtectionLevel is the true assurance of the device key.
 	ProtectionLevel spiffe.ProtectionLevel `json:"protection_level"`
 	// Hostname and OS are shown to the human approving this device.
@@ -189,13 +184,8 @@ type EnrollRequest struct {
 	// the signature below is bound to, and the issuer can recompute it, so the
 	// signature cannot be lifted onto a different device's enrollment.
 	DeviceFingerprint string `json:"device_fingerprint"`
-	// SignedTool and SignedTarget are the other two fields bound into the
-	// signature, so the issuer reconstructs the exact signed bytes rather than
-	// trusting an encoding the caller supplied.
-	SignedTool   string `json:"signed_tool"`
-	SignedTarget string `json:"signed_target"`
-	// EncodingVersion is the presence encoding version the signature was made
-	// under.
+	// EncodingVersion is the presence encoding version the signatures were
+	// made under.
 	EncodingVersion uint8 `json:"encoding_version"`
 	// IssuerURL is the issuer this device believes it enrolled with.
 	IssuerURL string `json:"issuer_url"`
@@ -214,15 +204,17 @@ type EnrollRequest struct {
 	FirstContact workloadapi.FirstContact `json:"first_contact"`
 	// Challenge is the issuer-minted, single-use value that was signed.
 	Challenge []byte `json:"challenge"`
-	// RequestHash binds everything above into the signature and is what the
-	// human-visible request code is derived from. The issuer recomputes it
-	// from the fields of this request; see enrollmentRequestHash for the
-	// canonical order.
-	RequestHash []byte `json:"request_hash"`
-	// Signature is over the canonical enrollment signing bytes, from the
-	// presence key when the device has one and from the device key when it is
-	// enrolling at presence "none".
+	// Signature is the device key's proof of possession over the canonical
+	// enrollment bytes (presence.SignEnrollment). The issuer re-encodes those
+	// bytes from the fields of this request and verifies with
+	// presence.VerifyEnrollment, so nothing here is trusted as supplied.
 	Signature []byte `json:"signature"`
+	// PresenceAssertion is the separate assertion proving a human was present,
+	// signed by the PRESENCE half over the enrollment digest. It is absent
+	// exactly when Presence is "none". Two signatures rather than one because
+	// they prove different things with different keys: possession of the
+	// device key, and a person being there.
+	PresenceAssertion []byte `json:"presence_assertion,omitempty"`
 	// BootstrapCode is the one-time code from `totem-issuer init`, redeemed by
 	// the founding device.
 	BootstrapCode string `json:"bootstrap_code,omitempty"`
@@ -537,4 +529,32 @@ func observeIssuerCertificate(ctx context.Context, issuerURL string) (fingerprin
 	leaf := state.PeerCertificates[0]
 	sum := sha256.Sum256(leaf.Raw)
 	return hex.EncodeToString(sum[:]), string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leaf.Raw})), nil
+}
+
+// PresenceState is the presence state this device is enrolling at, DERIVED
+// from whether it submitted a presence public half rather than stated
+// separately.
+//
+// It is derived on purpose. presence.EnrollmentInput binds the presence key
+// and does not carry a presence state field, because the key IS the state: a
+// device that submitted one can be asked to confirm, and a device that did not
+// cannot. A separate signed-alongside "presence: none" flag could disagree
+// with the key that was actually enrolled, and the whole reason PresencePublic
+// exists is that a disagreement between those two fails silently and forever.
+// One source of truth, and it is the one under the signature.
+func (r EnrollRequest) PresenceState() presence.State {
+	if len(r.PresencePublicDER) > 0 {
+		return presence.StatePresent
+	}
+	return presence.StateNone
+}
+
+// IssuerFingerprintBytes is the pinned issuer fingerprint as raw bytes, which
+// is the form presence.EnrollmentInput binds.
+func (r EnrollRequest) IssuerFingerprintBytes() []byte {
+	b, err := hex.DecodeString(r.IssuerFingerprint)
+	if err != nil {
+		return nil
+	}
+	return b
 }

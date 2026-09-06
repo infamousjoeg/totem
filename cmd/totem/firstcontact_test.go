@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/infamousjoeg/totem/internal/presence"
+	"github.com/infamousjoeg/totem/internal/spiffe"
 	"github.com/infamousjoeg/totem/internal/workloadapi"
 )
 
@@ -195,16 +197,114 @@ func TestFingerprintFlagIsRecordedAsThePinnedPath(t *testing.T) {
 // the two paths must not become indistinguishable after the fact, so the fact
 // reaches the issuer and is bound into the signature.
 func TestFirstContactTravelsToTheIssuer(t *testing.T) {
-	for _, fc := range []workloadapi.FirstContact{workloadapi.FirstContactFragment, workloadapi.FirstContactPrompt} {
-		req := EnrollRequest{DevicePublicDER: []byte("d"), FirstContact: fc}
-		other := req
-		if fc == workloadapi.FirstContactFragment {
-			other.FirstContact = workloadapi.FirstContactPrompt
-		} else {
-			other.FirstContact = workloadapi.FirstContactFragment
+	base := EnrollRequest{
+		DevicePublicDER:   []byte("d"),
+		ProtectionLevel:   spiffe.ProtectionHardware,
+		Hostname:          "laptop",
+		OS:                "darwin",
+		IssuerFingerprint: testFingerprint,
+		Challenge:         make([]byte, presence.ChallengeSize),
+	}
+	digestFor := func(fc workloadapi.FirstContact) []byte {
+		r := base
+		r.FirstContact = fc
+		d, err := enrollmentInput(r).Digest()
+		if err != nil {
+			t.Fatalf("digest: %v", err)
 		}
-		if bytes.Equal(enrollmentRequestHash(req), enrollmentRequestHash(other)) {
-			t.Fatal("how first contact happened is not bound into the signature, so it can be relabelled in transit")
-		}
+		return d
+	}
+	if bytes.Equal(digestFor(workloadapi.FirstContactFragment), digestFor(workloadapi.FirstContactPrompt)) {
+		t.Fatal("how first contact happened is not bound into the signature, so it can be relabelled in transit")
+	}
+}
+
+// TestUnrecordedFirstContactReadsAsTheWeakerPath is the fail-safe direction.
+// An enrollment record written by an older build, truncated by a crash, or
+// edited by hand says nothing about how first contact happened. It must read
+// as the prompt path, never the fragment path, or the easiest way to claim the
+// strong path becomes omitting the field.
+func TestUnrecordedFirstContactReadsAsTheWeakerPath(t *testing.T) {
+	var unset workloadapi.FirstContact
+
+	if unset.Verified() {
+		t.Fatal("an unrecorded first contact reported itself as verified")
+	}
+	if got := unset.OrWeakest(); got != workloadapi.FirstContactPrompt {
+		t.Fatalf("unrecorded resolves to %q, want %q", got, workloadapi.FirstContactPrompt)
+	}
+	if !workloadapi.FirstContactFragment.Verified() {
+		t.Error("the fragment path must report as verified")
+	}
+	if workloadapi.FirstContactPrompt.Verified() {
+		t.Error("the prompt path must not report as verified")
+	}
+
+	// A value nobody defined is also weak, not strong. Anything that is not
+	// exactly the fragment is the fallback.
+	if workloadapi.FirstContact("something-else").Verified() {
+		t.Error("an unrecognised first contact value reported as verified")
+	}
+	if got := workloadapi.FirstContact("something-else").OrWeakest(); got != workloadapi.FirstContactPrompt {
+		t.Errorf("an unrecognised value resolves to %q, want the weaker path", got)
+	}
+
+	// What a human is told must not present the gap as neutral.
+	said := describeFirstContact(unset)
+	if !strings.Contains(said, "weaker") {
+		t.Errorf("an unrecorded first contact is described as %q, which does not say it is the weaker path", said)
+	}
+
+	// And doctor must not report it as the strong path either.
+	got := checkFirstContact(&workloadapi.State{
+		TrustDomain: "issuer.example", DeviceID: "d", IssuerFingerprint: testFingerprint,
+	})
+	if strings.Contains(got.detail, "automatically") {
+		t.Errorf("doctor reports an unrecorded first contact as the automatic check: %q", got.detail)
+	}
+}
+
+// TestUnrecordedFirstContactIsNeverSignedAsTheStrongPath: the value that goes
+// under the enrollment signature is resolved before signing, so an unset field
+// cannot become "fragment" on the wire.
+func TestUnrecordedFirstContactIsNeverSignedAsTheStrongPath(t *testing.T) {
+	base := EnrollRequest{
+		DevicePublicDER:   []byte("device"),
+		ProtectionLevel:   spiffe.ProtectionHardware,
+		Hostname:          "laptop",
+		OS:                "darwin",
+		IssuerFingerprint: testFingerprint,
+		Challenge:         make([]byte, presence.ChallengeSize),
+	}
+
+	unset := base // FirstContact deliberately not set
+	if got := enrollmentInput(unset).FirstContact; got != presence.FirstContactPrompt {
+		t.Fatalf("an unset first contact was signed as %q, want %q", got, presence.FirstContactPrompt)
+	}
+
+	// It must also be byte-identical to an explicit prompt, so the two cannot
+	// be told apart after the fact and neither can be relabelled.
+	explicit := base
+	explicit.FirstContact = workloadapi.FirstContactPrompt
+	unsetDigest, err := enrollmentInput(unset).Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	explicitDigest, err := enrollmentInput(explicit).Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(unsetDigest, explicitDigest) {
+		t.Error("an unset first contact signs differently from an explicit prompt; they must be the same weak claim")
+	}
+
+	strong := base
+	strong.FirstContact = workloadapi.FirstContactFragment
+	strongDigest, err := enrollmentInput(strong).Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(strongDigest, unsetDigest) {
+		t.Fatal("the strong path signs identically to an unset one")
 	}
 }

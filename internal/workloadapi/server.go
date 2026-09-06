@@ -21,6 +21,44 @@ import (
 	tspiffe "github.com/infamousjoeg/totem/internal/spiffe"
 )
 
+// What a stock go-spiffe client actually requires of this server.
+//
+// These are the non-obvious ones, written down because each cost real time to
+// find and none of them is stated anywhere a reader of this file would look.
+// If any of them regresses, the conformance suite fails in a way that points
+// at the client rather than at us.
+//
+//  1. Every call carries the metadata header workload.spiffe.io: true, and the
+//     server MUST reject a request without it. go-spiffe sets it on every call
+//     via metadata.Pairs; see requireSecurityHeader below.
+//
+//  2. X509SvidKey must be UNENCRYPTED PKCS#8 DER and X509Svid must be a
+//     CONCATENATED DER chain, leaf first, with no PEM and no padding between
+//     certificates. The client hands both straight to x509svid.ParseRaw, which
+//     calls x509.ParseCertificates and x509.ParsePKCS8PrivateKey on the raw
+//     bytes. PEM anywhere in either field fails to parse.
+//
+//  3. The per-SVID Bundle field is MANDATORY, not optional, even though the
+//     proto marks it as just another field. The client derives each bundle's
+//     trust domain from that SVID's spiffe_id (parseX509Bundle calls
+//     spiffeid.TrustDomainFromString on it), so an X509SVIDResponse without a
+//     bundle breaks FetchX509Context and X509Source while FetchX509SVID alone
+//     still appears to work. That asymmetry is what makes it hard to spot.
+//
+//  4. X509BundlesResponse.Bundles is keyed by the trust domain's full SPIFFE
+//     ID ("spiffe://example.org"), NOT by the bare trust domain name. The same
+//     is true of FederatedBundles and of the JWT bundle map.
+//
+//  5. FetchX509SVID is a STREAM the client holds open, not a one-shot.
+//     X509Source and WatchX509Context block on Recv and expect an unprompted
+//     second message on rotation. A server that sends once and returns looks
+//     correct in a single fetch and then never rotates anybody.
+//
+//  6. The client dials with insecure transport credentials, so server-side
+//     credentials must return the raw connection unchanged rather than
+//     attempting any negotiation. See Credentials in attestconn.go, which uses
+//     the handshake purely as a place to publish the attested connection.
+//
 // SecurityHeader is the metadata header the SPIFFE Workload API requires on
 // every request. go-spiffe's client sets it on every call
 // (metadata.Pairs("workload.spiffe.io", "true")), and the spec requires the
@@ -214,6 +252,19 @@ func requireSecurityHeader(ctx context.Context) error {
 // derived SPIFFE ID. It is the single default-deny gate: every handler starts
 // here, and a caller that did not attest to a catalog tool leaves with a
 // legible status and no identity.
+//
+// It reads the attestation the LISTENER already performed; it never attests.
+// That matters for more than tidiness: attesting the Claude binary is a SHA-256
+// plus a page-hash pass over roughly 200MB, about 0.1 second. Once per
+// connection that is invisible. Per RPC it would be ruinous, and a client
+// holding an X509-SVID stream open makes many calls on one connection. The
+// only other place attestation happens is Conn.Reattest, on renewal, which is
+// required by the spec and is bounded by the renewal interval rather than by
+// call volume.
+//
+// The identity returned here is also the ONLY source of who the caller is.
+// Nothing a caller puts in a request body contributes to it: see the note on
+// Source about grant provenance.
 func (s *Server) callerIdentity(ctx context.Context) (*Conn, *attest.Identity, Derived, error) {
 	conn, ok := ConnFromContext(ctx)
 	if !ok {
@@ -329,6 +380,10 @@ func (s *Server) FetchJWTSVID(ctx context.Context, req *workload.JWTSVIDRequest)
 	if len(req.GetAudience()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "this request did not say what it wants the identity for. Ask for at least one audience.")
 	}
+	// The requested SPIFFE ID is a caller-supplied string, so it is checked
+	// against the derived identity rather than trusted. A caller may ask for
+	// the identity it already has, and nothing else; asking for another one is
+	// a refusal, not a hint.
 	if want := req.GetSpiffeId(); want != "" && want != derived.String() {
 		return nil, status.Errorf(codes.PermissionDenied,
 			"%s asked for an identity it is not entitled to. On this device it is %s. Run 'totem status' to see what each program gets.",

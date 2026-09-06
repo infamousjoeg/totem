@@ -71,8 +71,15 @@ type Event struct {
 }
 
 // EventFor builds a log event carrying every fact attestation established
-// about a caller. It is the single place the audit line is assembled, so a
-// field cannot be recorded on a refusal and forgotten on an issuance.
+// about a caller.
+//
+// It is the SINGLE place an audit line is assembled, and it needs to stay that
+// way. Constructing Event literals at each call site is how an audit record
+// rots: somebody adds a field, records it on the refusal path where they were
+// working, and the issuance path silently keeps writing lines without it. The
+// gap is invisible until an incident, when the lines you most need turn out to
+// be the ones missing the field. One constructor means a new fact is either on
+// every line or on none, which is a difference a reader can see.
 func EventFor(kind string, ident *attest.Identity, err error) Event {
 	ev := Event{Kind: kind}
 	if ident != nil {

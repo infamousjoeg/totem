@@ -150,14 +150,17 @@ func cmdEnroll(ctx context.Context, args []string) error {
 		}
 	}
 
-	// Everything the issuer will be asked to stand behind gets bound into the
-	// signature, not just the challenge. enrollmentRequestHash is the one
-	// canonical order both sides use; see its doc comment for why each field
-	// is in there.
+	// Everything the issuer will be asked to stand behind is bound into the
+	// signature, not just the challenge. presence.EnrollmentInput is the
+	// canonical encoder; see enrollmentInput for the request-to-input mapping
+	// and presence/enroll.go for why each field is in there.
+	if len(challenge.Challenge) != presence.ChallengeSize {
+		return failf("Ask your issuer operator whether the issuer is running a version totem understands.",
+			"your issuer sent something totem cannot sign safely.")
+	}
 	req := EnrollRequest{
 		DevicePublicDER:   devicePub,
 		PresencePublicDER: presencePub,
-		Presence:          presenceState,
 		ProtectionLevel:   key.ProtectionLevel(),
 		Hostname:          hostname,
 		OS:                runtime.GOOS,
@@ -166,48 +169,64 @@ func cmdEnroll(ctx context.Context, args []string) error {
 		IssuerFingerprint: addr.FingerprintHex,
 		FirstContact:      addr.FirstContact,
 		BootstrapCode:     *code,
-		SignedTool:        "totem",
-		SignedTarget:      addr.URL,
 		EncodingVersion:   presence.EncodingVersion,
 		Challenge:         challenge.Challenge,
 	}
-	if len(challenge.Challenge) != presence.ChallengeSize {
+	in := enrollmentInput(req)
+
+	// The device key's proof of possession. No human needed for this one: it
+	// proves the device holds the key it is asking the issuer to enrol, and
+	// nothing more.
+	if req.Signature, err = presence.SignEnrollment(ctx, key, in); err != nil {
+		return failf("Run 'totem doctor' for what this machine can do.",
+			"totem could not use this device's key: %v", err)
+	}
+
+	digest, err := in.Digest()
+	if err != nil {
 		return failf("Ask your issuer operator whether the issuer is running a version totem understands.",
-			"your issuer sent something totem cannot sign safely.")
-	}
-	req.RequestHash = enrollmentRequestHash(req)
-
-	// The signed bytes go through presence's canonical encoder rather than
-	// being the raw challenge. Every signature in totem is domain-separated: a
-	// fixed context string plus a version byte plus length-prefixed fields, so
-	// a signature made to enroll a device cannot be replayed as a signature
-	// made for anything else, and no field boundary can be shifted.
-	signing := presence.SigningInput{
-		DeviceID:    fingerprintHex,
-		Tool:        req.SignedTool,
-		Target:      req.SignedTarget,
-		Challenge:   challenge.Challenge,
-		RequestHash: req.RequestHash,
+			"totem could not prepare this device's enrollment: %v", err)
 	}
 
-	var sig []byte
 	if presenceState == presence.StatePresent {
 		// The code goes on screen BEFORE the prompt, so the human has
-		// something to compare the OS dialog against. It has to come from
-		// presence.RequestCode over the issuer-minted challenge and this
-		// request's hash, which is the same call presence.Sign makes to fill
-		// the prompt: a code derived any other way, or from the request alone,
-		// can be precomputed offline by anything running as this user, and a
-		// code that can be precomputed is not a check.
+		// something to compare the OS dialog against. It comes from
+		// presence.EnrollmentCode, which derives it from the issuer-minted
+		// challenge and the enrollment digest: a code derived from the request
+		// alone could be precomputed offline by anything running as this user,
+		// and a code that can be precomputed is not a check.
+		codeText, cerr := presence.EnrollmentCode(in)
+		if cerr != nil {
+			return failf("Ask your issuer operator whether the issuer is running a version totem understands.",
+				"totem could not prepare this device's enrollment: %v", cerr)
+		}
 		fmt.Println()
-		fmt.Printf("  This request's code is %s\n", presence.RequestCode(challenge.Challenge, req.RequestHash))
+		fmt.Printf("  This request's code is %s\n", codeText)
 		fmt.Println("  Confirm it's you to finish setting this device up.")
 		fmt.Println("  The prompt should show that same code. If it shows a different one, say no.")
 
-		assertion, aerr := presence.Sign(ctx, key, signing)
+		// The separate assertion that a human was actually there, signed by
+		// the presence half over the same digest. Two signatures because they
+		// prove two different things: the one above proves this device holds
+		// the key, this one proves a person approved it.
+		//
+		// It reuses the SAME issuer-minted challenge as the enrollment, on
+		// purpose. Both signatures then provably belong to one enrollment
+		// attempt: with two challenges an attacker could pair a device
+		// signature from one attempt with a presence assertion from another,
+		// and nothing in either signature would contradict it. The assertion
+		// is bound twice over here, by the shared challenge and by
+		// RequestHash being this enrollment's digest.
+		assertion, aerr := presence.Sign(ctx, key, presence.SigningInput{
+			DeviceID:    fingerprintHex,
+			Tool:        "totem",
+			Target:      addr.URL,
+			Challenge:   challenge.Challenge,
+			RequestHash: digest,
+		})
 		switch {
 		case aerr == nil:
-			sig = assertion.Signature
+			req.PresenceAssertion = assertion.Signature
 		case errors.Is(aerr, platform.ErrPresenceDenied):
 			return failf("Run 'totem enroll' again and approve the prompt within 60 seconds.",
 				"the confirmation was declined or timed out, so nothing was set up.")
@@ -225,25 +244,11 @@ func cmdEnroll(ctx context.Context, args []string) error {
 		// No presence capability anywhere on this device. It still enrolls and
 		// exchanges still work; the level is recorded honestly and travels on
 		// every identity, so a target that needs a person present will refuse
-		// this device rather than being fooled by it.
+		// this device rather than being fooled by it. There is no presence
+		// assertion, and its absence is what says so.
 		fmt.Println("This device has no way to confirm a person is present, so that is recorded as part of its setup.")
 		fmt.Println("Targets that require a person will refuse it. Everything else works.")
-		signed, berr := signing.Bytes()
-		if berr != nil {
-			return failf("Ask your issuer operator whether the issuer is running a version totem understands.",
-				"totem could not prepare this device's enrollment: %v", berr)
-		}
-		if sig, err = key.Sign(ctx, signed, platform.Prompt{
-			Required: false,
-			Tool:     req.SignedTool,
-			Target:   req.SignedTarget,
-			DeviceID: fingerprintHex,
-		}); err != nil {
-			return failf("Run 'totem doctor' for what this machine can do.",
-				"totem could not use this device's key: %v", err)
-		}
 	}
-	req.Signature = sig
 
 	resp, err := client.Enroll(ctx, req)
 	if err != nil {

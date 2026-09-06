@@ -55,6 +55,9 @@ func cmdStatus(_ context.Context, args []string) error {
 	fmt.Printf("  address:       %s\n", orDash(state.IssuerURL))
 	fmt.Printf("  verified as:   %s\n", orDash(shortFingerprint(state.IssuerFingerprint)))
 	fmt.Printf("  last reached:  %s\n", whenOrNever(state.LastIssuerContact))
+	if state.Enrolled() {
+		fmt.Printf("  checked:       %s\n", describeFirstContact(state.FirstContact))
+	}
 	fmt.Println()
 
 	rs, err := workloadapi.LoadRuntimeStatus("")

@@ -23,6 +23,7 @@ func TestEveryRefusalTellsAHuman(t *testing.T) {
 		attest.ErrTooManyShellHops,
 		attest.ErrInterpreterWrapped,
 		attest.ErrUnsignedAtWritablePath,
+		attest.ErrChainChanged,
 		platform.ErrPresenceDenied,
 		platform.ErrPresenceUnavailable,
 		ErrIssuerUnreachable,
@@ -72,6 +73,7 @@ func TestAttestErrorsGetDistinctCodes(t *testing.T) {
 		attest.ErrTooManyShellHops,
 		attest.ErrInterpreterWrapped,
 		attest.ErrUnsignedAtWritablePath,
+		attest.ErrChainChanged,
 	} {
 		c := statusCodeFor(err)
 		if prev, ok := seen[c]; ok {

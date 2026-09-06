@@ -226,3 +226,96 @@ func TestListenerLogsRefusals(t *testing.T) {
 	}
 	_ = os.Remove(logPath)
 }
+
+// recheckingAttestor implements attest.Rechecker, which is the path the
+// Workload API is supposed to take on renewal: re-read the start time and
+// re-walk, rather than redo the whole 0.1-second attestation.
+type recheckingAttestor struct {
+	fakeAttestor
+	rechecks  int
+	recheckFn func(n int) error
+}
+
+func (r *recheckingAttestor) Recheck(_ context.Context, id *attest.Identity) error {
+	r.mu.Lock()
+	r.rechecks++
+	n := r.rechecks
+	r.mu.Unlock()
+	if id == nil {
+		return errors.New("Recheck was handed no identity")
+	}
+	if r.recheckFn != nil {
+		return r.recheckFn(n)
+	}
+	return nil
+}
+
+// TestReattestPrefersRecheck: when the attestor offers the cheap renewal path,
+// renewal must use it and must not redo the full attestation.
+func TestReattestPrefersRecheck(t *testing.T) {
+	ident := toolIdentity(t)
+	att := &recheckingAttestor{fakeAttestor: fakeAttestor{identity: ident}}
+	lis, _ := dialPair(t, att)
+	c, err := lis.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+
+	got, err := c.(*Conn).Reattest(context.Background())
+	if err != nil {
+		t.Fatalf("Reattest: %v", err)
+	}
+	if got != ident {
+		t.Error("Reattest returned a different identity for an unchanged peer")
+	}
+	if att.rechecks != 1 {
+		t.Errorf("Recheck called %d times, want 1", att.rechecks)
+	}
+	if n := att.callCount(); n != 1 {
+		t.Errorf("full attestation ran %d times, want 1 (accept only); renewal must use the cheap path", n)
+	}
+}
+
+// TestReattestSurfacesAChangedChain: a helper whose shell exited is a normal
+// lifecycle event, and it has to reach the caller as its own status rather
+// than collapsing into "we do not know this program".
+func TestReattestSurfacesAChangedChain(t *testing.T) {
+	att := &recheckingAttestor{
+		fakeAttestor: fakeAttestor{identity: toolIdentity(t)},
+		recheckFn:    func(int) error { return attest.ErrChainChanged },
+	}
+	lis, _ := dialPair(t, att)
+	c, _ := lis.Accept()
+
+	_, err := c.(*Conn).Reattest(context.Background())
+	if !errors.Is(err, attest.ErrChainChanged) {
+		t.Fatalf("err = %v, want ErrChainChanged", err)
+	}
+	if !Retryable(err) {
+		t.Error("a changed chain is a lifecycle event; reconnecting is the fix, so it must be retryable")
+	}
+	if errors.Is(err, attest.ErrNotInCatalog) {
+		t.Error("a changed chain collapsed into a catalog miss; an operator cannot tell a normal exit from an attack")
+	}
+}
+
+// TestReattestFallsBackWithoutRechecker: an Attestor written against the plain
+// interface still gets the spec's renewal guarantee rather than silently
+// getting none.
+func TestReattestFallsBackWithoutRechecker(t *testing.T) {
+	first := toolIdentity(t)
+	moved := toolIdentity(t)
+	moved.Peer.StartTime = first.Peer.StartTime.Add(time.Second)
+
+	att := &fakeAttestor{onCall: func(n int) (*attest.Identity, error) {
+		if n == 1 {
+			return first, nil
+		}
+		return moved, nil
+	}}
+	lis, _ := dialPair(t, att)
+	c, _ := lis.Accept()
+	if _, err := c.(*Conn).Reattest(context.Background()); !errors.Is(err, attest.ErrPIDReused) {
+		t.Fatalf("err = %v, want ErrPIDReused from the fallback comparison", err)
+	}
+}

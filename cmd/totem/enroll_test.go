@@ -285,8 +285,8 @@ func TestEnrollSubmitsBothPublicHalves(t *testing.T) {
 	if bytes.Equal(got.DevicePublicDER, got.PresencePublicDER) {
 		t.Error("both halves were submitted as the same key")
 	}
-	if got.Presence != presence.StatePresent {
-		t.Errorf("presence = %q, want %q", got.Presence, presence.StatePresent)
+	if got.PresenceState() != presence.StatePresent {
+		t.Errorf("presence = %q, want %q", got.PresenceState(), presence.StatePresent)
 	}
 
 	// The enrollment record keeps both halves so doctor can compare later.
@@ -319,8 +319,8 @@ func TestEnrollRecordsPresenceNoneHonestly(t *testing.T) {
 	if err := cmdEnroll(context.Background(), []string{"https://issuer.example#sha256:" + testFingerprint}); err != nil {
 		t.Fatalf("a device with no presence capability must still enroll: %v", err)
 	}
-	if got.Presence != presence.StateNone {
-		t.Errorf("presence = %q, want %q recorded on the enrollment", got.Presence, presence.StateNone)
+	if got.PresenceState() != presence.StateNone {
+		t.Errorf("presence = %q, want %q recorded on the enrollment", got.PresenceState(), presence.StateNone)
 	}
 	if len(got.PresencePublicDER) != 0 {
 		t.Error("a presence public half was submitted for a device that has none")
@@ -366,34 +366,50 @@ func TestEnrollSignsDomainSeparatedBytes(t *testing.T) {
 
 	// The canonical encoding must verify, reconstructed from the fields the
 	// request carries, which is exactly what the issuer will do.
-	// The issuer recomputes the request hash from the fields it received; if
-	// any of them were rewritten in transit, this reconstruction diverges and
-	// the signature stops verifying. That is the point of binding them.
-	if !bytes.Equal(got.RequestHash, enrollmentRequestHash(got)) {
-		t.Fatal("the request hash is not recomputable from the fields the enrollment carries")
+	// The issuer re-encodes the signed bytes from the fields it received and
+	// verifies. If any field were rewritten in transit the reconstruction
+	// diverges and the signature stops verifying, which is the whole point of
+	// binding them. This is exactly presence.VerifyEnrollment, the call the
+	// issuer will make.
+	in := enrollmentInput(got)
+	device, presenceKey, verr := presence.VerifyEnrollment(in, got.Signature)
+	if verr != nil {
+		t.Fatalf("the issuer cannot verify this enrollment from the fields it carries: %v", verr)
 	}
-	in := presence.SigningInput{
-		Version:     got.EncodingVersion,
-		DeviceID:    got.DeviceFingerprint,
-		Tool:        got.SignedTool,
-		Target:      got.SignedTarget,
-		Challenge:   got.Challenge,
-		RequestHash: got.RequestHash,
+	if !device.Equal(&k.device.PublicKey) {
+		t.Error("the verified device key is not this device's key")
 	}
-	signed, err := in.Bytes()
+	if presenceKey == nil || !presenceKey.Equal(&k.presence.PublicKey) {
+		t.Error("the verified presence key is not this device's presence key")
+	}
+
+	// The separate assertion proving a human was there is signed by the
+	// PRESENCE half over the enrollment digest.
+	digest, err := in.Digest()
 	if err != nil {
-		t.Fatalf("canonical bytes: %v", err)
+		t.Fatal(err)
 	}
-	digest := sha256.Sum256(signed)
-	if !ecdsa.VerifyASN1(&k.device.PublicKey, digest[:], got.Signature) {
-		t.Fatal("the issuer cannot reconstruct the signed bytes from the fields the enrollment carries")
+	if len(got.PresenceAssertion) == 0 {
+		t.Fatal("no assertion that a human was present was submitted")
+	}
+	assertionBytes, err := presence.SigningInput{
+		Version:     presence.EncodingVersion,
+		DeviceID:    got.DeviceFingerprint,
+		Tool:        "totem",
+		Target:      got.IssuerURL,
+		Challenge:   got.Challenge,
+		RequestHash: digest,
+	}.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertionDigest := sha256.Sum256(assertionBytes)
+	if !ecdsa.VerifyASN1(&k.device.PublicKey, assertionDigest[:], got.PresenceAssertion) {
+		t.Fatal("the presence assertion does not verify over the enrollment digest")
 	}
 
 	if got.DeviceFingerprint != hex.EncodeToString(hashPublicKey(got.DevicePublicDER)) {
-		t.Error("the fingerprint bound into the signature is not derived from the submitted device key, so the signature could be lifted onto another enrollment")
-	}
-	if got.SignedTarget != "https://issuer.example" {
-		t.Errorf("signed target = %q; the signature is not bound to this issuer", got.SignedTarget)
+		t.Error("the fingerprint is not derived from the submitted device key, so it could be lifted onto another enrollment")
 	}
 }
 
@@ -405,7 +421,6 @@ func TestEnrollmentBindingCoversEveryClaim(t *testing.T) {
 	base := EnrollRequest{
 		DevicePublicDER:   []byte("device"),
 		PresencePublicDER: []byte("presence"),
-		Presence:          presence.StatePresent,
 		ProtectionLevel:   spiffe.ProtectionHardware,
 		Hostname:          "laptop",
 		OS:                "darwin",
@@ -413,26 +428,42 @@ func TestEnrollmentBindingCoversEveryClaim(t *testing.T) {
 		IssuerFingerprint: testFingerprint,
 		FirstContact:      workloadapi.FirstContactFragment,
 		BootstrapCode:     "ABC-123",
+		Challenge:         make([]byte, presence.ChallengeSize),
 	}
-	original := enrollmentRequestHash(base)
+	originalInput := enrollmentInput(base)
+	original, err := originalInput.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	tamper := map[string]func(*EnrollRequest){
 		"device public half":   func(r *EnrollRequest) { r.DevicePublicDER = []byte("other") },
 		"presence public half": func(r *EnrollRequest) { r.PresencePublicDER = []byte("other") },
-		"presence state":       func(r *EnrollRequest) { r.Presence = presence.StateNone },
-		"protection level":     func(r *EnrollRequest) { r.ProtectionLevel = spiffe.ProtectionSoftware },
-		"hostname":             func(r *EnrollRequest) { r.Hostname = "someone-elses-laptop" },
-		"os":                   func(r *EnrollRequest) { r.OS = "linux" },
-		"issuer url":           func(r *EnrollRequest) { r.IssuerURL = "https://attacker.example" },
-		"issuer fingerprint":   func(r *EnrollRequest) { r.IssuerFingerprint = strings.Repeat("ff", 32) },
-		"first contact":        func(r *EnrollRequest) { r.FirstContact = workloadapi.FirstContactPrompt },
-		"bootstrap code":       func(r *EnrollRequest) { r.BootstrapCode = "STOLEN-CODE" },
+		// The presence STATE is not a separate field; dropping the presence
+		// key is how a device says it has none, and that is covered above.
+
+		"protection level": func(r *EnrollRequest) { r.ProtectionLevel = spiffe.ProtectionSoftware },
+		"hostname":         func(r *EnrollRequest) { r.Hostname = "someone-elses-laptop" },
+		"os":               func(r *EnrollRequest) { r.OS = "linux" },
+		// IssuerURL deliberately is NOT bound: an address is not an identity,
+		// and the fingerprint below is what actually names the issuer. Binding
+		// the URL too would make a legitimate address change look like an
+		// attack while adding nothing, since the issuer checks that the bound
+		// fingerprint is its own certificate.
+		"issuer fingerprint": func(r *EnrollRequest) { r.IssuerFingerprint = strings.Repeat("ff", 32) },
+		"challenge":          func(r *EnrollRequest) { r.Challenge[0] ^= 0xff },
+		"first contact":      func(r *EnrollRequest) { r.FirstContact = workloadapi.FirstContactPrompt },
+		"bootstrap code":     func(r *EnrollRequest) { r.BootstrapCode = "STOLEN-CODE" },
 	}
 	for name, mutate := range tamper {
 		t.Run(name, func(t *testing.T) {
 			altered := base
 			mutate(&altered)
-			if bytes.Equal(enrollmentRequestHash(altered), original) {
+			got, derr := enrollmentInput(altered).Digest()
+			if derr != nil {
+				t.Fatalf("digest: %v", derr)
+			}
+			if bytes.Equal(got, original) {
 				t.Errorf("rewriting the %s does not change the signature's binding, so an attacker can change it in transit", name)
 			}
 		})
@@ -442,7 +473,11 @@ func TestEnrollmentBindingCoversEveryClaim(t *testing.T) {
 	// code" and "some bootstrap code" become interchangeable.
 	noCode := base
 	noCode.BootstrapCode = ""
-	if bytes.Equal(enrollmentRequestHash(noCode), original) {
+	dropped, err := enrollmentInput(noCode).Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(dropped, original) {
 		t.Error("dropping the bootstrap code does not change the binding")
 	}
 }
@@ -452,25 +487,37 @@ func TestEnrollmentBindingCoversEveryClaim(t *testing.T) {
 // something to compare the OS dialog against. A code derived from the request
 // alone can be precomputed offline by anything running as this user.
 func TestEnrollPrintsTheRequestCodeFromChallengeAndRequest(t *testing.T) {
-	req := EnrollRequest{
-		DevicePublicDER: []byte("device"),
-		Presence:        presence.StatePresent,
-		IssuerURL:       "https://issuer.example",
-	}
-	req.RequestHash = enrollmentRequestHash(req)
 	challenge := make([]byte, presence.ChallengeSize)
 	challenge[0] = 1
-
-	code := presence.RequestCode(challenge, req.RequestHash)
+	req := EnrollRequest{
+		DevicePublicDER:   []byte("device"),
+		ProtectionLevel:   spiffe.ProtectionHardware,
+		Hostname:          "laptop",
+		OS:                "darwin",
+		IssuerURL:         "https://issuer.example",
+		IssuerFingerprint: testFingerprint,
+		FirstContact:      workloadapi.FirstContactFragment,
+		Challenge:         challenge,
+	}
+	code, err := presence.EnrollmentCode(enrollmentInput(req))
+	if err != nil {
+		t.Fatalf("EnrollmentCode: %v", err)
+	}
 	if code == "" {
-		t.Fatal("no request code was produced")
+		t.Fatal("no enrollment code was produced")
 	}
 
 	// A different challenge must produce a different code, which is what stops
-	// the code being precomputable from the request alone.
-	other := make([]byte, presence.ChallengeSize)
-	other[0] = 2
-	if presence.RequestCode(other, req.RequestHash) == code {
+	// the code being precomputable from the request alone by anything running
+	// as this user.
+	other := req
+	other.Challenge = make([]byte, presence.ChallengeSize)
+	other.Challenge[0] = 2
+	otherCode, err := presence.EnrollmentCode(enrollmentInput(other))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if otherCode == code {
 		t.Error("the code does not depend on the issuer's challenge, so it can be precomputed offline")
 	}
 }

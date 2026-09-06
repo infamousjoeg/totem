@@ -91,6 +91,26 @@ type JWTSVID struct {
 // Nothing in this interface takes an attestation result. Attestation happens
 // once per connection at accept time and produces the derived identity that is
 // passed in here; a Source never re-decides who the caller is.
+//
+// IMPORTANT for whoever implements this against the issuer: every identity
+// input is the Derived value, which comes from attestation. Nothing a caller
+// puts in a request body reaches here, and nothing may be added that does.
+//
+// This is what enforces the grant-provenance rule. A delegated agent may
+// narrow itself into a near-empty sub-identity to wrap a prompt-injection
+// surface such as a third-party MCP server, and the issuer refuses to open a
+// session on any grant that is not the presented one or a descendant of it.
+// That check is only as strong as where the presented grant id comes from: if
+// a caller can supply it, the caller simply claims to be the root grant and
+// the narrowing evaporates. So the grant id must be read from the attested
+// credential's provenance, never from a request.
+//
+// The Workload API makes this structurally easy to get right, and that is on
+// purpose. The only caller-controlled identity input in the whole protocol is
+// JWTSVIDRequest.spiffe_id, and the server refuses it unless it equals the
+// derived identity (see Server.FetchJWTSVID). Any future method added here
+// must keep that property: take Derived, take no identity, grant, or scope
+// from the caller.
 type Source interface {
 	// FetchX509SVID returns the current X509-SVID for a derived identity,
 	// minting or renewing it at the issuer as needed.

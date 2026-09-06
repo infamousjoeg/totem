@@ -62,12 +62,20 @@ func (c *Conn) Identity() (*attest.Identity, error) {
 	return c.identity, nil
 }
 
-// Reattest re-runs attestation on this same connection and confirms the peer
-// did not change underneath it. It implements the spec's renewal rule:
-// attestation is per connection, but process start time and binary hash are
-// re-checked on renewal. A moved start time is a reused pid; a moved hash is a
-// binary that changed since totem pinned it. Either way the connection loses
-// its identity for good.
+// Reattest re-checks this connection's peer on renewal, implementing the
+// spec's rule that attestation is per connection but process start time and
+// binary hash are re-checked when a credential is renewed.
+//
+// It prefers attest's Rechecker, which is the path that package built for
+// exactly this call: it re-reads the start time and re-walks to the catalog
+// binary without redoing the full attestation. That distinction is not
+// cosmetic. A full re-attest hashes the tool binary, which for Claude Code is
+// roughly 200MB and about 0.1 second, and renewal happens on a timer for every
+// connected client. Recheck does the part that can actually have changed.
+//
+// A peer that moved loses its identity permanently. The refusal latches rather
+// than being re-evaluated, because "it failed once and then passed" is the
+// signature of a pid being reused underneath us, not of a transient glitch.
 func (c *Conn) Reattest(ctx context.Context) (*attest.Identity, error) {
 	c.mu.Lock()
 	prev, prevErr, attestor, uc := c.identity, c.err, c.attestor, c.UnixConn
@@ -80,28 +88,43 @@ func (c *Conn) Reattest(ctx context.Context) (*attest.Identity, error) {
 		return nil, ErrAttestorUnavailable
 	}
 
-	fresh, err := attestor.AttestPeer(ctx, uc)
-	if err == nil && prev != nil {
-		switch {
-		case fresh.Peer.PID != prev.Peer.PID, !fresh.Peer.StartTime.Equal(prev.Peer.StartTime):
-			err = attest.ErrPIDReused
-		case fresh.BinaryHash != prev.BinaryHash:
-			err = attest.ErrSignatureMismatch
-		case fresh.Tool != prev.Tool:
-			err = attest.ErrSignatureMismatch
-		}
-	}
+	fresh, err := recheck(ctx, attestor, prev, uc)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if err != nil {
-		// Latch the refusal: once a connection's peer has moved, it never gets
-		// its identity back, even if a later check would pass.
 		c.err = err
 		c.identity = nil
 		return nil, err
 	}
 	c.identity = fresh
+	return fresh, nil
+}
+
+// recheck runs the cheap renewal check when the attestor offers one, and falls
+// back to a full re-attestation plus an explicit comparison when it does not.
+// The fallback exists so a Attestor written against the plain interface still
+// gets the spec's renewal guarantee rather than silently getting none.
+func recheck(ctx context.Context, attestor attest.Attestor, prev *attest.Identity, uc *net.UnixConn) (*attest.Identity, error) {
+	if r, ok := attestor.(attest.Rechecker); ok && prev != nil {
+		if err := r.Recheck(ctx, prev); err != nil {
+			return nil, err
+		}
+		return prev, nil
+	}
+
+	fresh, err := attestor.AttestPeer(ctx, uc)
+	if err != nil {
+		return nil, err
+	}
+	if prev != nil {
+		switch {
+		case fresh.Peer.PID != prev.Peer.PID, !fresh.Peer.StartTime.Equal(prev.Peer.StartTime):
+			return nil, attest.ErrPIDReused
+		case fresh.BinaryHash != prev.BinaryHash, fresh.Tool != prev.Tool:
+			return nil, attest.ErrSignatureMismatch
+		}
+	}
 	return fresh, nil
 }
 
@@ -123,12 +146,21 @@ func NewListener(inner *net.UnixListener, attestor attest.Attestor, log *Logger)
 	return &Listener{inner: inner, attestor: attestor, log: log}
 }
 
-// Accept accepts a connection, attests its peer once, and returns a *Conn
-// carrying the result. A failed attestation is NOT a closed connection: the
-// spec's rejection-UX rule requires the caller to be told what to do, and a
-// connection closed at accept time gives a developer nothing but EOF. The
-// refusal travels on the connection and is answered as a gRPC status on the
-// caller's first RPC.
+// Accept accepts a connection, attests its peer ONCE, and returns a *Conn
+// carrying the result. This is the only place accept-time attestation happens,
+// and attestation is not repeated per RPC: hashing a large catalog binary is
+// around 0.1 second, which is invisible once per connection and ruinous per
+// call on a stream a client holds open for an hour.
+//
+// A FAILED ATTESTATION DOES NOT CLOSE THE CONNECTION. This looks wrong and is
+// deliberate, so please do not "fix" it. Closing here would be the instinctive
+// safer-looking choice and it makes the product worse: the caller gets an EOF
+// or a connection reset, which tells a developer nothing, and the spec's
+// rejection-UX rule requires a refusal to say what to do next. Nothing is
+// issued either way, because Conn.Identity returns the refusal to every
+// handler, so the connection staying open buys the caller no access at all. It
+// buys them a sentence. The refusal travels on the connection and is answered
+// as a legible gRPC status on the caller's first RPC.
 func (l *Listener) Accept() (net.Conn, error) {
 	raw, err := l.inner.Accept()
 	if err != nil {

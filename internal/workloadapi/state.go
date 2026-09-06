@@ -56,6 +56,29 @@ const (
 	FirstContactPrompt FirstContact = "prompt"
 )
 
+// Verified reports whether first contact took the strong path: the fingerprint
+// was pinned before anything was said, and no human was asked to compare
+// anything.
+//
+// THE ZERO VALUE IS THE WEAK ANSWER, and that is the whole point of having a
+// method rather than comparing the string at each call site. An enrollment
+// record written by an older build, truncated by a crash, or hand-edited says
+// nothing about how first contact happened, and a record that fails to say
+// must read as the weaker path, never the stronger one. Defaulting the other
+// way would mean the single easiest way to claim the strong path is to omit
+// the field, which is exactly backwards.
+func (f FirstContact) Verified() bool { return f == FirstContactFragment }
+
+// OrWeakest returns f, or the weaker path when f says nothing. Use it wherever
+// an unrecorded value has to become a concrete one: reporting to a human,
+// or building the value that goes under the enrollment signature.
+func (f FirstContact) OrWeakest() FirstContact {
+	if f == FirstContactFragment {
+		return FirstContactFragment
+	}
+	return FirstContactPrompt
+}
+
 // State is the enrollment record the agent persists. It holds no secret: the
 // device private key lives in the Secure Enclave, the TPM, the keyring, or a
 // separate 0600 file owned by internal/platform, never here.
