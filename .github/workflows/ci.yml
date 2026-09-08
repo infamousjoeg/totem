@@ -118,10 +118,16 @@ jobs:
         run: go test -count=1 -timeout 30m -run TestRestoreOnAFreshBoxMeetsTheTenMinuteGate -v ./internal/store/
 
   release-gate:
-    # Proves the gate still bites. This job SUCCEEDS when the release build is
-    # REFUSED, because the OID arc is still a placeholder. When a real IANA
-    # enterprise number is registered and the marker is cleared, this job starts
-    # failing and is meant to be inverted then, not deleted.
+    # INVERTED 2026-09-08, when PEN 66761 was registered and OIDArcProvisional
+    # was cleared. Until then this job succeeded when the release build was
+    # REFUSED, and the note said to invert it rather than delete it on the day
+    # the PEN arrived. This is that inversion.
+    #
+    # It is still the same guard, read the other way. A release build must now
+    # LINK, and the day it stops linking is the day something put the arc back
+    # into a provisional state. Deleting the job would have removed the only
+    # thing that notices that, and "the gate we removed because we passed it" is
+    # how a placeholder ships in some later release nobody is watching.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -129,11 +135,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: a release build must refuse a provisional OID arc
+      - name: a release build must link on the registered OID arc
         run: |
-          if go build -tags release ./internal/ca/... 2>/dev/null; then
-            echo "a release build linked while the OID arc is still provisional."
-            echo "if a real PEN was registered, invert this job; do not delete it."
+          if ! go build -tags release ./internal/ca/...; then
+            echo "a release build refused to link."
+            echo "OIDArcProvisional is non-empty again, so the OID arc is back to being"
+            echo "provisional. Read it for what it says is wrong; do not clear it to get"
+            echo "green, and do not delete this job."
             exit 1
           fi
-          echo "release build correctly refused: the OID arc is still a placeholder."
+          echo "release build linked: the OID arc is the registered PEN, not a placeholder."

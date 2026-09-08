@@ -5,9 +5,17 @@ import (
 	"testing"
 )
 
-// placeholderPEN is the private-enterprise number the OID arc uses while totem
-// has no registered IANA assignment.
+// placeholderPEN is the private-enterprise number the OID arc used while totem
+// had no registered IANA assignment. Kept so the guard below can still say "not
+// this one" if the arc ever regresses.
 const placeholderPEN = 62733
+
+// registeredPEN is totem's IANA Private Enterprise Number, assigned to Infamous
+// Endeavors on 2026-09-08. Clearing OIDArcProvisional proves the arc is no
+// longer the placeholder; it does not prove the arc is the number we were
+// actually assigned, and a transposed digit there is unrecoverable in exactly
+// the same way the placeholder was. So the real number is pinned here too.
+const registeredPEN = 66761
 
 // TestOIDArcAndItsReleaseGateStayInSync is the ordinary-CI half of the arc
 // guard. release_gate.go stops a PLACEHOLDER arc from shipping; this stops the
@@ -33,6 +41,20 @@ func TestOIDArcAndItsReleaseGateStayInSync(t *testing.T) {
 		t.Fatalf("the OID arc has moved off the placeholder PEN but OIDArcProvisional is still set to %q; clear it in the same commit or no release can ever build", OIDArcProvisional)
 	case OIDArcProvisional == "" && onPlaceholder:
 		t.Fatalf("OIDArcProvisional has been cleared while the arc is still placeholder PEN %d; that opens the release gate on a placeholder, which is what the gate exists to stop", placeholderPEN)
+	}
+}
+
+// TestOIDArcIsTheRegisteredPEN pins the arc to the number IANA actually assigned.
+//
+// The sync test above only distinguishes "placeholder" from "not placeholder",
+// which a typo satisfies: 66771 is not the placeholder either, and it would
+// clear the gate, ship, and be unchangeable the moment a relying party matched
+// on it. The assignment is a fact about the outside world, so it is written down
+// once and asserted rather than inferred.
+func TestOIDArcIsTheRegisteredPEN(t *testing.T) {
+	t.Parallel()
+	if got := OIDProtectionLevel[6]; got != registeredPEN {
+		t.Fatalf("the OID arc is on PEN %d; totem's registered assignment is %d", got, registeredPEN)
 	}
 }
 

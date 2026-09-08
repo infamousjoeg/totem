@@ -724,27 +724,31 @@ const (
 // the path", so relying-party policy matches on an extension rather than
 // parsing a URI.
 //
-// PROVISIONAL ARC. 1.3.6.1.4.1.62733 is a placeholder private-enterprise
-// number, not an IANA assignment. It must be replaced with a real PEN before
-// the first release: changing an OID after relying parties match on it is a
-// breaking change for every deployment at once. Every OID lives in this one
-// block so that change is a single edit.
+// REGISTERED ARC. 1.3.6.1.4.1.66761 is totem's IANA Private Enterprise Number,
+// assigned to Infamous Endeavors on 2026-09-08. It replaced the placeholder
+// 62733 the arc carried until then.
 //
-// This is not left to a comment somebody has to read at the right moment. See
-// OIDArcProvisional and release_gate.go: while the arc is a placeholder, a
-// release build does not compile.
+// These OIDs are now permanent. Changing one after relying parties match on it
+// is a breaking change for every deployment at once, which is why the arc had
+// to stop being provisional before the first release rather than after. Every
+// OID still lives in this one block so the arc can be read at a glance.
+//
+// The guard that got us here is still in place and now runs in the other
+// direction. See OIDArcProvisional, release_gate.go, and oidarc_test.go: the
+// marker and the arc must always agree, so a regression back onto a placeholder
+// cannot quietly ship either.
 var (
 	// OIDProtectionLevel carries spiffe.ProtectionLevel as a UTF8String.
-	OIDProtectionLevel = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 62733, 1, 1}
+	OIDProtectionLevel = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 66761, 1, 1}
 	// OIDPresenceState carries presence.State as a UTF8String: present,
 	// delegated, or none.
-	OIDPresenceState = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 62733, 1, 2}
+	OIDPresenceState = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 66761, 1, 2}
 	// OIDPresenceAge carries the age of the presence assertion at issuance, in
 	// seconds, as an INTEGER.
-	OIDPresenceAge = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 62733, 1, 3}
+	OIDPresenceAge = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 66761, 1, 3}
 	// OIDGrantID carries the grant a delegated issuance was made under, as a
 	// UTF8String. Absent when presence is not delegated.
-	OIDGrantID = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 62733, 1, 4}
+	OIDGrantID = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 66761, 1, 4}
 )
 
 // OIDArcProvisional is non-empty for exactly as long as the OID arc above is a
@@ -761,10 +765,13 @@ var (
 // it breaks every deployment simultaneously. So the placeholder cannot ship
 // silently, which is the actual requirement.
 //
-// TO RELEASE: register a PEN, replace 62733 in the block above with it, and set
-// this to "" in the same commit. Those two edits belong together and the gate
-// exists to make sure they happen together.
-const OIDArcProvisional = "the x509 extension OID arc is still placeholder PEN 62733, not a registered IANA assignment"
+// It is EMPTY as of 2026-09-08: PEN 66761 is registered to Infamous Endeavors
+// and the arc above uses it, so release builds link. The constant stays rather
+// than being deleted, because the property it guards is not "we once had a
+// placeholder" but "the arc must never be provisional in a release". If the arc
+// ever has to move again, set this to a non-empty explanation in the same commit
+// and the gate closes on its own.
+const OIDArcProvisional = ""
 
 // IssuerPath is the path of the issuer's own identity: spiffe://<td>/issuer.
 // It has no device segment and no tool segment, which is what makes it
